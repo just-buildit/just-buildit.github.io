@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # ############################################################################
-# SCRIPT: install.sh                                                         #
+# SCRIPT: get-just-runit.sh                                                         #
 # PACKAGE: just-bashit version 0.1.4                                         #
 # ############################################################################
 # Installs just-runit (alias: jr) to ~/.local/bin and updates PATH.         #
 #                                                                             #
 # Must be sourced so PATH exports reach the calling shell:                   #
-#   . <(curl -sSL https://raw.githubusercontent.com/just-buildit/just-bashit/main/src/install.sh)
+#   . <(curl -sSL https://raw.githubusercontent.com/just-buildit/just-bashit/main/src/get-just-runit.sh)
 # ############################################################################
 
 # Wrapped in a function so locals don't leak and we can clean up afterward.
@@ -27,6 +27,17 @@ _jbs_install() {
     _jbs_say()  { printf "${CYAN}  ->  ${RESET}${BOLD}%s${RESET}\n" "$*"; }
     _jbs_ok()   { printf "${GREEN}  ok  ${RESET}%s\n" "$*"; }
     _jbs_warn() { printf "${YELLOW}  !!  ${RESET}%s\n" "$*"; }
+
+    # -- disclaimer ------------------------------------------------------------
+
+    printf '%b' "${YELLOW}${BOLD}"
+    printf '  +----------------------------------------------------------+\n'
+    printf '  |  This script is provided AS IS, without warranty of any  |\n'
+    printf '  |  kind. Review the source before running:                 |\n'
+    printf '  |  https://just-buildit.github.io/get-just-runit.sh       |\n'
+    printf '  |  Use at your own risk.                                   |\n'
+    printf '  +----------------------------------------------------------+\n'
+    printf '%b\n' "${RESET}"
 
     # -- install dir -----------------------------------------------------------
 

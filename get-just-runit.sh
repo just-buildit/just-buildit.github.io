@@ -85,6 +85,20 @@ _jbs_install() {
         _jbs_ok "${INSTALL_DIR} already in PATH"
     fi
 
+    # -- uv (enables Python PEP 723 dep resolution in jr) ---------------------
+
+    if command -v uv >/dev/null 2>&1; then
+        _jbs_ok "uv found — Python PEP 723 support ready"
+    else
+        _jbs_say "installing uv via jr (Python PEP 723 support)"
+        "${INSTALL_DIR}/just-runit" https://astral.sh/uv/install.sh
+        if command -v uv >/dev/null 2>&1; then
+            _jbs_ok "uv installed"
+        else
+            _jbs_warn "uv installed — open a new shell if 'uv' isn't found"
+        fi
+    fi
+
     # -- confirm ---------------------------------------------------------------
 
     printf '\n%b\n\n' "${GREEN}${BOLD}  just-runit and jr are ready.${RESET}"

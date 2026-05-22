@@ -35,6 +35,12 @@ _jbs_install() {
     printf '  |  This script is provided AS IS, without warranty of any  |\n'
     printf '  |  kind. Review the source before running:                 |\n'
     printf '  |  https://just-buildit.github.io/get-just-runit.sh       |\n'
+    printf '  |                                                          |\n'
+    printf '  |  The tool it installs (just-runit / jr) fetches and     |\n'
+    printf '  |  executes arbitrary code from URLs you provide. It      |\n'
+    printf '  |  performs no review, scanning, or sandboxing. You are   |\n'
+    printf '  |  solely responsible for what you choose to run.         |\n'
+    printf '  |                                                          |\n'
     printf '  |  Use at your own risk.                                   |\n'
     printf '  +----------------------------------------------------------+\n'
     printf '%b\n' "${RESET}"

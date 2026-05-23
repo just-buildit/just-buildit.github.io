@@ -54,6 +54,43 @@
     color: var(--fg-muted);
     margin: 2.5rem 0 0.75rem;
   }
+  .install-heading {
+    display: flex;
+    align-items: baseline;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+    margin: 2.5rem 0 0.75rem;
+  }
+  .install-heading h2 {
+    margin: 0;
+    white-space: nowrap;
+  }
+  .install-cmd {
+    font-family: 'JetBrains Mono', SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.95rem;
+    font-weight: 400;
+    color: var(--fg);
+    background: transparent;
+    padding: 0;
+    letter-spacing: 0;
+    text-transform: none;
+  }
+  .install-copy {
+    margin-left: auto;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--fg-muted);
+    cursor: pointer;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.75rem;
+    padding: 0.2rem 0.5rem;
+    transition: color 0.15s, border-color 0.15s;
+    user-select: none;
+    white-space: nowrap;
+  }
+  .install-copy:hover { color: var(--fg); border-color: var(--fg-muted); }
+  .install-copy.copied { color: #4ade80; border-color: #4ade80; }
   p { margin: 0 0 1rem; }
   a { color: var(--accent); text-decoration: none; }
   a:hover { text-decoration: underline; }
@@ -137,10 +174,10 @@
      <code>aliases.toml</code>, and other small static resources the
      toolchain depends on.</p>
 
-  <h2>Get the universal entrypoint — <code class="accent">jb</code></h2>
-  <div class="code-block">
-    <pre><code>. &lt;(curl -sSL https://just-buildit.github.io/get-just-runit.sh)</code></pre>
-    <button class="copy-btn" aria-label="Copy to clipboard">copy</button>
+  <div class="install-heading">
+    <h2>Get the universal entrypoint <code class="accent">jb</code> &mdash;</h2>
+    <code class="install-cmd">. &lt;(curl -sSL https://just-buildit.github.io/get-jb.sh)</code>
+    <button class="install-copy" aria-label="Copy install command">copy</button>
   </div>
 
   <h2>Then use it</h2>
@@ -162,7 +199,7 @@ jbx https://example.com/tool.py --arg # any HTTPS script</code></pre>
 
   <h2>What lives here</h2>
   <ul>
-    <li><a href="get-just-runit.sh"><code>get-just-runit.sh</code></a> — installs <code>jb</code> / <code>jbx</code> to <code>~/.local/bin</code></li>
+    <li><a href="get-jb.sh"><code>get-jb.sh</code></a> — installs <code>jb</code> / <code>jbx</code> to <code>~/.local/bin</code></li>
     <li><a href="aliases.toml"><code>aliases.toml</code></a> — default-namespace alias manifest</li>
   </ul>
 
@@ -171,6 +208,17 @@ jbx https://example.com/tool.py --arg # any HTTPS script</code></pre>
   <footer>MIT across all repos.</footer>
 </main>
 <script>
+  document.querySelectorAll('.install-heading').forEach(function(block) {
+    var btn = block.querySelector('.install-copy');
+    var code = block.querySelector('.install-cmd');
+    btn.addEventListener('click', function() {
+      navigator.clipboard.writeText(code.innerText).then(function() {
+        btn.textContent = 'copied!';
+        btn.classList.add('copied');
+        setTimeout(function() { btn.textContent = 'copy'; btn.classList.remove('copied'); }, 2000);
+      });
+    });
+  });
   document.querySelectorAll('.code-block').forEach(function(block) {
     var btn = block.querySelector('.copy-btn');
     var code = block.querySelector('code');

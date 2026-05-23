@@ -34,7 +34,7 @@
   }
   .wordmark {
     display: block;
-    max-width: 360px;
+    max-width: 480px;
     width: 100%;
     height: auto;
     margin: 0 auto 1.5rem;
@@ -67,15 +67,43 @@
     border-radius: 4px;
     color: var(--fg);
   }
+  .code-block {
+    position: relative;
+  }
   pre {
     background: var(--code-bg);
     border: 1px solid var(--border);
     padding: 1rem 1.25rem;
+    padding-right: 3.5rem;
     border-radius: 6px;
     overflow-x: auto;
     line-height: 1.5;
+    margin: 0;
   }
   pre code { background: transparent; padding: 0; }
+  .copy-btn {
+    position: absolute;
+    top: 0.5rem;
+    right: 0.5rem;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--fg-muted);
+    cursor: pointer;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.75rem;
+    padding: 0.2rem 0.5rem;
+    transition: color 0.15s, border-color 0.15s;
+    user-select: none;
+  }
+  .copy-btn:hover {
+    color: var(--fg);
+    border-color: var(--fg-muted);
+  }
+  .copy-btn.copied {
+    color: #4ade80;
+    border-color: #4ade80;
+  }
   ul { padding-left: 1.25rem; margin: 0 0 1rem; }
   li { margin: 0.35rem 0; }
   hr {
@@ -104,7 +132,10 @@
      toolchain depends on.</p>
 
   <h2>Get the universal entrypoint</h2>
-  <pre><code>. &lt;(curl -sSL https://just-buildit.github.io/get-just-runit.sh)</code></pre>
+  <div class="code-block">
+    <pre><code>. &lt;(curl -sSL https://just-buildit.github.io/get-just-runit.sh)</code></pre>
+    <button class="copy-btn" aria-label="Copy to clipboard">copy</button>
+  </div>
 
   <h2>What lives here</h2>
   <ul>
@@ -116,5 +147,22 @@
 
   <footer>See the <a href="https://github.com/just-buildit">org profile</a> for the full picture. MIT across all repos.</footer>
 </main>
+<script>
+  document.querySelectorAll('.code-block').forEach(function(block) {
+    var btn = block.querySelector('.copy-btn');
+    var code = block.querySelector('code');
+    btn.addEventListener('click', function() {
+      var text = code.innerText;
+      navigator.clipboard.writeText(text).then(function() {
+        btn.textContent = 'copied!';
+        btn.classList.add('copied');
+        setTimeout(function() {
+          btn.textContent = 'copy';
+          btn.classList.remove('copied');
+        }, 2000);
+      });
+    });
+  });
+</script>
 </body>
 </html>

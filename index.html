@@ -137,6 +137,23 @@
     <button class="copy-btn" aria-label="Copy to clipboard">copy</button>
   </div>
 
+  <h2>Then use it</h2>
+  <div class="code-block">
+    <pre><code>jx just-bashit:logging info "hello"   # run a bash lib function
+jx install-deps -s apt                # resolved via aliases.toml
+jx gh:user/repo/tool.sh run           # any GitHub raw script
+jx https://example.com/tool.py --arg  # any HTTPS script</code></pre>
+    <button class="copy-btn" aria-label="Copy to clipboard">copy</button>
+  </div>
+
+  <h2>Learn more</h2>
+  <ul>
+    <li><a href="https://github.com/just-buildit/just-bashit">just-bashit</a> — proven bash scripts and tools</li>
+    <li><a href="https://github.com/just-buildit/just-makeit">just-makeit</a> — Python C extensions out-of-the-box</li>
+    <li><a href="https://github.com/just-buildit/just-buildit">just-buildit</a> — zero-dep PEP 517 build backend for C extensions</li>
+    <li><a href="https://github.com/just-buildit">github.com/just-buildit</a> — full org overview</li>
+  </ul>
+
   <h2>What lives here</h2>
   <ul>
     <li><a href="get-just-runit.sh"><code>get-just-runit.sh</code></a> — installs <code>jx</code> to <code>~/.local/bin</code></li>
@@ -145,7 +162,7 @@
 
   <hr>
 
-  <footer>See the <a href="https://github.com/just-buildit">org profile</a> for the full picture. MIT across all repos.</footer>
+  <footer>MIT across all repos.</footer>
 </main>
 <script>
   document.querySelectorAll('.code-block').forEach(function(block) {

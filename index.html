@@ -81,6 +81,12 @@
     margin: 0;
   }
   pre code { background: transparent; padding: 0; }
+  code.accent {
+    background: transparent;
+    color: var(--accent);
+    font-weight: 700;
+    padding: 0;
+  }
   .copy-btn {
     position: absolute;
     top: 0.5rem;
@@ -131,7 +137,7 @@
      <code>aliases.toml</code>, and other small static resources the
      toolchain depends on.</p>
 
-  <h2>Get the universal entrypoint</h2>
+  <h2>Get the universal entrypoint — <code class="accent">jx</code></h2>
   <div class="code-block">
     <pre><code>. &lt;(curl -sSL https://just-buildit.github.io/get-just-runit.sh)</code></pre>
     <button class="copy-btn" aria-label="Copy to clipboard">copy</button>

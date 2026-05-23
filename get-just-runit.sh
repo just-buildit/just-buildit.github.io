@@ -95,6 +95,17 @@ _jbs_install() {
 		_jbs_ok "just-runit v${new_ver} installed"
 	fi
 
+	# -- remove stale aliases from prior naming schemes -----------------------
+
+	local stale
+	for stale in jr jx; do
+		local stale_path="${INSTALL_DIR}/${stale}"
+		if [[ -L ${stale_path} && "$(readlink -f "${stale_path}")" == "$(readlink -f "${INSTALL_DIR}/just-runit")" ]]; then
+			rm -f "${stale_path}"
+			_jbs_warn "removed stale alias: ${stale}"
+		fi
+	done
+
 	# -- just-buildit symlink (always created — canonical long name) -----------
 
 	ln -sf just-runit "${INSTALL_DIR}/just-buildit"

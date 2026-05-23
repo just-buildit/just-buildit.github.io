@@ -1,0 +1,11 @@
+# just-buildit org default-namespace alias manifest.
+#
+# `jx NAME` consults this table when there is no script served directly
+# at https://just-buildit.github.io/${NAME}.{sh,py}.
+#
+# Third-party tools welcomed via PR — keep entries pinned to a tag/sha
+# rather than a moving branch.
+
+[aliases]
+install-deps   = "https://raw.githubusercontent.com/just-buildit/just-bashit/main/src/install-deps.sh"
+get-just-runit = "https://raw.githubusercontent.com/just-buildit/just-bashit/main/src/get-just-runit.sh"

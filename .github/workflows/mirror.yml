@@ -1,0 +1,50 @@
+name: Mirror upstream scripts
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # daily at 06:00 UTC
+  workflow_dispatch:       # manual refresh
+  repository_dispatch:
+    types: [mirror]        # remote trigger from source repos
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch upstream scripts
+        run: |
+          set -euo pipefail
+          declare -A SOURCES=(
+            [get-just-runit.sh]="https://raw.githubusercontent.com/just-buildit/just-bashit/main/src/get-just-runit.sh"
+            # Add get-just-makeit.sh, get-just-bashit.sh, get-just-buildit.sh here as they land.
+          )
+          for dest in "${!SOURCES[@]}"; do
+            url="${SOURCES[$dest]}"
+            echo "fetching ${url} -> ${dest}"
+            curl -sSL --proto '=https' --tlsv1.2 -o "${dest}.new" "${url}"
+            if [ -f "${dest}" ] && cmp -s "${dest}" "${dest}.new"; then
+              echo "  unchanged"
+              rm -f "${dest}.new"
+            else
+              mv "${dest}.new" "${dest}"
+              echo "  updated"
+            fi
+          done
+
+      - name: Commit & push if changed
+        run: |
+          set -euo pipefail
+          git config user.name  "just-buildit-bot"
+          git config user.email "bot@just-buildit.invalid"
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "mirror: refresh upstream scripts"
+            git push
+          else
+            echo "nothing to commit"
+          fi

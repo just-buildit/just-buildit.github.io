@@ -3,10 +3,13 @@
 # SCRIPT: get-just-runit.sh                                                  #
 # PACKAGE: just-bashit version 0.1.4                                         #
 # ############################################################################
-# Installs just-runit (just-buildit / jb / jbx) to ~/.local/bin.             #
-#                                                                            #
+# Installs just-runit (just-buildit / jb / jbx) to ~/.local/bin.            #
+#                                                                             #
 # Must be sourced so PATH exports reach the calling shell:                   #
-#   . <(curl -sSL https://just-buildit.github.io/get-just-runit.sh)          #
+#   . <(curl -sSL https://just-buildit.github.io/get-just-runit.sh)         #
+#                                                                             #
+# To force reinstall even when already current:                              #
+#   JB_REINSTALL=1 . <(curl -sSL https://just-buildit.github.io/get-just-runit.sh)
 # ############################################################################
 
 # Wrapped in a function so locals don't leak and we can clean up afterward.
@@ -34,7 +37,7 @@ _jbs_install() {
 	printf '  +----------------------------------------------------------+\n'
 	printf '  |  This script is provided AS IS, without warranty of any  |\n'
 	printf '  |  kind. Review the source before running:                 |\n'
-	printf '  |  https://just-buildit.github.io/get-just-runit.sh        |\n'
+	printf '  |  https://just-buildit.github.io/get-just-runit.sh       |\n'
 	printf '  |                                                          |\n'
 	printf '  |  The tool it installs fetches and executes arbitrary     |\n'
 	printf '  |  code from URLs you provide. It performs no review,      |\n'
@@ -50,16 +53,47 @@ _jbs_install() {
 	_jbs_say "install dir: ${INSTALL_DIR}"
 	mkdir -p "${INSTALL_DIR}"
 
-	# -- download just-runit ---------------------------------------------------
+	# -- version-aware download -----------------------------------------------
 
-	_jbs_say "downloading just-runit from ${RUNIT_URL}"
-	if ! curl -sSL --proto '=https' --tlsv1.2 \
-		-o "${INSTALL_DIR}/just-runit" "${RUNIT_URL}"; then
+	local tmp_runit
+	tmp_runit=$(mktemp /tmp/just-runit.XXXXXX)
+	# shellcheck disable=SC2064
+	trap "rm -f '${tmp_runit}'" RETURN
+
+	_jbs_say "fetching just-runit from ${RUNIT_URL}"
+	if ! curl -sSL --proto '=https' --tlsv1.2 -o "${tmp_runit}" "${RUNIT_URL}"; then
 		printf "\033[1;31m  !!  \033[0mfailed to download just-runit\n" >&2
 		return 1
 	fi
-	chmod +x "${INSTALL_DIR}/just-runit"
-	_jbs_ok "just-runit installed"
+
+	local new_ver
+	new_ver=$(grep '^_VERSION=' "${tmp_runit}" | cut -d'"' -f2)
+	new_ver="${new_ver:-unknown}"
+
+	local installed="${INSTALL_DIR}/just-runit"
+	if [[ -x ${installed} ]]; then
+		local cur_ver
+		cur_ver=$(grep '^_VERSION=' "${installed}" | cut -d'"' -f2)
+		cur_ver="${cur_ver:-unknown}"
+
+		if [[ ${cur_ver} == "${new_ver}" && ${JB_REINSTALL:-0} != "1" ]]; then
+			_jbs_ok "already at v${cur_ver} — set JB_REINSTALL=1 to force reinstall"
+		else
+			if [[ ${cur_ver} != "${new_ver}" ]]; then
+				_jbs_say "upgrading v${cur_ver} -> v${new_ver}"
+			else
+				_jbs_say "reinstalling v${new_ver}"
+			fi
+			cp "${tmp_runit}" "${installed}"
+			chmod +x "${installed}"
+			_jbs_ok "just-runit v${new_ver} installed"
+		fi
+	else
+		_jbs_say "installing v${new_ver}"
+		cp "${tmp_runit}" "${installed}"
+		chmod +x "${installed}"
+		_jbs_ok "just-runit v${new_ver} installed"
+	fi
 
 	# -- just-buildit symlink (always created — canonical long name) -----------
 

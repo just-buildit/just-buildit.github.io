@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # ############################################################################
-# SCRIPT: get-just-runit.sh                                                         #
+# SCRIPT: get-just-runit.sh                                                  #
 # PACKAGE: just-bashit version 0.1.4                                         #
 # ############################################################################
-# Installs just-runit (alias: jr) to ~/.local/bin and updates PATH.         #
+# Installs just-runit (alias: jx) to ~/.local/bin and updates PATH.         #
 #                                                                             #
 # Must be sourced so PATH exports reach the calling shell:                   #
-#   . <(curl -sSL https://raw.githubusercontent.com/just-buildit/just-bashit/main/src/get-just-runit.sh)
+#   . <(curl -sSL https://just-buildit.github.io/get-just-runit.sh)         #
 # ############################################################################
 
 # Wrapped in a function so locals don't leak and we can clean up afterward.
@@ -36,7 +36,7 @@ _jbs_install() {
 	printf '  |  kind. Review the source before running:                 |\n'
 	printf '  |  https://just-buildit.github.io/get-just-runit.sh       |\n'
 	printf '  |                                                          |\n'
-	printf '  |  The tool it installs (just-runit / jr) fetches and     |\n'
+	printf '  |  The tool it installs (just-runit / jx) fetches and     |\n'
 	printf '  |  executes arbitrary code from URLs you provide. It      |\n'
 	printf '  |  performs no review, scanning, or sandboxing. You are   |\n'
 	printf '  |  solely responsible for what you choose to run.         |\n'
@@ -61,11 +61,11 @@ _jbs_install() {
 	chmod +x "${INSTALL_DIR}/just-runit"
 	_jbs_ok "just-runit installed"
 
-	# -- jr symlink ------------------------------------------------------------
+	# -- jx symlink ------------------------------------------------------------
 
-	_jbs_say "creating jr symlink"
-	ln -sf just-runit "${INSTALL_DIR}/jr"
-	_jbs_ok "jr -> just-runit"
+	_jbs_say "creating jx symlink"
+	ln -sf just-runit "${INSTALL_DIR}/jx"
+	_jbs_ok "jx -> just-runit"
 
 	# -- PATH ------------------------------------------------------------------
 
@@ -73,6 +73,7 @@ _jbs_install() {
 		_jbs_say "adding ${INSTALL_DIR} to PATH (current shell)"
 		export PATH="${INSTALL_DIR}:${PATH}"
 
+		# shellcheck disable=SC2016
 		local entry='export PATH="${HOME}/.local/bin:${PATH}"'
 		if ! grep -qF '.local/bin' "${BASHRC}" 2>/dev/null; then
 			_jbs_say "persisting PATH to ${BASHRC}"
@@ -85,12 +86,12 @@ _jbs_install() {
 		_jbs_ok "${INSTALL_DIR} already in PATH"
 	fi
 
-	# -- uv (enables Python PEP 723 dep resolution in jr) ---------------------
+	# -- uv (enables Python PEP 723 dep resolution in jx) --------------------
 
 	if command -v uv >/dev/null 2>&1; then
 		_jbs_ok "uv found — Python PEP 723 support ready"
 	else
-		_jbs_say "installing uv via jr (Python PEP 723 support)"
+		_jbs_say "installing uv via jx (Python PEP 723 support)"
 		"${INSTALL_DIR}/just-runit" https://astral.sh/uv/install.sh
 		if command -v uv >/dev/null 2>&1; then
 			_jbs_ok "uv installed"
@@ -101,9 +102,9 @@ _jbs_install() {
 
 	# -- confirm ---------------------------------------------------------------
 
-	printf '\n%b\n\n' "${GREEN}${BOLD}  just-runit and jr are ready.${RESET}"
-	printf '  %bjr -h%b              show help\n' "${BOLD}" "${RESET}"
-	printf '  %bjr jbs:datetime iso-8601-basic%b   quick test\n\n' \
+	printf '\n%b\n\n' "${GREEN}${BOLD}  just-runit (jx) is ready.${RESET}"
+	printf '  %bjx -h%b                          show help\n' "${BOLD}" "${RESET}"
+	printf '  %bjx just-bashit:datetime iso-8601-basic%b  quick test\n\n' \
 		"${BOLD}" "${RESET}"
 
 }

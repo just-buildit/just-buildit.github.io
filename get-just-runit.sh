@@ -3,10 +3,10 @@
 # SCRIPT: get-just-runit.sh                                                  #
 # PACKAGE: just-bashit version 0.1.4                                         #
 # ############################################################################
-# Installs just-runit (alias: jx) to ~/.local/bin and updates PATH.         #
-#                                                                             #
+# Installs just-runit (just-buildit / jb / jbx) to ~/.local/bin.             #
+#                                                                            #
 # Must be sourced so PATH exports reach the calling shell:                   #
-#   . <(curl -sSL https://just-buildit.github.io/get-just-runit.sh)         #
+#   . <(curl -sSL https://just-buildit.github.io/get-just-runit.sh)          #
 # ############################################################################
 
 # Wrapped in a function so locals don't leak and we can clean up afterward.
@@ -34,12 +34,12 @@ _jbs_install() {
 	printf '  +----------------------------------------------------------+\n'
 	printf '  |  This script is provided AS IS, without warranty of any  |\n'
 	printf '  |  kind. Review the source before running:                 |\n'
-	printf '  |  https://just-buildit.github.io/get-just-runit.sh       |\n'
+	printf '  |  https://just-buildit.github.io/get-just-runit.sh        |\n'
 	printf '  |                                                          |\n'
-	printf '  |  The tool it installs (just-runit / jx) fetches and     |\n'
-	printf '  |  executes arbitrary code from URLs you provide. It      |\n'
-	printf '  |  performs no review, scanning, or sandboxing. You are   |\n'
-	printf '  |  solely responsible for what you choose to run.         |\n'
+	printf '  |  The tool it installs fetches and executes arbitrary     |\n'
+	printf '  |  code from URLs you provide. It performs no review,      |\n'
+	printf '  |  scanning, or sandboxing. You are solely responsible     |\n'
+	printf '  |  for what you choose to run.                             |\n'
 	printf '  |                                                          |\n'
 	printf '  |  Use at your own risk.                                   |\n'
 	printf '  +----------------------------------------------------------+\n'
@@ -61,11 +61,29 @@ _jbs_install() {
 	chmod +x "${INSTALL_DIR}/just-runit"
 	_jbs_ok "just-runit installed"
 
-	# -- jx symlink ------------------------------------------------------------
+	# -- just-buildit symlink (always created — canonical long name) -----------
 
-	_jbs_say "creating jx symlink"
-	ln -sf just-runit "${INSTALL_DIR}/jx"
-	_jbs_ok "jx -> just-runit"
+	ln -sf just-runit "${INSTALL_DIR}/just-buildit"
+	_jbs_ok "just-buildit -> just-runit"
+
+	# -- jb symlink (short alias — skipped if jb is already someone else's) ---
+
+	local _jb_cmd
+	_jb_cmd="$(command -v jb 2>/dev/null || true)"
+	local _JB_NAME="jb"
+	if [[ -n ${_jb_cmd} && "$(readlink -f "${_jb_cmd}")" != "$(readlink -f "${INSTALL_DIR}/just-runit")" ]]; then
+		_jbs_warn "'jb' is already in use (${_jb_cmd}) — skipping short alias"
+		_jbs_warn "use 'just-buildit' instead (always available)"
+		_JB_NAME="just-buildit"
+	else
+		ln -sf just-runit "${INSTALL_DIR}/jb"
+		_jbs_ok "jb -> just-runit"
+	fi
+
+	# -- jbx symlink (runner shorthand, always created) -----------------------
+
+	ln -sf just-runit "${INSTALL_DIR}/jbx"
+	_jbs_ok "jbx -> just-runit"
 
 	# -- PATH ------------------------------------------------------------------
 
@@ -86,12 +104,12 @@ _jbs_install() {
 		_jbs_ok "${INSTALL_DIR} already in PATH"
 	fi
 
-	# -- uv (enables Python PEP 723 dep resolution in jx) --------------------
+	# -- uv (enables Python PEP 723 dep resolution) ---------------------------
 
 	if command -v uv >/dev/null 2>&1; then
 		_jbs_ok "uv found — Python PEP 723 support ready"
 	else
-		_jbs_say "installing uv via jx (Python PEP 723 support)"
+		_jbs_say "installing uv (Python PEP 723 support)"
 		"${INSTALL_DIR}/just-runit" https://astral.sh/uv/install.sh
 		if command -v uv >/dev/null 2>&1; then
 			_jbs_ok "uv installed"
@@ -102,10 +120,11 @@ _jbs_install() {
 
 	# -- confirm ---------------------------------------------------------------
 
-	printf '\n%b\n\n' "${GREEN}${BOLD}  just-runit (jx) is ready.${RESET}"
-	printf '  %bjx -h%b                          show help\n' "${BOLD}" "${RESET}"
-	printf '  %bjx just-bashit:datetime iso-8601-basic%b  quick test\n\n' \
-		"${BOLD}" "${RESET}"
+	printf '\n%b\n\n' "${GREEN}${BOLD}  just-buildit is ready.${RESET}"
+	printf '  %b%s -h%b                           show help\n' \
+		"${BOLD}" "${_JB_NAME}" "${RESET}"
+	printf '  %b%s run just-bashit:datetime iso-8601-basic%b  quick test\n\n' \
+		"${BOLD}" "${_JB_NAME}" "${RESET}"
 
 }
 

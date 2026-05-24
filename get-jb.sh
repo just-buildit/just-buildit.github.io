@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # ############################################################################
-# SCRIPT: get-just-runit.sh                                                  #
+# SCRIPT: get-jb.sh                                                          #
 # PACKAGE: just-bashit version 0.1.4                                         #
 # ############################################################################
 # Installs just-runit (just-buildit / jb / jbx) to ~/.local/bin.            #
 #                                                                             #
 # Must be sourced so PATH exports reach the calling shell:                   #
-#   . <(curl -sSL https://just-buildit.github.io/get-just-runit.sh)         #
+#   . <(curl -sSL https://just-buildit.github.io/get-jb.sh)                 #
 #                                                                             #
 # To force reinstall even when already current:                              #
-#   JB_REINSTALL=1 . <(curl -sSL https://just-buildit.github.io/get-just-runit.sh)
+#   JB_REINSTALL=1 . <(curl -sSL https://just-buildit.github.io/get-jb.sh)
 # ############################################################################
 
 # Wrapped in a function so locals don't leak and we can clean up afterward.
@@ -37,7 +37,7 @@ _jbs_install() {
 	printf '  +----------------------------------------------------------+\n'
 	printf '  |  This script is provided AS IS, without warranty of any  |\n'
 	printf '  |  kind. Review the source before running:                 |\n'
-	printf '  |  https://just-buildit.github.io/get-just-runit.sh       |\n'
+	printf '  |  https://just-buildit.github.io/get-jb.sh                |\n'
 	printf '  |                                                          |\n'
 	printf '  |  The tool it installs fetches and executes arbitrary     |\n'
 	printf '  |  code from URLs you provide. It performs no review,      |\n'

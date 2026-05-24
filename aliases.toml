@@ -8,4 +8,4 @@
 
 [aliases]
 install-deps   = "https://raw.githubusercontent.com/just-buildit/just-bashit/main/src/install-deps.sh"
-get-just-runit = "https://raw.githubusercontent.com/just-buildit/just-bashit/main/src/get-just-runit.sh"
+get-jb         = "https://raw.githubusercontent.com/just-buildit/just-bashit/main/src/get-jb.sh"

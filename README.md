@@ -4,8 +4,8 @@ Org-pages root for [github.com/just-buildit](https://github.com/just-buildit).
 
 Serves the small static resources the toolchain depends on:
 
-- `get-just-runit.sh` — installs `jx` (the universal entrypoint)
-- `aliases.toml` — default-namespace alias manifest read by `jx`
+- `get-jb.sh` — installs `jbx` (the universal entrypoint)
+- `aliases.toml` — default-namespace alias manifest read by `jbx`
 - (eventually) `get-just-makeit.sh`, `get-just-bashit.sh`, `get-just-buildit.sh`
 - `index.html` — minimal landing page
 

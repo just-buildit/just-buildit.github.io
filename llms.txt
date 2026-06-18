@@ -1,0 +1,22 @@
+# just-buildit
+
+> The just-buildit toolchain: small, composable tools for standing up,
+> building, and shipping Python + C projects without a tool owning your build.
+> Each tool stands alone; they also compose. Declare what you need in TOML; the
+> tooling pulls the rest on demand.
+
+## Tools
+
+- [just-makeit](https://github.com/just-buildit/just-makeit) (`jm`): scaffold and build Python C extensions — generates C, CMake, CPython bindings, type stubs, and tests from a manifest, so you write only the algorithm. Docs: https://just-buildit.github.io/just-makeit/
+- [just-buildit](https://github.com/just-buildit/just-buildit): a zero-dependency PEP 517 build backend for C extensions — you define the build, it packages the wheel. Docs: https://just-buildit.github.io/just-buildit/
+- [just-bashit](https://github.com/just-buildit/just-bashit): shfmt-conformant, bats-tested, shellcheck-linted shell libraries, tools, and templates. Docs: https://just-buildit.github.io/just-bashit/
+- jbx / just-runit (`jb`): the universal entrypoint and ephemeral script runner — `. <(curl -sSL https://just-buildit.github.io/get-jb.sh)`
+
+## Packages
+
+- just-makeit on PyPI: https://pypi.org/project/just-makeit/
+- just-buildit on PyPI: https://pypi.org/project/just-buildit/
+
+## Org
+
+- GitHub: https://github.com/just-buildit

@@ -7,5 +7,5 @@
 # rather than a moving branch.
 
 [aliases]
-install-deps   = "https://just-buildit.github.io/install-deps.sh"
+install-deps   = "https://raw.githubusercontent.com/just-buildit/just-bashit/main/src/just_bashit/install-deps.sh"
 get-jb         = "https://just-buildit.github.io/get-jb.sh"

@@ -21,12 +21,13 @@ jobs:
           set -euo pipefail
           declare -A SOURCES=(
             [get-jb.sh]="https://raw.githubusercontent.com/just-buildit/just-bashit/main/src/just_bashit/get-jb.sh"
+            [just-runit]="https://raw.githubusercontent.com/just-buildit/just-bashit/main/src/just_bashit/just-runit"
             # Add get-just-makeit.sh, get-just-bashit.sh, get-just-buildit.sh here as they land.
           )
           for dest in "${!SOURCES[@]}"; do
             url="${SOURCES[$dest]}"
             echo "fetching ${url} -> ${dest}"
-            curl -sSL --proto '=https' --tlsv1.2 -o "${dest}.new" "${url}"
+            curl -sSL --fail --proto '=https' --tlsv1.2 -o "${dest}.new" "${url}"
             if [ -f "${dest}" ] && cmp -s "${dest}" "${dest}.new"; then
               echo "  unchanged"
               rm -f "${dest}.new"

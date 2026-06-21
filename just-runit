@@ -1,0 +1,682 @@
+#!/usr/bin/env bash
+# ############################################################################
+# EXECUTABLE: just-runit (aliases: jb run, jbx)                              #
+# PACKAGE: just-bashit version 0.2.0                                         #
+# ############################################################################
+# Ephemeral bash tool runner. Fetch a script from a URL or namespace, call   #
+# an optional function, then discard — no installation, no env pollution.    #
+# Analogous to uvx but for any bash/Python script reachable over HTTPS.      #
+# ############################################################################
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---- defaults ---------------------------------------------------------------
+
+_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/just-runit"
+_ME="$(basename "$0")"
+_VERSION="0.1.4"
+_DEFAULT_TTL=3600
+
+# Default namespace base URL (just-buildit org pages root).
+_JB_DEFAULT_NS="just-buildit"
+_JB_DEFAULT_BASE="https://just-buildit.github.io"
+
+# just-bashit raw source base — scripts co-fetched for inter-lib calls.
+_JBS_BASE="https://raw.githubusercontent.com/just-buildit/just-bashit/main/src/just_bashit"
+# All src/ libs; fetched together so relative inter-source calls resolve.
+_JBS_LIBS=(
+	datetime environment file format
+	function-template logging match network path
+	pkg toml
+)
+
+# ---- top-level dispatch (when called as "jb" or "just-buildit") -------------
+
+if [[ ${_ME} == "jb" || ${_ME} == "just-buildit" ]]; then
+	SUBCMD="${1:-}"
+	case "${SUBCMD}" in
+	run)
+		shift
+		_ME="${_ME} run"
+		;;
+	cache)
+		shift
+		_CACHE_OP="${1:-}"
+		case "${_CACHE_OP}" in
+		clear)
+			shift
+			_CACHE_TARGET="${1:-all}"
+			case "${_CACHE_TARGET}" in
+			all)
+				rm -rf "${_CACHE_DIR}"
+				echo "cleared ${_CACHE_DIR}"
+				;;
+			jbs)
+				rm -rf "${_CACHE_DIR}/jbs"
+				echo "cleared ${_CACHE_DIR}/jbs"
+				;;
+			*)
+				# Treat arg as a URL — remove its cache entry.
+				_key=$(printf '%s' "${_CACHE_TARGET}" | sha256sum | cut -d' ' -f1)
+				_removed=0
+				for _f in "${_CACHE_DIR}/${_key}".{sh,py} "${_CACHE_DIR}/${_key}".meta; do
+					[[ -f ${_f} ]] && {
+						rm -f "${_f}"
+						_removed=1
+					}
+				done
+				if [[ ${_removed} -eq 1 ]]; then
+					echo "cleared cache entry for ${_CACHE_TARGET}"
+				else
+					echo "${_ME}: no cache entry found for ${_CACHE_TARGET}" >&2
+					exit 1
+				fi
+				;;
+			esac
+			;;
+		"" | -h | --help)
+			cat <<-EOF
+				Usage: ${_ME} cache <operation> [TARGET]
+
+				Operations:
+				  clear [all]   Remove all cached scripts and aliases (default)
+				  clear jbs     Remove the just-bashit co-fetch bundle only
+				  clear <url>   Remove the cache entry for a specific URL
+			EOF
+			;;
+		*)
+			echo "${_ME} cache: unknown operation '${_CACHE_OP}'" >&2
+			echo "Run '${_ME} cache -h' for usage." >&2
+			exit 1
+			;;
+		esac
+		exit 0
+		;;
+	install)
+		# Find jb.toml walking up from CWD.
+		_toml=""
+		_dir="${PWD}"
+		while [[ "${_dir}" != "/" ]]; do
+			if [[ -f "${_dir}/jb.toml" ]]; then
+				_toml="${_dir}/jb.toml"
+				break
+			fi
+			_dir="$(dirname "${_dir}")"
+		done
+		if [[ -z "${_toml}" ]]; then
+			echo "${_ME}: no jb.toml found (searched up from ${PWD})" >&2
+			exit 1
+		fi
+		printf '  reading %s\n' "${_toml}"
+		# Extract all source = "..." values from [tools.*] sections.
+		mapfile -t _sources < <(awk '
+			/^\[tools\./ { in_t=1; next }
+			/^\[/        { in_t=0 }
+			in_t && /^[[:space:]]*source[[:space:]]*=/ {
+				gsub(/.*=[[:space:]]*"|".*/, ""); print
+			}
+		' "${_toml}")
+		if [[ ${#_sources[@]} -eq 0 ]]; then
+			echo "${_ME}: no [tools.*] entries with source in ${_toml}"
+			exit 0
+		fi
+		_runner="$(readlink -f "${BASH_SOURCE[0]}")"
+		_ok=0
+		_fail=0
+		for _src in "${_sources[@]}"; do
+			printf '  -> %s ' "${_src}"
+			if "${_runner}" -l "${_src}" >/dev/null 2>&1; then
+				printf 'ok\n'
+				((_ok++)) || true
+			else
+				printf 'failed\n' >&2
+				((_fail++)) || true
+			fi
+		done
+		printf '  %d fetched' "${_ok}"
+		[[ ${_fail} -gt 0 ]] && printf ', %d failed' "${_fail}"
+		printf '\n'
+		[[ ${_fail} -gt 0 ]] && exit 1 || exit 0
+		;;
+	version | -V | --version)
+		echo "${_ME} v${_VERSION}"
+		exit 0
+		;;
+	"" | help | -h | --help)
+		cat <<-EOF
+			Usage: ${_ME} <command> [OPTIONS] [ARGS...]
+
+			Commands:
+			  run      Ephemeral script runner (alias: jbx)
+			  install  Pre-fetch all tools declared in jb.toml
+			  cache    Manage the local script cache
+			  version  Print version and exit
+
+			Run '${_ME} <command> -h' for details.
+		EOF
+		exit 0
+		;;
+	*)
+		echo "${_ME}: unknown command '${SUBCMD}'" >&2
+		echo "Run '${_ME} help' for usage." >&2
+		exit 1
+		;;
+	esac
+fi
+
+# ---- option state -----------------------------------------------------------
+
+OPT_REFRESH=0
+OPT_NO_CACHE=0
+OPT_CLEAN=0
+OPT_VERBOSE=0
+OPT_LIST=0
+OPT_TTL="${_DEFAULT_TTL}"
+OPT_CHECKSUM=""
+OPT_PASS=()
+OPTARG=""
+OPTIND=1
+
+# ---- help -------------------------------------------------------------------
+
+read -r -d '' HELP <<-EOF || true
+	Usage: ${_ME} [OPTIONS] SPEC [FUNCTION [ARGS...]]
+	   or: jbx [OPTIONS] SPEC [FUNCTION [ARGS...]]
+
+	  Ephemeral tool runner. Resolve SPEC to a script, optionally call
+	  FUNCTION with ARGS, then discard — no installation, no env pollution.
+
+	SPEC forms:
+	  NAME                  bare name, resolved via default namespace (just-buildit)
+	  NS:NAME               explicit namespace (e.g. just-bashit:logging)
+	  gh:USER/REPO/PATH     GitHub raw, default branch main
+	  gh:USER/REPO/PATH@REF GitHub raw at a specific ref/tag/sha
+	  https://URL           direct URL
+
+	Namespaces:
+	  just-buildit          ${_JB_DEFAULT_BASE}/   (default)
+	  just-bashit           ${_JBS_BASE}/
+
+	Resolution order for NAME / NS:NAME:
+	  1. aliases.toml at namespace base
+	  2. Direct URL probe: NS_BASE/NAME.sh then NS_BASE/NAME.py
+
+	Options:
+	  -h        Show this message and exit.
+	  -l        List functions defined by SPEC then exit.
+	  -r        Refresh — ignore and overwrite cached copy.
+	  -n        No-cache — fetch fresh and discard (nothing written).
+	  -c        Clean environment (minimal, like sudo without -E).
+	  -p VARS   Comma-separated var names to pass through with -c.
+	  -t TTL    Cache TTL in seconds (default 3600). 0 = keep forever.
+	  -k HASH   Verify script before running: sha256:HASH or md5:HASH.
+	  -v        Verbose.
+
+	Language detection (automatic):
+	  .sh / bash shebang   Sourced into a bash subshell; FUNCTION supported.
+	  .py / python shebang Run with uv run (PEP 723 inline deps) or python3.
+	                       FUNCTION not supported for Python — pass args directly.
+
+	Examples:
+	  ${_ME} install-deps -s apt
+	  ${_ME} just-bashit:logging log "hello"
+	  ${_ME} just-bashit:datetime iso-8601-basic -m
+	  ${_ME} gh:user/repo/tools/deploy.sh run --env prod
+	  ${_ME} gh:user/repo/tool.sh@v2.1.0 setup
+	  ${_ME} https://example.com/tool.sh
+	  ${_ME} https://example.com/tool.py --flag value
+	  ${_ME} -l just-bashit:logging
+	  ${_ME} -c -p HOME,TERM https://example.com/tool.sh func arg
+	  ${_ME} -n -k sha256:abc123 https://example.com/tool.sh fn
+EOF
+
+# ---- parse options ----------------------------------------------------------
+
+while getopts ":hlrncvp:t:k:" option; do
+	case $option in
+	h)
+		echo "${HELP}"
+		exit 0
+		;;
+	l) OPT_LIST=1 ;;
+	r) OPT_REFRESH=1 ;;
+	n) OPT_NO_CACHE=1 ;;
+	c) OPT_CLEAN=1 ;;
+	v) OPT_VERBOSE=1 ;;
+	p) IFS=',' read -ra OPT_PASS <<<"${OPTARG}" ;;
+	t) OPT_TTL="${OPTARG}" ;;
+	k) OPT_CHECKSUM="${OPTARG}" ;;
+	\?)
+		echo "Invalid option: -${OPTARG}"
+		echo "${HELP}"
+		exit 1
+		;;
+	esac
+done
+shift "$((OPTIND - 1))"
+
+[[ $# -eq 0 ]] && {
+	echo "${HELP}"
+	exit 1
+}
+
+RAW_SPEC="${1}"
+shift
+# Only treat the next arg as a function name if it doesn't look like a flag.
+# Flags (starting with -) and missing args fall through to ARGS unchanged.
+FUNC="${1:-}"
+if [[ -n ${FUNC} && ${FUNC} != -* ]]; then
+	shift || true
+else
+	FUNC=""
+fi
+ARGS=("$@")
+
+# ---- helpers ----------------------------------------------------------------
+
+_log() { [[ ${OPT_VERBOSE} -eq 1 ]] && echo "${_ME}: $*" >&2 || true; }
+_err() {
+	echo "${_ME}: error: $*" >&2
+	exit 1
+}
+
+# ---- namespace resolution ---------------------------------------------------
+
+# Parse aliases.toml from NS_BASE/aliases.toml and look up a name.
+# Returns the resolved URL, or empty string if not found.
+_lookup_alias() {
+	local base="${1}" name="${2}"
+	local aliases_url="${base}/aliases.toml"
+	local key
+	key=$(printf '%s' "${base}" | sha256sum | cut -d' ' -f1)
+	local aliases_cache="${_CACHE_DIR}/aliases-${key}.toml"
+
+	if [[ ${OPT_REFRESH} -eq 1 ]] || ! _cache_valid "${aliases_cache}"; then
+		mkdir -p "${_CACHE_DIR}"
+		_log "fetching ${aliases_url}"
+		if ! curl -sSL --proto '=https' --tlsv1.2 --max-time 10 \
+			-o "${aliases_cache}.new" "${aliases_url}" 2>/dev/null; then
+			rm -f "${aliases_cache}.new"
+			echo ""
+			return
+		fi
+		mv "${aliases_cache}.new" "${aliases_cache}"
+		printf 'ts=%s\nurl=%s\n' "$(date +%s)" "${aliases_url}" \
+			>"$(_meta_path "${aliases_cache}")"
+	fi
+
+	# Parse: find key under [aliases] section.
+	awk -v target="${name}" '
+		/^\[aliases\]/ { in_sec=1; next }
+		/^\[/          { in_sec=0 }
+		in_sec && /^[[:space:]]*[^#=[:space:]]/ {
+			split($0, a, /[[:space:]]*=[[:space:]]*/)
+			key = a[1]; gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+			val = a[2]; gsub(/^[[:space:]"]+|["[:space:]]+$/, "", val)
+			if (key == target) { print val; exit }
+		}
+	' "${aliases_cache}"
+}
+
+# Probe whether a URL exists (HEAD, no download).  Returns 0 if 2xx/3xx.
+_head_ok() {
+	local url="${1}"
+	local code
+	code=$(curl -sSL --proto '=https' --tlsv1.2 --max-time 5 \
+		-o /dev/null -w '%{http_code}' --head "${url}" 2>/dev/null)
+	[[ ${code} == "200" || ${code} == "301" || ${code} == "302" ]]
+}
+
+# Resolve NS:NAME or bare NAME against a namespace base URL.
+# Returns a URL or the internal "jbs:NAME" marker for just-bashit.
+_resolve_ns() {
+	local ns="${1}" name="${2}"
+
+	# Map namespace to base URL.
+	local base
+	case "${ns}" in
+	just-buildit) base="${_JB_DEFAULT_BASE}" ;;
+	just-bashit)
+		# just-bashit uses the co-fetch mechanism; return internal marker.
+		echo "jbs:${name}"
+		return
+		;;
+	*)
+		_err "unknown namespace '${ns}'; known: just-buildit, just-bashit"
+		;;
+	esac
+
+	# 1. Check aliases.toml first (one cached round-trip covers all names).
+	local alias_url
+	alias_url=$(_lookup_alias "${base}" "${name}")
+	if [[ -n ${alias_url} ]]; then
+		_log "resolved '${name}' via aliases.toml -> ${alias_url}"
+		echo "${alias_url}"
+		return
+	fi
+
+	# 2. Probe direct .sh then .py.
+	local url_sh="${base}/${name}.sh"
+	local url_py="${base}/${name}.py"
+	if _head_ok "${url_sh}"; then
+		_log "resolved '${name}' via direct probe -> ${url_sh}"
+		echo "${url_sh}"
+		return
+	fi
+	if _head_ok "${url_py}"; then
+		_log "resolved '${name}' via direct probe -> ${url_py}"
+		echo "${url_py}"
+		return
+	fi
+
+	_err "cannot resolve '${name}' in namespace '${ns}' (checked ${base}/aliases.toml and ${url_sh})"
+}
+
+# ---- URL resolution ---------------------------------------------------------
+
+_resolve() {
+	local raw="${1}"
+	case "${raw}" in
+	just-bashit:*)
+		# Explicit just-bashit namespace; use co-fetch mechanism.
+		echo "jbs:${raw#just-bashit:}"
+		;;
+	*://*)
+		case "${raw}" in
+		https://*) echo "${raw}" ;;
+		http://*) _err "HTTP not allowed; use HTTPS" ;;
+		*) _err "unrecognised URL scheme: ${raw}" ;;
+		esac
+		;;
+	gh:*)
+		local spec="${raw#gh:}" ref="main"
+		if [[ ${spec} == *@* ]]; then
+			ref="${spec##*@}"
+			spec="${spec%@*}"
+		fi
+		local user repo path
+		user="${spec%%/*}"
+		spec="${spec#*/}"
+		repo="${spec%%/*}"
+		path="${spec#*/}"
+		echo "https://raw.githubusercontent.com/${user}/${repo}/${ref}/${path}"
+		;;
+	*:*)
+		# NS:NAME form (not a URL scheme — no :// present).
+		local ns="${raw%%:*}" name="${raw#*:}"
+		_resolve_ns "${ns}" "${name}"
+		;;
+	*)
+		# Bare name — resolve against default namespace.
+		_resolve_ns "${_JB_DEFAULT_NS}" "${raw}"
+		;;
+	esac
+}
+
+# ---- cache helpers ----------------------------------------------------------
+
+_cache_key() { printf '%s' "${1}" | sha256sum | cut -d' ' -f1; }
+
+_cache_ext() { case "${1}" in *.py) echo ".py" ;; *) echo ".sh" ;; esac }
+
+_cache_path() {
+	local url="${1}"
+	echo "${_CACHE_DIR}/$(_cache_key "${url}")$(_cache_ext "${url}")"
+}
+
+_meta_path() { echo "${1%.*}.meta"; }
+
+_cache_valid() {
+	local cached="${1}"
+	[[ -f ${cached} ]] || return 1
+	local meta
+	meta=$(_meta_path "${cached}")
+	[[ -f ${meta} ]] || return 1
+	[[ ${OPT_TTL} -eq 0 ]] && return 0
+	local ts now
+	ts=$(grep '^ts=' "${meta}" | cut -d= -f2)
+	now=$(date +%s)
+	((now - ts < OPT_TTL))
+}
+
+_fetch_to() {
+	local url="${1}" dest="${2}"
+	_log "fetching ${url}"
+	curl -sSL -o "${dest}" "${url}"
+	printf 'ts=%s\nurl=%s\n' "$(date +%s)" "${url}" >"$(_meta_path "${dest}")"
+}
+
+# ---- acquire script ---------------------------------------------------------
+
+# For just-bashit scripts, all src/ libs are co-fetched into cache/jbs/ so
+# that relative inter-source calls (e.g. logging.sh -> format.sh) resolve.
+_acquire_jbs() {
+	local lib="${1}"
+	local jbs_dir="${_CACHE_DIR}/jbs"
+	mkdir -p "${jbs_dir}"
+
+	local needs_fetch=0
+	local dest="${jbs_dir}/${lib}.sh"
+
+	[[ ${OPT_REFRESH} -eq 1 ]] && needs_fetch=1
+	[[ ! -f ${dest} ]] && needs_fetch=1
+	! _cache_valid "${dest}" && needs_fetch=1
+
+	if [[ ${needs_fetch} -eq 1 ]]; then
+		_log "fetching all jbs libs to ${jbs_dir}"
+		for l in "${_JBS_LIBS[@]}"; do
+			_fetch_to "${_JBS_BASE}/${l}.sh" "${jbs_dir}/${l}.sh"
+		done
+		# fetch the target itself when it is not one of the core libs
+		if ! printf '%s\n' "${_JBS_LIBS[@]}" | grep -qx "${lib}"; then
+			_fetch_to "${_JBS_BASE}/${lib}.sh" "${dest}"
+		fi
+	else
+		_log "cache hit: ${dest}"
+	fi
+
+	echo "${dest}"
+}
+
+_acquire() {
+	local url="${1}"
+
+	if [[ ${url} == jbs:* ]]; then
+		_acquire_jbs "${url#jbs:}"
+		return
+	fi
+
+	# Scripts fetched directly from _JBS_BASE need their sibling libs available
+	# at ${_SCRIPT_DIR}/ (where _SCRIPT_DIR = dirname of the cached file).
+	# Route through _acquire_jbs so all libs land together in cache/jbs/.
+	if [[ ${url} == "${_JBS_BASE}/"* ]]; then
+		local _lib="${url#${_JBS_BASE}/}"
+		_acquire_jbs "${_lib%.sh}"
+		return
+	fi
+
+	if [[ ${OPT_NO_CACHE} -eq 1 ]]; then
+		local ext tmp
+		ext=$(_cache_ext "${url}")
+		tmp=$(mktemp "/tmp/just-runit.XXXXXX${ext}")
+		# shellcheck disable=SC2064
+		trap "rm -f '${tmp}' '$(_meta_path "${tmp}")'" EXIT
+		_fetch_to "${url}" "${tmp}"
+		echo "${tmp}"
+		return
+	fi
+
+	mkdir -p "${_CACHE_DIR}"
+	local cached
+	cached=$(_cache_path "${url}")
+
+	if [[ ${OPT_REFRESH} -eq 1 ]] || ! _cache_valid "${cached}"; then
+		_fetch_to "${url}" "${cached}"
+	else
+		_log "cache hit: ${cached}"
+	fi
+
+	echo "${cached}"
+}
+
+# ---- checksum ---------------------------------------------------------------
+
+_verify() {
+	local file="${1}" spec="${2}"
+	local algo="${spec%%:*}" expected="${spec#*:}" actual
+	case "${algo}" in
+	sha256) actual=$(sha256sum "${file}" | cut -d' ' -f1) ;;
+	md5) actual=$(md5sum "${file}" | cut -d' ' -f1) ;;
+	*) _err "unsupported checksum algorithm: ${algo}" ;;
+	esac
+	[[ ${actual} == "${expected}" ]] ||
+		_err "checksum mismatch (got ${actual}, expected ${expected})"
+	_log "checksum OK"
+}
+
+# ---- language detection -----------------------------------------------------
+
+# Check shebang first, fall back to URL extension.
+_detect_lang() {
+	local script="${1}" url="${2}"
+	local shebang
+	shebang=$(head -1 "${script}" 2>/dev/null || true)
+	case "${shebang}" in
+	*python*)
+		echo "python"
+		return
+		;;
+	esac
+	case "${url}" in
+	*.py)
+		echo "python"
+		return
+		;;
+	esac
+	echo "bash"
+}
+
+# ---- list functions ---------------------------------------------------------
+
+_list_fns() {
+	local script="${1}" lang="${2}"
+	if [[ ${lang} == "python" ]]; then
+		python3 - "${script}" <<'PYEOF'
+import ast, sys
+src = open(sys.argv[1]).read()
+names = sorted(
+    node.name
+    for node in ast.walk(ast.parse(src))
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+)
+print('\n'.join(names))
+PYEOF
+		return
+	fi
+	bash -c "
+        _b=\$(declare -F | awk '{print \$3}')
+        # shellcheck source=/dev/null
+        source '${script}' 2>/dev/null || true
+        _a=\$(declare -F | awk '{print \$3}')
+        comm -13 <(printf '%s\n' \${_b} | sort) \
+                 <(printf '%s\n' \${_a} | sort)
+    "
+}
+
+# ---- execute ----------------------------------------------------------------
+
+_run_python() {
+	local script="${1}"
+	shift
+
+	if ! command -v uv >/dev/null 2>&1; then
+		_log "uv not found — installing via jb run"
+		"${0}" https://astral.sh/uv/install.sh
+		hash -r 2>/dev/null || true
+		command -v uv >/dev/null 2>&1 ||
+			_err "uv install failed; try manually: jb run https://astral.sh/uv/install.sh"
+	fi
+
+	_log "using uv run"
+	if [[ ${OPT_CLEAN} -eq 1 ]]; then
+		local env_pairs=("HOME=${HOME}" "TERM=${TERM:-}" "PATH=${PATH}")
+		local v
+		for v in "${OPT_PASS[@]+"${OPT_PASS[@]}"}"; do
+			env_pairs+=("${v}=${!v:-}")
+		done
+		env -i "${env_pairs[@]}" uv run "${script}" "$@"
+	else
+		uv run "${script}" "$@"
+	fi
+}
+
+_run() {
+	local script="${1}" func="${2:-}" lang="${3}"
+	shift 3 || true
+
+	if [[ ${lang} == "python" ]]; then
+		[[ -n ${func} ]] &&
+			_err "function mode not supported for Python; pass args directly"
+		_run_python "${script}" "$@"
+		return
+	fi
+
+	# Validate func is defined after sourcing the script. Using declare -F
+	# rather than the before/after diff in _list_fns so that script functions
+	# which shadow same-named env functions are accepted.
+	# In verbose mode, also report when the script function shadows a
+	# pre-existing command or builtin.
+	if [[ -n ${func} ]]; then
+		local _probe
+		_probe=$(bash -c "
+			_pre=\$(type -t ${func@Q} 2>/dev/null || true)
+			source ${script@Q} 2>/dev/null
+			declare -F ${func@Q} >/dev/null 2>&1 && echo \"ok:\${_pre}\" || echo notfound
+		")
+		case "${_probe}" in
+		notfound) _err "'${func}' is not a function defined by this script" ;;
+		ok:file) _log "note: script function '${func}' shadows a shell command" ;;
+		ok:builtin) _log "note: script function '${func}' shadows a shell builtin" ;;
+		ok:alias) _log "note: script function '${func}' shadows a shell alias" ;;
+		esac
+	fi
+
+	# Build the command string; %q ensures safe quoting of paths/names.
+	local cmd
+	if [[ -n ${func} ]]; then
+		cmd=$(printf '. %q && %q "$@"' "${script}" "${func}")
+	else
+		cmd=$(printf '. %q' "${script}")
+	fi
+
+	if [[ ${OPT_CLEAN} -eq 1 ]]; then
+		local env_pairs=("HOME=${HOME}" "TERM=${TERM:-}" "PATH=${PATH}")
+		local v
+		for v in "${OPT_PASS[@]+"${OPT_PASS[@]}"}"; do
+			env_pairs+=("${v}=${!v:-}")
+		done
+		env -i "${env_pairs[@]}" bash -c "${cmd}" -- "$@"
+	else
+		bash -c "${cmd}" -- "$@"
+	fi
+}
+
+# ---- main -------------------------------------------------------------------
+
+URL=$(_resolve "${RAW_SPEC}")
+_log "resolved: ${URL}"
+
+SCRIPT=$(_acquire "${URL}")
+_log "script: ${SCRIPT}"
+
+[[ -n ${OPT_CHECKSUM} ]] && _verify "${SCRIPT}" "${OPT_CHECKSUM}"
+
+SCRIPT_LANG=$(_detect_lang "${SCRIPT}" "${RAW_SPEC}")
+_log "language: ${SCRIPT_LANG}"
+
+if [[ ${OPT_LIST} -eq 1 ]]; then
+	_list_fns "${SCRIPT}" "${SCRIPT_LANG}"
+	exit 0
+fi
+
+_run "${SCRIPT}" "${FUNC}" "${SCRIPT_LANG}" "${ARGS[@]+"${ARGS[@]}"}"

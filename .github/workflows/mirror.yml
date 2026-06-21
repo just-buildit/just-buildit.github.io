@@ -20,7 +20,7 @@ jobs:
         run: |
           set -euo pipefail
           declare -A SOURCES=(
-            [get-jb.sh]="https://raw.githubusercontent.com/just-buildit/just-bashit/main/src/get-jb.sh"
+            [get-jb.sh]="https://raw.githubusercontent.com/just-buildit/just-bashit/main/src/just_bashit/get-jb.sh"
             # Add get-just-makeit.sh, get-just-bashit.sh, get-just-buildit.sh here as they land.
           )
           for dest in "${!SOURCES[@]}"; do

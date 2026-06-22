@@ -16,7 +16,9 @@
 _jb_install() {
 
 	local INSTALL_DIR="${HOME}/.local/bin"
-	local RUNIT_URL="https://just-buildit.github.io/just-runit"
+	local RAW_BASE
+	RAW_BASE="https://raw.githubusercontent.com/just-buildit/just-bashit/main/src"
+	local RUNIT_URL="${RAW_BASE}/just-runit"
 	local BASHRC="${HOME}/.bashrc"
 
 	local BOLD="\033[1m"

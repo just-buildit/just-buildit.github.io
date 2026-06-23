@@ -22,7 +22,7 @@ _JB_DEFAULT_NS="just-buildit"
 _JB_DEFAULT_BASE="https://just-buildit.github.io"
 
 # just-bashit raw source base — scripts co-fetched for inter-lib calls.
-_JBS_BASE="https://raw.githubusercontent.com/just-buildit/just-bashit/main/src"
+_JBS_BASE="https://raw.githubusercontent.com/just-buildit/just-bashit/main/src/just_bashit"
 # All src/ libs; fetched together so relative inter-source calls resolve.
 _JBS_LIBS=(
 	datetime environment file format

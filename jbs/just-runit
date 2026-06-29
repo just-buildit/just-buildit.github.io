@@ -21,8 +21,10 @@ _DEFAULT_TTL=3600
 _JB_DEFAULT_NS="just-buildit"
 _JB_DEFAULT_BASE="https://just-buildit.github.io"
 
-# just-bashit raw source base — scripts co-fetched for inter-lib calls.
-_JBS_BASE="https://raw.githubusercontent.com/just-buildit/just-bashit/main/src/just_bashit"
+# just-bashit source base — sibling libs co-fetched for inter-lib calls.
+# Served from the Pages CDN (mirror of src/just_bashit/), NOT
+# raw.githubusercontent, which rate-limits shared CI runner IPs.
+_JBS_BASE="https://just-buildit.github.io/jbs"
 # All src/ libs; fetched together so relative inter-source calls resolve.
 _JBS_LIBS=(
 	datetime environment file format

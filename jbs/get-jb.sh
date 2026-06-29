@@ -17,7 +17,8 @@ _jb_install() {
 
 	local INSTALL_DIR="${HOME}/.local/bin"
 	local RAW_BASE
-	RAW_BASE="https://raw.githubusercontent.com/just-buildit/just-bashit/main/src/just_bashit"
+	# Pages CDN mirror of src/just_bashit/ (not rate-limited raw.github).
+	RAW_BASE="https://just-buildit.github.io/jbs"
 	local RUNIT_URL="${RAW_BASE}/just-runit"
 	local BASHRC="${HOME}/.bashrc"
 

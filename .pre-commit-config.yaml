@@ -1,0 +1,24 @@
+# Mirror artifacts are synced verbatim from just-bashit by mirror.yml — never
+# reformat them here or they drift from source. Everything else is hand-owned.
+exclude: ^(jbs/|get-jb\.sh|just-runit|install-deps\.sh)
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-yaml          # .github/workflows/mirror.yml
+      - id: check-toml          # aliases.toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=500]
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  - repo: https://github.com/hukkin/mdformat
+    rev: 1.0.0
+    hooks:
+      - id: mdformat            # README.md, llms.txt
+        additional_dependencies:
+          - mdformat-gfm
+          - mdformat-gfm-alerts
+          - mdformat-mkdocs

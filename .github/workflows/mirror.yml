@@ -37,6 +37,22 @@ jobs:
             fi
           done
 
+      - name: Mirror just-bashit co-fetch libs to /jbs/
+        run: |
+          set -euo pipefail
+          # jbx co-fetches the whole sibling lib set (datetime, environment,
+          # logging, ...) on every just-bashit:* call. Serve them from the
+          # Pages CDN so _JBS_BASE no longer hits rate-limited
+          # raw.githubusercontent from shared CI runner IPs.
+          tmp="$(mktemp -d)"
+          git clone --depth 1 \
+            https://github.com/just-buildit/just-bashit "${tmp}/jb"
+          mkdir -p jbs
+          rm -f jbs/*.sh jbs/just-runit
+          cp "${tmp}"/jb/src/just_bashit/*.sh jbs/
+          cp "${tmp}"/jb/src/just_bashit/just-runit jbs/
+          rm -rf "${tmp}"
+
       - name: Commit & push if changed
         run: |
           set -euo pipefail

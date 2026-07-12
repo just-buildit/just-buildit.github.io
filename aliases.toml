@@ -9,3 +9,4 @@
 [aliases]
 install-deps   = "https://just-buildit.github.io/jbs/install-deps.sh"
 get-jb         = "https://just-buildit.github.io/get-jb.sh"
+get-doppler    = "https://raw.githubusercontent.com/doppler-dsp/doppler/v0.33.2/scripts/get-doppler.sh"

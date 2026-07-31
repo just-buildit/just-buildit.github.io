@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  # No path filter on pull_request, deliberately. The `main` ruleset requires
+  # the "CI passed" check below on every PR, so it has to run on every PR — a
+  # path filter would skip the job on an unrelated change and the required
+  # check would never arrive, leaving the PR unmergeable forever. That is not
+  # hypothetical: it is the state this repo was in until this workflow existed,
+  # with a required check no workflow here could ever report.
+  pull_request:
+  workflow_dispatch: {}
+
+jobs:
+  # ------------------------------------------------------------------
+  # standard.mk is CANONICAL: every repo in just-buildit and doppler-dsp
+  # vendors this exact file, and their `make lint` compares against it on
+  # every run with no cache. So a broken publish here does not fail here —
+  # it fails in every adopter, at once, the moment they re-vendor. This job
+  # is the only place that cost can be caught before it is paid.
+  # ------------------------------------------------------------------
+  standard-mk:
+    name: standard.mk
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parses as GNU make, with the config surface unset
+        # The file must FAIL cleanly when a required command variable is
+        # missing -- that is the gh-issue-class it exists to prevent (a flag
+        # turned on with no command behind it is a target that exits 0 having
+        # done nothing). A syntax error and a deliberate $(error) look alike to
+        # `make`, so assert on the message, not just the exit code.
+        run: |
+          tmp="$(mktemp -d)"; cp standard.mk "$tmp/"
+          printf 'HAS_DOXYGEN = 1\ninclude standard.mk\n' > "$tmp/Makefile"
+          out="$(make -C "$tmp" help 2>&1 || true)"
+          echo "$out"
+          echo "$out" | grep -q "TEST_CMD is empty" \
+            || { echo "::error::expected a parse-time error naming TEST_CMD"; exit 1; }
+
+      - name: Every feature group defines its targets
+        # Turns ON every flag with a command behind each one, so a group whose
+        # variables and targets have drifted apart shows up here rather than in
+        # whichever adopter enables that flag next.
+        run: |
+          tmp="$(mktemp -d)"; cp standard.mk "$tmp/"
+          cat > "$tmp/Makefile" <<'EOF'
+          HAS_C = 1
+          HAS_PYTHON = 1
+          HAS_RUST = 1
+          HAS_DOCS = 1
+          HAS_DOXYGEN = 1
+          HAS_BENCH = 1
+          HAS_COVERAGE = 1
+          HAS_RELEASE = 1
+          HAS_EXAMPLES = 1
+          TEST_CMD = @echo test
+          TEST_FAST_CMD = @echo test-fast
+          CLEAN_PATHS = dist/
+          PYEXT_CMD = @echo pyext
+          DOXYGEN_CHECK_CMD = @echo doxygen-check
+          BENCH_CMD = @echo bench
+          BENCH_SAVE_CMD = @echo bench-save
+          BENCH_COMPARE_CMD = @echo bench-compare
+          COVERAGE_CMD = @echo coverage
+          COVERAGE_GATE_CMD = @echo coverage-gate
+          BUMP_VERSION_CMD = @echo bump
+          RELEASE_WATCH_CMD = @echo watch
+          VERSION_PROBES = pyproject.toml|echo 1.2.3
+          TEST_EXAMPLES_CMD = @echo test-examples
+          LINT_TOOLS = ruff
+          LINT_ruff = @echo lint-ruff
+          include standard.mk
+          EOF
+          make -C "$tmp" help
+          n="$(make -C "$tmp" help | grep -cE '^  [a-z]')"
+          echo "targets listed: $n"
+          [ "$n" -ge 38 ] || { echo "::error::expected >=38 targets, got $n"; exit 1; }
+
+      - name: Its own gates pass, and can fail
+        # help-check and ghost-check are what adopters rely on. Prove both
+        # directions here: clean tree passes, sabotaged tree fails. A gate that
+        # cannot fail is the thing this whole standard exists to stop.
+        run: |
+          tmp="$(mktemp -d)"; cp standard.mk "$tmp/"
+          cat > "$tmp/Makefile" <<'EOF'
+          TEST_CMD = @echo test
+          TEST_FAST_CMD = @echo test-fast
+          CLEAN_PATHS = dist/
+          include standard.mk
+          EOF
+          make -C "$tmp" help-check ghost-check
+
+          printf 'LOCAL_TARGETS = ghosty\n' >> "$tmp/Makefile"
+          printf '.PHONY: ghosty\nghosty: ## a target with no recipe\n' >> "$tmp/Makefile"
+          if make -C "$tmp" ghost-check > "$tmp/log" 2>&1; then
+            cat "$tmp/log"
+            echo "::error::ghost-check passed a target with no recipe"; exit 1
+          fi
+          grep -q "ghosty" "$tmp/log" \
+            || { cat "$tmp/log"; echo "::error::ghost-check did not name it"; exit 1; }
+          echo "OK — gates pass clean and fail when sabotaged."
+
+      - name: Serving matches the repo
+        # Only meaningful on main (a PR's copy is not published yet), and it is
+        # the question the drift gate asks from the other side: does what Pages
+        # actually serves equal what is committed here?
+        if: github.ref == 'refs/heads/main'
+        run: |
+          curl -fsSL -o served.mk https://just-buildit.github.io/standard.mk
+          diff -u served.mk standard.mk \
+            || { echo "::error::Pages is serving a different standard.mk"; exit 1; }
+          echo "OK — Pages serves the committed file."
+
+  # ------------------------------------------------------------------
+  # Aggregator: the single "CI passed" check the `main` ruleset requires.
+  # Adding a job above means adding it to `needs:` here — otherwise the
+  # aggregator goes green while the new job is red, and the required check
+  # stops meaning anything. Mirrors doppler and just-buildit/.github so the
+  # org has one shape.
+  # ------------------------------------------------------------------
+  ci-passed:
+    name: CI passed
+    needs:
+      - standard-mk
+    runs-on: ubuntu-latest
+    # `always()` so this still runs when a dependency failed — otherwise it
+    # would be skipped, the required check would never report, and a red PR
+    # would look identical to an unmergeable one.
+    if: always()
+    steps:
+      - name: Require all jobs to have succeeded
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" || \
+                "${{ contains(needs.*.result, 'cancelled') }}" == "true" || \
+                "${{ contains(needs.*.result, 'skipped') }}" == "true" ]]; then
+            echo "::error::a required CI job did not succeed — CI not green"
+            exit 1
+          fi
+          echo "All required CI jobs succeeded."

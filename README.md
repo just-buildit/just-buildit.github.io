@@ -6,6 +6,8 @@ Serves the small static resources the toolchain depends on:
 
 - `get-jb.sh` — installs `jbx` (the universal entrypoint)
 - `aliases.toml` — default-namespace alias manifest read by `jbx`
+- `standard.mk` — the cross-org Makefile standard, vendored by every repo in
+    `just-buildit` and `doppler-dsp`
 - (eventually) `get-just-makeit.sh`, `get-just-bashit.sh`, `get-just-buildit.sh`
 - `index.html` — minimal landing page
 
@@ -22,8 +24,20 @@ associative array in the workflow and commit.
 
 ## Local edits
 
-`aliases.toml` and `index.html` are hand-edited in this repo. The
-mirror workflow only touches `get-just-*.sh` files.
+`aliases.toml`, `index.html` and `standard.mk` are hand-edited in this
+repo. The mirror workflow only touches `get-just-*.sh` files.
+
+`standard.mk` is **canonical here**, and this repo is deliberately not one
+of its adopters — it has no `Makefile`, so it consumes nothing it also
+defines. Every adopter vendors a byte-identical copy and gates on the
+difference (`make lint` runs a `standard-check` that fetches this file and
+fails on any drift, and fails rather than skips when it cannot reach it).
+
+So editing this file changes every repo's `make lint` the moment it deploys.
+The order that follows from that: land the change here, confirm
+<https://just-buildit.github.io/standard.mk> serves it, then re-vendor in
+each adopter. Design RFC: doppler-dsp/doppler#555; plan and success criteria:
+the just-buildit/.github README.
 
 ## Pages settings
 

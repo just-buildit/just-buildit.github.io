@@ -25,8 +25,11 @@ curl -fsSL -o standard.mk https://just-buildit.github.io/standard.mk
 
 - In `Makefile`: set the `HAS_*` flags and command variables, then
     `include standard.mk`. Nothing shared goes in this file.
-- Repo-only targets go in `local.mk`, named in `LOCAL_TARGETS` so `help` and
-    the gates see them.
+- Repo-only targets go **below the `include`** in your `Makefile`, or in an
+    optional `local.mk`. Either is fine; what matters is naming them in
+    `LOCAL_TARGETS`, which is what puts them in `.PHONY`, in `help`, and under
+    the same gates as the standard ones. (doppler keeps all 26 of its own
+    targets in the `Makefile`; just-makeit has one, in `local.mk`.)
 - Run `make lint`. Vendoring the file is what arms the drift gate — there is
     no second line to remember, and no way to forget it.
 

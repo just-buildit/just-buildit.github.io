@@ -103,6 +103,30 @@ jobs:
             || { cat "$tmp/log"; echo "::error::ghost-check did not name it"; exit 1; }
           echo "OK — gates pass clean and fail when sabotaged."
 
+      - name: The gates do not re-enter the default goal
+        # Both gates dump make's database with `$(MAKE) -rpn`, and -n still
+        # EXECUTES recipe lines containing $(MAKE). With no goal named, that
+        # sub-make builds .DEFAULT_GOAL -- so a repo configuring ALL_DEPS to
+        # reach `lint` (what skills://makefile-convention prescribes for shell
+        # repos) made the gates invoke themselves without bound: ~900
+        # processes on a bare `make`, and no output saying why. See #13.
+        #
+        # Bounded by `timeout` rather than asserted structurally, because the
+        # regression's symptom is "never returns" -- the only honest test is
+        # to run it and require it to finish.
+        run: |
+          tmp="$(mktemp -d)"; cp standard.mk "$tmp/"
+          cat > "$tmp/Makefile" <<'EOF'
+          TEST_CMD = @echo test
+          TEST_FAST_CMD = @echo test-fast
+          CLEAN_PATHS = dist/
+          ALL_DEPS = lint test
+          include standard.mk
+          EOF
+          timeout 60 make -C "$tmp" help-check ghost-check \
+            || { echo "::error::gates did not terminate with lint in the default goal chain"; exit 1; }
+          echo "OK — gates terminate regardless of the default goal."
+
       - name: Serving matches the repo
         # Only meaningful on main (a PR's copy is not published yet), and it is
         # the question the drift gate asks from the other side: does what Pages

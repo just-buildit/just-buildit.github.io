@@ -123,8 +123,18 @@ jobs:
           ALL_DEPS = lint test
           include standard.mk
           EOF
-          timeout 60 make -C "$tmp" help-check ghost-check \
-            || { echo "::error::gates did not terminate with lint in the default goal chain"; exit 1; }
+          # Distinguish the two failure modes. A bare `||` would report every
+          # non-zero exit as "did not terminate", pointing a future operator
+          # at a hang when the gates had merely failed for a real reason.
+          rc=0
+          timeout 60 make -C "$tmp" help-check ghost-check || rc=$?
+          if [ "$rc" -eq 124 ]; then
+            echo "::error::gates did not terminate with lint in the default goal chain — the recursion is back"
+            exit 1
+          elif [ "$rc" -ne 0 ]; then
+            echo "::error::gates failed (exit $rc) — a real failure, not a hang; see the output above"
+            exit 1
+          fi
           echo "OK — gates terminate regardless of the default goal."
 
       - name: Serving matches the repo

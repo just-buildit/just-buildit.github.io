@@ -103,6 +103,37 @@ jobs:
             || { cat "$tmp/log"; echo "::error::ghost-check did not name it"; exit 1; }
           echo "OK — gates pass clean and fail when sabotaged."
 
+      - name: gates-check verifies gates covers CI, and names the gap when not
+        # Same both-directions proof for the newest gate. A `make <target>` CI
+        # runs that `gates` cannot reach must fail here, naming it — that is the
+        # whole point of the target, and a version that could not fail would be
+        # exactly the silently-wrong `gates` it replaces.
+        run: |
+          tmp="$(mktemp -d)"; cp standard.mk "$tmp/"
+          mkdir -p "$tmp/.github/workflows"
+          cat > "$tmp/Makefile" <<'EOF'
+          TEST_CMD = @echo test
+          TEST_FAST_CMD = @echo test-fast
+          CLEAN_PATHS = dist/
+          GATES_DEPS = lint covered
+          include standard.mk
+          EOF
+          # CI runs `make covered` (a gates member) and `make install-deps`
+          # (default provisioning) — both accounted for, so gates-check passes.
+          printf 'jobs:\n  x:\n    steps:\n      - run: make install-deps\n      - run: make covered\n' \
+            > "$tmp/.github/workflows/ci.yml"
+          make -C "$tmp" gates-check \
+            || { echo "::error::gates-check failed when gates DID cover CI"; exit 1; }
+          # Now CI also runs `make orphan`, reachable from nothing — must fail.
+          printf '      - run: make orphan\n' >> "$tmp/.github/workflows/ci.yml"
+          if make -C "$tmp" gates-check > "$tmp/log" 2>&1; then
+            cat "$tmp/log"
+            echo "::error::gates-check passed a CI target gates cannot reach"; exit 1
+          fi
+          grep -q "orphan" "$tmp/log" \
+            || { cat "$tmp/log"; echo "::error::gates-check did not name orphan"; exit 1; }
+          echo "OK — gates-check passes when complete, fails naming the gap."
+
       - name: The gates do not re-enter the default goal
         # Both gates dump make's database with `$(MAKE) -rpn`, and -n still
         # EXECUTES recipe lines containing $(MAKE). With no goal named, that

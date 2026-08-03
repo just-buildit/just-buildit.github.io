@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ############################################################################
 # EXECUTABLE: just-runit (aliases: jb run, jbx)                              #
-# PACKAGE: just-bashit version 0.3.1                                         #
+# PACKAGE: just-bashit version 0.3.2                                         #
 # ############################################################################
 # Ephemeral bash tool runner. Fetch a script from a URL or namespace, call   #
 # an optional function, then discard — no installation, no env pollution.    #
@@ -14,7 +14,7 @@ IFS=$'\n\t'
 
 _CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/just-runit"
 _ME="$(basename "$0")"
-_VERSION="0.3.1"
+_VERSION="0.3.2"
 _DEFAULT_TTL=3600
 
 # Default namespace base URL (just-buildit org pages root).
@@ -470,14 +470,19 @@ _cache_valid() {
 # `--retry-connrefused` (>= 7.52) already ride out timeouts and 429/5xx
 # throttling there; `--retry-all-errors` is added only where curl accepts it, so
 # the bootstrap stays dependable from curl 7.61 through current. Probed once.
-_curl_retry_opts() {
+#
+# Populated as an ARRAY, not a space-joined string: this file runs under the
+# strict `IFS=$'\n\t'` set at the top, so an unquoted `$(...)` of a
+# space-separated string would NOT word-split — curl would see the whole
+# "--retry 3 --retry-connrefused ..." as one bogus option and abort every
+# fetch. `"${_CURL_RETRY_OPTS[@]}"` expands to distinct args regardless of IFS.
+_curl_retry_opts_init() {
 	if [[ -z ${_CURL_RETRY_OPTS+x} ]]; then
-		_CURL_RETRY_OPTS='--retry 3 --retry-connrefused'
+		_CURL_RETRY_OPTS=(--retry 3 --retry-connrefused)
 		if curl --retry-all-errors --help >/dev/null 2>&1; then
-			_CURL_RETRY_OPTS+=' --retry-all-errors'
+			_CURL_RETRY_OPTS+=(--retry-all-errors)
 		fi
 	fi
-	printf '%s' "${_CURL_RETRY_OPTS}"
 }
 
 _fetch_to() {
@@ -489,8 +494,8 @@ _fetch_to() {
 	# as the script ("line 1: 400: command not found"). --fail emits no body
 	# and returns non-zero on >=400, and the retries ride out transient
 	# throttling so a blip retries instead of reddening the build.
-	# shellcheck disable=SC2046  # deliberate word-split of the retry flags
-	if ! curl -sSL --fail $(_curl_retry_opts) --connect-timeout 30 \
+	_curl_retry_opts_init
+	if ! curl -sSL --fail "${_CURL_RETRY_OPTS[@]}" --connect-timeout 30 \
 		-o "${dest}" "${url}"; then
 		rm -f "${dest}"
 		_err "fetch failed (no usable response from ${url})"

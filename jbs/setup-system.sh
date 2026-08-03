@@ -1,7 +1,7 @@
 #!/bin/bash
 # ############################################################################
 # EXECUTABLE: setup-system.sh                                                #
-# PACKAGE: just-bashit version 0.3.1                                         #
+# PACKAGE: just-bashit version 0.3.2                                         #
 # ############################################################################
 # One command to take a freshly installed machine to a working one: system   #
 # packages, shell configuration, ssh, git defaults, and dev tooling. Every   #
@@ -187,14 +187,19 @@ _have() { command -v "$1" >/dev/null 2>&1; }
 # the fetch. `--retry`/`--retry-connrefused` still ride out throttling there;
 # the all-errors flag is added only where supported. Probed once. (Kept in sync
 # with just-runit's copy — both fetch from the same Pages CDN.)
-_curl_retry_opts() {
+#
+# Populated as an ARRAY, not a space-joined string: this file runs under the
+# strict `IFS=$'\n\t'` set at the top, so an unquoted `$(...)` of a
+# space-separated string would NOT word-split — curl would see the whole
+# "--retry 3 --retry-connrefused ..." as one bogus option and abort every
+# fetch. `"${_CURL_RETRY_OPTS[@]}"` expands to distinct args regardless of IFS.
+_curl_retry_opts_init() {
 	if [[ -z ${_CURL_RETRY_OPTS+x} ]]; then
-		_CURL_RETRY_OPTS='--retry 3 --retry-connrefused'
+		_CURL_RETRY_OPTS=(--retry 3 --retry-connrefused)
 		if curl --retry-all-errors --help >/dev/null 2>&1; then
-			_CURL_RETRY_OPTS+=' --retry-all-errors'
+			_CURL_RETRY_OPTS+=(--retry-all-errors)
 		fi
 	fi
-	printf '%s' "${_CURL_RETRY_OPTS}"
 }
 
 _asset() {
@@ -209,8 +214,8 @@ _asset() {
 		dest="$(mktemp "${TMPDIR:-/tmp}/jb-${name}.XXXXXX")"
 	fi
 	_log "fetching ${_JBS_BASE}/${name}"
-	# shellcheck disable=SC2046  # deliberate word-split of the retry flags
-	if ! curl -sSL --fail $(_curl_retry_opts) --connect-timeout 30 \
+	_curl_retry_opts_init
+	if ! curl -sSL --fail "${_CURL_RETRY_OPTS[@]}" --connect-timeout 30 \
 		-o "${dest}" "${_JBS_BASE}/${name}"; then
 		rm -f "${dest}"
 		echo "error: cannot obtain ${name} (no sibling copy, fetch failed)" >&2

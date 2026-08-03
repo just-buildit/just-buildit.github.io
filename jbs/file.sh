@@ -1,7 +1,7 @@
 #!/bin/bash
 # ############################################################################
 # LIBRARY: file.sh                                                           #
-# PACKAGE: just-bashit version 0.2.0                                         #
+# PACKAGE: just-bashit version 0.3.1                                         #
 # ############################################################################
 
 # Enforce sourcing of the script by taking advantage of the fact that return
@@ -70,15 +70,17 @@ add-line() {
 	local FILEPATH=${2:-}
 
 	# For two inputs assume standard operation; if one, treat it as FILEPATH.
-	if [ -z "${FILEPATH}" ] && [ -n "${ENTRY}" ]; then
-		FILEPATH="${ENTRY}"
-		ENTRY=""
+	if [ -z "${FILEPATH}" ]; then
+		if [ -n "${ENTRY}" ]; then
+			FILEPATH="${ENTRY}"
+			ENTRY=""
 
-	# Print some help if they didn't provide anything.
-	else
-		echo "Not enough arguments."
-		echo "${HELP}"
+		# Print some help if they didn't provide anything.
+		else
+			echo "Not enough arguments."
+			echo "${HELP}"
 
+		fi
 	fi
 
 	# Check permissions and create if necessary.
@@ -198,7 +200,7 @@ add-contents() {
 	read -r -d '' HELP <<-'EOF' || true
 		Usage: add-contents [OPTIONS] FROMPATH TOPATH ...
 
-		  Write each line of FROMPATH to TOPATH only if not 
+		  Write each line of FROMPATH to TOPATH only if not
 		  already present in TOPATH.
 
 		Options:

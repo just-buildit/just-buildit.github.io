@@ -8,5 +8,6 @@
 
 [aliases]
 install-deps   = "https://just-buildit.github.io/jbs/install-deps.sh"
+make-run       = "https://just-buildit.github.io/jbs/make-run.sh"
 get-jb         = "https://just-buildit.github.io/get-jb.sh"
 get-doppler    = "https://raw.githubusercontent.com/doppler-dsp/doppler/4fb2f3ad55ddb07198d545d4b6d6b4552791f4c2/scripts/get-doppler.sh"

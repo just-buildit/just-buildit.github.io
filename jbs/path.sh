@@ -1,7 +1,7 @@
 #!/bin/bash
 # ############################################################################
 # LIBRARY: path.sh                                                           #
-# PACKAGE: just-bashit version 0.3.2                                         #
+# PACKAGE: just-bashit version 0.4.0                                         #
 # ############################################################################
 
 # Enforce sourcing of the script by taking advantage of the fact that return

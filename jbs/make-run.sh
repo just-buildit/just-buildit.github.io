@@ -1,7 +1,7 @@
 #!/bin/bash
 # ############################################################################
 # LIBRARY: make-run.sh                                                       #
-# PACKAGE: just-bashit version 0.4.0                                         #
+# PACKAGE: just-bashit version 0.4.1                                         #
 # ############################################################################
 # Resolve and run a repository's make targets and command variables from     #
 # that repository's OWN Makefile, so callers never carry a second copy of a  #

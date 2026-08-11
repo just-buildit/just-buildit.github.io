@@ -134,6 +134,68 @@ jobs:
             || { cat "$tmp/log"; echo "::error::gates-check did not name orphan"; exit 1; }
           echo "OK — gates-check passes when complete, fails naming the gap."
 
+      - name: One red gate does not hide the gates behind it
+        # `gates` re-invokes its list with -k instead of declaring it as
+        # prerequisites, because make stops at the first failing prerequisite
+        # and the rest never run. That reads as an ordinary failure while a
+        # third of the set was silently skipped -- measured in doppler, where
+        # `glibc-check` cannot pass on a dev box by design, sits mid-list, and
+        # made six targets behind it structurally unreachable.
+        #
+        # Four properties, because three of them are what makes the current
+        # form SAFE and a fix that drops one is not a fix: everything runs, the
+        # run still fails, ALL PASS cannot print, and a clean run still passes.
+        #
+        # The four recipe lines below carry LITERAL TABS, as every make recipe
+        # must. They are legal here because they sit in a block scalar's
+        # CONTENT rather than its indentation -- but a reformat that converts
+        # them to spaces breaks this fixture, so leave them alone.
+        run: |
+          tmp="$(mktemp -d)"; cp standard.mk "$tmp/"
+          cat > "$tmp/Makefile" <<'EOF'
+          TEST_CMD = @echo test
+          TEST_FAST_CMD = @echo test-fast
+          CLEAN_PATHS = dist/
+          GATES_DEPS = first red behind1 behind2
+          LOCAL_TARGETS = first red behind1 behind2
+          include standard.mk
+
+          first: ## ordered before the red gate
+          	@echo RAN-first
+          red: ## fails, as some gates do by design
+          	@echo RAN-red; exit 1
+          behind1: ## ordered behind the red gate
+          	@echo RAN-behind1
+          behind2: ## also behind
+          	@echo RAN-behind2
+          EOF
+          make -C "$tmp" gates > "$tmp/log" 2>&1 && rc=0 || rc=$?
+          cat "$tmp/log"
+          for t in first red behind1 behind2; do
+            grep -q "RAN-$t" "$tmp/log" \
+              || { echo "::error::$t never ran — one red gate still hides the rest"; exit 1; }
+          done
+          [ "$rc" -ne 0 ] \
+            || { echo "::error::a failing gate did not fail the run"; exit 1; }
+          grep -q "ALL PASS" "$tmp/log" \
+            && { echo "::error::ALL PASS printed with a gate red"; exit 1; }
+          # ...and gates-check must survive the list moving out of the
+          # prerequisites. It walks the closure from `gates`, so a walk of
+          # prerequisites alone now finds NOTHING and reports every CI target
+          # as uncovered -- which would turn `make lint` red in every adopter.
+          mkdir -p "$tmp/.github/workflows"
+          printf 'jobs:\n  x:\n    steps:\n      - run: make install-deps\n      - run: make behind2\n' \
+            > "$tmp/.github/workflows/ci.yml"
+          make -C "$tmp" gates-check \
+            || { echo "::error::gates-check cannot see GATES_DEPS any more"; exit 1; }
+          # Clean tree: everything runs, run passes, ALL PASS prints.
+          sed -i 's/@echo RAN-red; exit 1/@echo RAN-red/' "$tmp/Makefile"
+          make -C "$tmp" gates > "$tmp/ok" 2>&1 \
+            || { cat "$tmp/ok"; echo "::error::a clean gates run failed"; exit 1; }
+          grep -q "ALL PASS" "$tmp/ok" \
+            || { cat "$tmp/ok"; echo "::error::clean run did not print ALL PASS"; exit 1; }
+          echo "OK — every gate runs, a red one still fails the run."
+
       - name: The gates do not re-enter the default goal
         # Both gates dump make's database with `$(MAKE) -rpn`, and -n still
         # EXECUTES recipe lines containing $(MAKE). With no goal named, that

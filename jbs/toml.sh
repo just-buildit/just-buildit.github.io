@@ -236,7 +236,7 @@ toml_get_tool_groups() {
 		  TOOL  The tool name as it appears in [tools.TOOL] (e.g. "install-deps").
 
 		Examples:
-		  cat jb.toml | toml_get_tool_groups install-deps
+		  cat bootstrap.toml | toml_get_tool_groups install-deps
 	EOF
 
 	local OPTARG="" OPTIND=0

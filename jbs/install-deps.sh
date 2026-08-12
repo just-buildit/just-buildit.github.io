@@ -26,7 +26,8 @@ read -r -d '' HELP <<-'EOF' || true
 	  Install system packages for the detected OS from a declarative TOML file.
 	  Auto-detects the package manager from the OS. By default installs ALL
 	  groups defined in the file.
-	  Input resolution: DEPS_FILE arg > jb-deps.toml > jb.toml > stdin.
+	  Input resolution: DEPS_FILE arg > bootstrap.toml > stdin.
+	  (jb-deps.toml and jb.toml are still read, and deprecated.)
 
 	  Section format — standard install:
 
@@ -52,7 +53,7 @@ read -r -d '' HELP <<-'EOF' || true
 	  Supported package managers: apt, pacman, brew, dnf, zypper, apk, msys2.
 
 	  Default groups: all groups found in the file. To restrict defaults,
-	  set groups = [...] under [tools.install-deps] in jb.toml.
+	  set groups = [...] under [tools.install-deps] in bootstrap.toml.
 
 	Options:
 	  -h / --help              Show this message and exit.
@@ -64,7 +65,7 @@ read -r -d '' HELP <<-'EOF' || true
 	       --template [PATH]   Write a scaffold deps.toml to PATH (default: stdout).
 
 	Arguments:
-	  DEPS_FILE  Path to TOML file. Omit to auto-discover jb-deps.toml or jb.toml.
+	  DEPS_FILE  Path to TOML file. Omit to auto-discover bootstrap.toml.
 EOF
 
 # ---------------------------------------------------------------------------
@@ -228,13 +229,32 @@ if [[ ${TEMPLATE} -eq 1 ]]; then
 	exit 0
 fi
 
-# Slurp deps content: explicit file > jb-deps.toml > jb.toml > stdin.
+# Manifest discovery: bootstrap.toml, then the deprecated jb-prefixed names.
+# `jb` reads as just-buildit — the PEP 517 backend, which never opens this
+# file — so the old name pointed at the wrong tool. Both legacy names are
+# still read, and warn, because this script is fetched live from the CDN on
+# every CI run: a hard cutover would break every repo that had not yet
+# renamed, in the window between the publish and their rename.
+_find_bootstrap_toml() {
+	local _n
+	for _n in bootstrap.toml jb-deps.toml jb.toml; do
+		if [ -f "${_n}" ]; then
+			if [ "${_n}" != "bootstrap.toml" ]; then
+				printf 'warning: %s is deprecated, rename it to bootstrap.toml\n' \
+					"${_n}" >&2
+			fi
+			printf '%s\n' "${_n}"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# Slurp deps content: explicit file > discovered manifest > stdin.
 if [ -n "${DEPS_FILE}" ]; then
 	CONTENT=$(cat "${DEPS_FILE}")
-elif [ -f "jb-deps.toml" ]; then
-	CONTENT=$(cat "jb-deps.toml")
-elif [ -f "jb.toml" ]; then
-	CONTENT=$(cat "jb.toml")
+elif _found=$(_find_bootstrap_toml); then
+	CONTENT=$(cat "${_found}")
 else
 	CONTENT=$(cat)
 fi

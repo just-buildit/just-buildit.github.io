@@ -45,7 +45,7 @@ read -r -d '' HELP <<-'EOF' || true
 	  and every step is safe to re-run — nothing is duplicated or clobbered.
 
 	Steps:
-	  deps    Install system packages from jb.toml / jb-deps.toml in the
+	  deps    Install system packages from bootstrap.toml in the
 	          current directory (delegates to install-deps). Skipped when no
 	          deps file is present.
 	  shell   Install the opinionated bash configuration to
@@ -76,7 +76,7 @@ read -r -d '' HELP <<-'EOF' || true
 	                             Write the profile template to PATH (or stdout).
 
 	Default steps: all of them. To restrict the default set, declare
-	steps = [...] under [tools.setup-system] in jb.toml.
+	steps = [...] under [tools.setup-system] in bootstrap.toml.
 
 	Examples:
 	  setup-system.sh --dry-run           # see the whole plan, touch nothing
@@ -272,17 +272,34 @@ _source_line() {
 # ---------------------------------------------------------------------------
 
 # deps — hand the project's deps file to install-deps.
+# Manifest discovery: bootstrap.toml, then the deprecated jb-prefixed names.
+# `jb` reads as just-buildit — the PEP 517 backend, which never opens this
+# file — so the old name pointed at the wrong tool. Both legacy names are
+# still read, and warn, because this script is fetched live from the CDN on
+# every CI run: a hard cutover would break every repo that had not yet
+# renamed, in the window between the publish and their rename.
+_find_bootstrap_toml() {
+	local _n
+	for _n in bootstrap.toml jb-deps.toml jb.toml; do
+		if [ -f "${_n}" ]; then
+			if [ "${_n}" != "bootstrap.toml" ]; then
+				printf 'warning: %s is deprecated, rename it to bootstrap.toml\n' \
+					"${_n}" >&2
+			fi
+			printf '%s\n' "${_n}"
+			return 0
+		fi
+	done
+	return 1
+}
+
 step_deps() {
 	_head "deps — system packages"
 
 	local deps_file=""
-	if [[ -f jb-deps.toml ]]; then
-		deps_file="jb-deps.toml"
-	elif [[ -f jb.toml ]]; then
-		deps_file="jb.toml"
-	fi
+	deps_file="$(_find_bootstrap_toml || true)"
 	if [[ -z ${deps_file} ]]; then
-		_info "no jb.toml or jb-deps.toml in $(pwd) — nothing to install"
+		_info "no bootstrap.toml in $(pwd) — nothing to install"
 		_result "deps:    skipped (no deps file)"
 		return 0
 	fi
@@ -544,11 +561,12 @@ fi
 # Resolve the step list: explicit -s > [tools.setup-system].steps > all.
 if [[ ${STEPS_EXPLICIT} -eq 0 ]]; then
 	_toml_steps=""
-	if [[ -f jb.toml ]]; then
+	_steps_toml="$(_find_bootstrap_toml || true)"
+	if [[ -n ${_steps_toml} ]]; then
 		while IFS= read -r _s; do
 			[[ -z ${_s} ]] && continue
 			_toml_steps="${_toml_steps:+${_toml_steps},}${_s}"
-		done < <(toml_get_array "tools" "setup-system" "steps" <jb.toml)
+		done < <(toml_get_array "tools" "setup-system" "steps" <"${_steps_toml}")
 	fi
 	if [[ -n ${_toml_steps} ]]; then
 		STEPS_STR="${_toml_steps}"

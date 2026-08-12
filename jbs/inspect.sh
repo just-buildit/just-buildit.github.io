@@ -29,7 +29,8 @@ read -r -d '' HELP <<-'EOF' || true
 	  Query installed versions of system packages listed in a TOML deps file,
 	  together with system and compiler information. Output is valid TOML,
 	  suitable for committing as jb.versions to record the build environment.
-	  Input resolution: DEPS_FILE arg > jb-deps.toml > jb.toml > stdin.
+	  Input resolution: DEPS_FILE arg > bootstrap.toml > stdin.
+	  (jb-deps.toml and jb.toml are still read, and deprecated.)
 
 	  Output sections:
 	    [system]    os, kernel, arch, glibc
@@ -189,12 +190,31 @@ _do_inspect() {
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+# Manifest discovery: bootstrap.toml, then the deprecated jb-prefixed names.
+# `jb` reads as just-buildit — the PEP 517 backend, which never opens this
+# file — so the old name pointed at the wrong tool. Both legacy names are
+# still read, and warn, because this script is fetched live from the CDN on
+# every CI run: a hard cutover would break every repo that had not yet
+# renamed, in the window between the publish and their rename.
+_find_bootstrap_toml() {
+	local _n
+	for _n in bootstrap.toml jb-deps.toml jb.toml; do
+		if [ -f "${_n}" ]; then
+			if [ "${_n}" != "bootstrap.toml" ]; then
+				printf 'warning: %s is deprecated, rename it to bootstrap.toml\n' \
+					"${_n}" >&2
+			fi
+			printf '%s\n' "${_n}"
+			return 0
+		fi
+	done
+	return 1
+}
+
 if [ -n "${DEPS_FILE}" ]; then
 	CONTENT=$(cat "${DEPS_FILE}")
-elif [ -f "jb-deps.toml" ]; then
-	CONTENT=$(cat "jb-deps.toml")
-elif [ -f "jb.toml" ]; then
-	CONTENT=$(cat "jb.toml")
+elif _found=$(_find_bootstrap_toml); then
+	CONTENT=$(cat "${_found}")
 else
 	CONTENT=$(cat)
 fi

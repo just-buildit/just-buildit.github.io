@@ -3,7 +3,7 @@
 # SCRIPT: get-jb.sh                                                          #
 # PACKAGE: just-bashit version 0.4.1                                         #
 # ############################################################################
-# Installs just-runit (just-buildit / jb / jbx) to ~/.local/bin.            #
+# Installs just-runit (alias: jbx) to ~/.local/bin.                          #
 #                                                                             #
 # Must be sourced so PATH exports reach the calling shell:                   #
 #   . <(curl -sSL https://just-buildit.github.io/get-jb.sh)                 #
@@ -99,7 +99,7 @@ _jb_install() {
 	# -- remove stale aliases from prior naming schemes -----------------------
 
 	local stale
-	for stale in jr jx; do
+	for stale in jr jx jb just-buildit; do
 		local stale_path="${INSTALL_DIR}/${stale}"
 		if [[ -L ${stale_path} && "$(readlink -f "${stale_path}")" == "$(readlink -f "${INSTALL_DIR}/just-runit")" ]]; then
 			rm -f "${stale_path}"
@@ -107,24 +107,13 @@ _jb_install() {
 		fi
 	done
 
-	# -- just-buildit symlink (always created — canonical long name) -----------
-
-	ln -sf just-runit "${INSTALL_DIR}/just-buildit"
-	_jb_ok "just-buildit -> just-runit"
-
-	# -- jb symlink (short alias — skipped if jb is already someone else's) ---
-
-	local _jb_cmd
-	_jb_cmd="$(command -v jb 2>/dev/null || true)"
-	local _JB_NAME="jb"
-	if [[ -n ${_jb_cmd} && "$(readlink -f "${_jb_cmd}")" != "$(readlink -f "${INSTALL_DIR}/just-runit")" ]]; then
-		_jb_warn "'jb' is already in use (${_jb_cmd}) — skipping short alias"
-		_jb_warn "use 'just-buildit' instead (always available)"
-		_JB_NAME="just-buildit"
-	else
-		ln -sf just-runit "${INSTALL_DIR}/jb"
-		_jb_ok "jb -> just-runit"
-	fi
+	# -- `jb` and `just-buildit` are NOT created ------------------------------
+	#
+	# They used to symlink here, which put one token on three things: the
+	# GitHub org, the PEP 517 build backend (`just-buildit`, the one that
+	# actually builds), and this runner. The backend keeps the name; the
+	# runner is `just-runit` and `jbx`. Both aliases are pruned above on
+	# upgrade, so a box that installed them before stops carrying them.
 
 	# -- jbx symlink (runner shorthand, always created) -----------------------
 
@@ -166,11 +155,11 @@ _jb_install() {
 
 	# -- confirm ---------------------------------------------------------------
 
-	printf '\n%b\n\n' "${GREEN}${BOLD}  just-buildit is ready.${RESET}"
-	printf '  %b%s -h%b                           show help\n' \
-		"${BOLD}" "${_JB_NAME}" "${RESET}"
-	printf '  %b%s run just-bashit:datetime iso-8601-basic%b  quick test\n\n' \
-		"${BOLD}" "${_JB_NAME}" "${RESET}"
+	printf '\n%b\n\n' "${GREEN}${BOLD}  just-runit is ready.${RESET}"
+	printf '  %bjust-runit -h%b                              show help\n' \
+		"${BOLD}" "${RESET}"
+	printf '  %bjbx just-bashit:datetime iso-8601-basic%b     quick test\n\n' \
+		"${BOLD}" "${RESET}"
 
 }
 

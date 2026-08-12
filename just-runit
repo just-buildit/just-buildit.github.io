@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ############################################################################
-# EXECUTABLE: just-runit (aliases: jb run, jbx)                              #
+# EXECUTABLE: just-runit (alias: jbx)                                        #
 # PACKAGE: just-bashit version 0.4.1                                         #
 # ############################################################################
 # Ephemeral bash tool runner. Fetch a script from a URL or namespace, call   #
@@ -54,9 +54,25 @@ _md5() {
 	fi
 }
 
-# ---- top-level dispatch (when called as "jb" or "just-buildit") -------------
+# ---- top-level dispatch (when called by the full name, "just-runit") --------
+#
+# This triggered on "jb" and "just-buildit" until 0.5.0, and that was the root
+# of a three-way collision on one token: `just-buildit` is the GitHub org, the
+# PEP 517 build backend, AND — via a symlink get-jb.sh created — this runner.
+# `jb`/`just-buildit` now mean the backend only, since it is the one that
+# actually builds; this runner answers to `just-runit` and `jbx`.
+#
+# The subcommands had to move somewhere, since they were only ever reachable
+# under those two names. They now live under the FULL name, and `just-runit`
+# falls THROUGH to the SPEC runner when the first argument is not a known
+# subcommand — so `just-runit <url>` keeps working, which is how the fetch
+# tests and every existing caller invoke it.
+#
+# `jbx` deliberately does NOT take subcommands. That is the escape hatch: a
+# script genuinely named `install` or `cache` is reachable as `jbx install`,
+# unambiguously, and no SPEC is shadowed by a keyword.
 
-if [[ ${_ME} == "jb" || ${_ME} == "just-buildit" ]]; then
+if [[ ${_ME} == "just-runit" ]]; then
 	SUBCMD="${1:-}"
 	case "${SUBCMD}" in
 	run)
@@ -117,19 +133,35 @@ if [[ ${_ME} == "jb" || ${_ME} == "just-buildit" ]]; then
 		exit 0
 		;;
 	install)
-		# Find jb.toml walking up from CWD.
+		# Find the bootstrap manifest walking up from CWD.
+		#
+		# `bootstrap.toml` is the name; `jb.toml` is accepted and deprecated.
+		# The old name pointed at the wrong tool — `jb` reads as just-buildit,
+		# the PEP 517 backend, which never opens this file. The new one says
+		# what the file declares instead: what must exist before the language
+		# ecosystem's own package manager can run.
+		#
+		# Both names are read during the transition because this script is
+		# fetched live from the CDN on every CI run, so a hard cutover would
+		# break every repo that had not yet renamed, in the window between the
+		# publish and their rename. Removal is tracked separately.
 		_toml=""
 		_dir="${PWD}"
 		while [[ "${_dir}" != "/" ]]; do
-			if [[ -f "${_dir}/jb.toml" ]]; then
-				_toml="${_dir}/jb.toml"
-				break
-			fi
+			for _cand in bootstrap.toml jb.toml; do
+				if [[ -f "${_dir}/${_cand}" ]]; then
+					_toml="${_dir}/${_cand}"
+					break 2
+				fi
+			done
 			_dir="$(dirname "${_dir}")"
 		done
 		if [[ -z "${_toml}" ]]; then
-			echo "${_ME}: no jb.toml found (searched up from ${PWD})" >&2
+			echo "${_ME}: no bootstrap.toml found (searched up from ${PWD})" >&2
 			exit 1
+		fi
+		if [[ "$(basename "${_toml}")" == "jb.toml" ]]; then
+			echo "${_ME}: ${_toml} — jb.toml is deprecated, rename it to bootstrap.toml" >&2
 		fi
 		printf '  reading %s\n' "${_toml}"
 		# Extract all source = "..." values from [tools.*] sections.
@@ -172,7 +204,7 @@ if [[ ${_ME} == "jb" || ${_ME} == "just-buildit" ]]; then
 
 			Commands:
 			  run      Ephemeral script runner (alias: jbx)
-			  install  Pre-fetch all tools declared in jb.toml
+			  install  Pre-fetch all tools declared in bootstrap.toml
 			  cache    Manage the local script cache
 			  version  Print version and exit
 
@@ -181,9 +213,10 @@ if [[ ${_ME} == "jb" || ${_ME} == "just-buildit" ]]; then
 		exit 0
 		;;
 	*)
-		echo "${_ME}: unknown command '${SUBCMD}'" >&2
-		echo "Run '${_ME} help' for usage." >&2
-		exit 1
+		# Not a subcommand, so it is a SPEC: fall through to the runner
+		# below rather than erroring. This is what keeps `just-runit <url>`
+		# working now that the full name owns the subcommands.
+		:
 		;;
 	esac
 fi

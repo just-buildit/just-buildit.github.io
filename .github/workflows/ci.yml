@@ -103,6 +103,67 @@ jobs:
             || { cat "$tmp/log"; echo "::error::ghost-check did not name it"; exit 1; }
           echo "OK — gates pass clean and fail when sabotaged."
 
+      - name: standard-check walks the whole vendored list, and cannot pass on nothing
+        # The drift gate compares a LIST now, not one file. Three ways it could
+        # go quietly wrong, each asserted rather than assumed:
+        #   1. a file in VENDORED_FILES is simply absent   -> must FAIL, not skip
+        #   2. the list is empty                           -> must FAIL, not pass
+        #   3. a listed file differs from canonical        -> must FAIL, naming it
+        # (1) and (2) are the "green because it covered zero things" class that
+        # has bitten this org before, so they are the ones tested hardest.
+        run: |
+          tmp="$(mktemp -d)"; cp standard.mk "$tmp/"
+          # Canonical for the test is served Pages content, which is stable and
+          # real: standard.mk itself plus get-jb.sh, both published at the root.
+          curl -fsSL https://just-buildit.github.io/standard.mk -o "$tmp/canonical.mk"
+          curl -fsSL https://just-buildit.github.io/get-jb.sh   -o "$tmp/get-jb.sh"
+          cat > "$tmp/Makefile" <<'EOF'
+          TEST_CMD = @echo test
+          TEST_FAST_CMD = @echo test-fast
+          CLEAN_PATHS = dist/
+          STANDARD_FILE = canonical.mk
+          VENDORED_FILES = get-jb.sh
+          include standard.mk
+          EOF
+
+          out="$(make -C "$tmp" standard-check)" || { echo "$out"; \
+            echo "::error::clean tree should pass"; exit 1; }
+          echo "$out"
+          echo "$out" | grep -q "2 vendored file(s) match" \
+            || { echo "::error::expected a count of 2, got: $out"; exit 1; }
+
+          # (1) listed but absent
+          mv "$tmp/get-jb.sh" "$tmp/elsewhere"
+          if make -C "$tmp" standard-check > "$tmp/log" 2>&1; then
+            cat "$tmp/log"
+            echo "::error::standard-check passed with a vendored file missing"; exit 1
+          fi
+          grep -q "get-jb.sh is vendored but missing" "$tmp/log" \
+            || { cat "$tmp/log"; echo "::error::did not name the missing file"; exit 1; }
+          mv "$tmp/elsewhere" "$tmp/get-jb.sh"
+
+          # (2) nothing to compare at all
+          sed -i 's/^STANDARD_FILE = .*/STANDARD_FILE =/; s/^VENDORED_FILES = .*/VENDORED_FILES =/' \
+            "$tmp/Makefile"
+          if make -C "$tmp" standard-check > "$tmp/log" 2>&1; then
+            cat "$tmp/log"
+            echo "::error::standard-check passed having compared 0 files"; exit 1
+          fi
+          grep -q "compared 0 files" "$tmp/log" \
+            || { cat "$tmp/log"; echo "::error::expected the compared-0-files guard"; exit 1; }
+
+          # (3) present but drifted
+          sed -i 's/^STANDARD_FILE =$/STANDARD_FILE = canonical.mk/; s/^VENDORED_FILES =$/VENDORED_FILES = get-jb.sh/' \
+            "$tmp/Makefile"
+          echo "# drift" >> "$tmp/get-jb.sh"
+          if make -C "$tmp" standard-check > "$tmp/log" 2>&1; then
+            cat "$tmp/log"
+            echo "::error::standard-check passed a drifted file"; exit 1
+          fi
+          grep -q "get-jb.sh differs from" "$tmp/log" \
+            || { cat "$tmp/log"; echo "::error::did not name the drifted file"; exit 1; }
+          echo "OK — walks the list, names what broke, cannot pass on nothing."
+
       - name: gates-check verifies gates covers CI, and names the gap when not
         # Same both-directions proof for the newest gate. A `make <target>` CI
         # runs that `gates` cannot reach must fail here, naming it — that is the

@@ -348,6 +348,28 @@ release: ## Build the native library clean, with BUILD_TYPE=Release
 	@$(MAKE) clean
 	@$(MAKE) build BUILD_TYPE=Release
 
+# `test` and `test-fast` execute COMPILED artifacts, so they must not execute
+# stale ones. A prerequisite-only line: it adds to the recipes defined in the
+# Core section above rather than replacing them, so there is no second recipe
+# and no `overriding recipe` warning.
+#
+# The failure this closes is not the noisy one. Editing a test and re-running
+# reported a failure quoting the OLD assertion at the OLD line numbers, which
+# is confusing but self-correcting the moment you read it. The one that
+# matters is the inverse: edit a source, `make test`, see green, ship -- with
+# the suite having never compiled the change, and nothing in the output
+# distinguishing that from a real pass. Reported from doppler
+# (doppler-dsp/doppler#659), where `make` is the only sanctioned way to run
+# the C suite -- a pre-commit hook blocks raw ctest -- so this was the single
+# path to a result and it was the one that could be silently stale.
+#
+# Inside HAS_C because `build` only exists here; a Python-only repo compiles
+# nothing and keeps `test` free-standing.
+#
+# No separate gate: a missing prerequisite reproduces the bug immediately, so
+# the dependency IS the check and there is nothing here that can rot.
+test test-fast: build
+
 ifeq ($(HAS_PYTHON),1)
 pyext: ## Build the Python extension in place
 	$(PYEXT_CMD)

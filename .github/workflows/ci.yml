@@ -103,6 +103,67 @@ jobs:
             || { cat "$tmp/log"; echo "::error::ghost-check did not name it"; exit 1; }
           echo "OK — gates pass clean and fail when sabotaged."
 
+      - name: hook-stage-check catches a hook that runs nowhere
+        # The gate exists because a hook can be configured, dispatch to a real
+        # target, pass hook-dispatch-check, and still execute on no machine and
+        # in no pipeline -- `stages: [pre-push]` with no
+        # `default_install_hook_types`, while `make lint` runs the default
+        # stage. Zero findings because it never looked. Measured in doppler,
+        # where two gates sat that way for months (doppler#737).
+        #
+        # Both directions, and the exemptions, because a gate that only ever
+        # passes is indistinguishable from one that is not wired.
+        run: |
+          tmp="$(mktemp -d)"; cp standard.mk "$tmp/"
+          cat > "$tmp/Makefile" <<'EOF'
+          TEST_CMD = @echo test
+          TEST_FAST_CMD = @echo test-fast
+          CLEAN_PATHS = dist/
+          include standard.mk
+          EOF
+
+          # No config at all is inert, not a failure: a repo without
+          # pre-commit is not being asked to care.
+          make -C "$tmp" hook-stage-check
+
+          # Wired correctly -> passes.
+          cat > "$tmp/.pre-commit-config.yaml" <<'EOF'
+          default_install_hook_types: [pre-commit, pre-push]
+          repos:
+            - repo: local
+              hooks:
+                - id: x
+                  name: x
+                  entry: make -s lint
+                  language: system
+                  stages: [pre-push]
+          EOF
+          make -C "$tmp" hook-stage-check
+
+          # SABOTAGE: drop the declaration. The hook is now installed by
+          # nothing, which is the exact doppler#737 shape.
+          sed -i '/default_install_hook_types/d' "$tmp/.pre-commit-config.yaml"
+          if make -C "$tmp" hook-stage-check > "$tmp/log" 2>&1; then
+            cat "$tmp/log"
+            echo "::error::hook-stage-check passed a hook that runs nowhere"; exit 1
+          fi
+          grep -q "pre-push" "$tmp/log" \
+            || { cat "$tmp/log"; echo "::error::it did not name the stage"; exit 1; }
+
+          # `manual` is a deliberate opt-out, not an accident -> exempt.
+          cat > "$tmp/.pre-commit-config.yaml" <<'EOF'
+          repos:
+            - repo: local
+              hooks:
+                - id: x
+                  name: x
+                  entry: make -s lint
+                  language: system
+                  stages: [manual]
+          EOF
+          make -C "$tmp" hook-stage-check
+          echo "OK — hook-stage-check passes wired, fails orphaned, exempts manual."
+
       - name: standard-check walks the whole vendored list, and cannot pass on nothing
         # The drift gate compares a LIST now, not one file. Three ways it could
         # go quietly wrong, each asserted rather than assumed:

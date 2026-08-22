@@ -641,8 +641,28 @@ endif
 	@test "$$(git rev-parse HEAD)" = "$$(git rev-parse origin/main)" || \
 	    { echo "ERROR: local main != origin/main — git pull first"; exit 1; }
 	@$(MAKE) version-check VERSION=$(VERSION)
-	git tag -a "v$(VERSION)" -m "Release v$(VERSION)"
-	git push origin "v$(VERSION)"
+# Idempotent, so `ship` can be RE-RUN after its watch is interrupted. The tag
+# push is the point of no return -- it starts the release -- but the watch that
+# follows runs for tens of minutes, and anything cutting it short (a timeout, a
+# dropped connection, Ctrl-C) used to leave `ship` unusable: `git tag` fails on
+# an existing tag, so the way back was to know that `release-watch` is a
+# separate target. Re-running the command you already ran is the obvious move,
+# and it now works.
+#
+# An existing tag on a DIFFERENT commit is still refused. That is the case
+# worth failing on: the artifacts were built from wherever the tag pointed when
+# the workflow ran, so moving it makes the tag disagree with what was published.
+	@if git rev-parse -q --verify "refs/tags/v$(VERSION)" >/dev/null 2>&1; then \
+	    test "$$(git rev-parse "v$(VERSION)^{commit}")" = "$$(git rev-parse HEAD)" || \
+	        { echo "ERROR: v$(VERSION) exists and points at another commit."; \
+	          echo "  A released tag must not move — its artifacts were built"; \
+	          echo "  from where it pointed. Cut the next patch version."; \
+	          exit 1; }; \
+	    echo "tag-release: v$(VERSION) already tags HEAD — reusing it"; \
+	else \
+	    git tag -a "v$(VERSION)" -m "Release v$(VERSION)"; \
+	fi
+	@git push origin "v$(VERSION)"
 	@echo "Tagged v$(VERSION) — release workflow starting on GitHub"
 
 release-watch: ## VERSION=x.y.z — watch the release workflow and verify it

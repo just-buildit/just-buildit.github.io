@@ -336,10 +336,25 @@ STD_TARGETS += pyext
 $(call _std_require,PYEXT_CMD,HAS_C=1 with HAS_PYTHON=1)
 endif
 
-build: ## Configure and build the native library
+# BUILD_TARGET=<name> builds ONE cmake target instead of the whole tree, for
+# the edit-compile-run loop on a single binary. Everything else is unchanged,
+# so `make build` is still the full build and still what CI runs.
+#
+# It exists because the alternative developers actually reach for is a raw
+# `cmake --build <dir> --target <name>`, which bypasses this file entirely --
+# the configure step, BUILD_TYPE, CMAKE_FLAGS and the compiler launcher all
+# come from here, so the hand-run command is a DIFFERENT build wearing the
+# same name. A repo with a hook that blocks raw cmake (doppler has one) then
+# gets the bypass env-var instead, which is worse: the rule is off for the
+# whole command, not just the part that needed it.
+#
+# Deliberately NOT called TARGET: `make TARGET=<goals>` is already the
+# convention for passing goals into a container/runner wrapper, and a name
+# that means two things is a name that will be passed to the wrong one.
+build: ## Configure and build the native library (BUILD_TARGET=<t> for one)
 	$(CMAKE) -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) \
 	    $(CMAKE_FLAGS)
-	$(CMAKE) --build $(BUILD_DIR)
+	$(CMAKE) --build $(BUILD_DIR) $(if $(BUILD_TARGET),--target $(BUILD_TARGET))
 
 debug: ## Build the native library with BUILD_TYPE=Debug
 	@$(MAKE) build BUILD_TYPE=Debug

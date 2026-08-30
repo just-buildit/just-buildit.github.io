@@ -411,9 +411,10 @@ gates-home-check: ## Verify every gate in GATES_DEPS runs in some CI job
 	 done; \
 	 if [ $$rc -ne 0 ]; then \
 	     echo ""; \
-	     echo "  A gate nothing runs guards nothing. Wire it into $$ci, or drop"; \
-	     echo "  it from GATES_DEPS, or name it in GATES_LOCAL_ONLY if it truly"; \
-	     echo "  cannot run on a runner."; \
+	     echo "  A gate nothing runs guards nothing. Wire it into $$ci, drop it"; \
+	     echo "  from GATES_DEPS, or name it in GATES_LOCAL_ONLY — which takes"; \
+	     echo "  a gate that cannot run on a runner AND an aggregate whose work"; \
+	     echo "  already runs under other names. See the comment on it."; \
 	     exit 1; \
 	 fi; \
 	 echo "gates-home-check: $$n gate(s) have an execution home in CI"

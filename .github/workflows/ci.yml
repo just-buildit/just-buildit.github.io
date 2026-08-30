@@ -356,12 +356,42 @@ jobs:
         # Only meaningful on main (a PR's copy is not published yet), and it is
         # the question the drift gate asks from the other side: does what Pages
         # actually serves equal what is committed here?
+        #
+        # It has to WAIT rather than ask once. On a push to main the Pages
+        # deploy has only just started and runs concurrently with this job, so
+        # asking immediately puts the question at the one moment the answer is
+        # definitionally no. The old form was therefore green for every push
+        # that left standard.mk alone and red for every push that changed it —
+        # red on exactly the changes it exists to verify, and indistinguishable
+        # from a genuine drift failure. Measured on the gates-home-check merge:
+        # this job failed at 14:18 against the pre-deploy copy, and the same
+        # file compared identical minutes later with nothing changed but time.
+        #
+        # What is being checked is unchanged: what an adopter FETCHES must
+        # equal what is committed. An adopter fetches through this CDN, so the
+        # CDN is what is polled — with a cache-buster, or a stale edge copy
+        # could satisfy the check without Pages having published anything.
+        #
+        # The budget is generous because the cost of overrunning it is a red
+        # main, and the predicate is known reachable (it is what every steady
+        # state looks like). On timeout the diff is printed: a wait that fails
+        # without saying what it saw sends the reader to the wrong question.
         if: github.ref == 'refs/heads/main'
         run: |
-          curl -fsSL -o served.mk https://just-buildit.github.io/standard.mk
-          diff -u served.mk standard.mk \
-            || { echo "::error::Pages is serving a different standard.mk"; exit 1; }
-          echo "OK — Pages serves the committed file."
+          : > served.mk
+          for i in $(seq 1 40); do
+            curl -fsSL -H 'Cache-Control: no-cache' -o served.mk \
+              "https://just-buildit.github.io/standard.mk?cb=$(date +%s)-$i" \
+              || echo "fetch $i failed — retrying"
+            if diff -q served.mk standard.mk >/dev/null 2>&1; then
+              echo "OK — Pages serves the committed file (after $i check(s))."
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::Pages is still serving a different standard.mk after 10 minutes"
+          diff -u served.mk standard.mk || true
+          exit 1
 
   # ------------------------------------------------------------------
   # Aggregator: the single "CI passed" check the `main` ruleset requires.

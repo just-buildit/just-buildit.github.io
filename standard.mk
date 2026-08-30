@@ -160,9 +160,25 @@ GATES_PROVISION ?= install-deps
 # four undefined operations on its first run.
 #
 # GATES_LOCAL_ONLY is the deliberate exception, named the way GATES_PROVISION
-# is: a gate that genuinely cannot run on a runner (hardware, a network the
-# runner lacks) is still a gate you run before merging, and forcing it out of
-# GATES_DEPS would lose it. Naming one is a decision that shows up in a diff.
+# is, so that adding one is a decision that shows up in a diff. Two reasons
+# qualify, and they are different questions:
+#
+#   * the gate CANNOT run on a runner -- hardware, a network the runner lacks.
+#     It is still a gate you run before merging, and forcing it out of
+#     GATES_DEPS would lose it.
+#   * the gate is an AGGREGATE for pre-push convenience whose work already has
+#     a home under other names. just-makeit's `docs-check` is the case that
+#     taught this: its strict build runs in docs.yml as `make docs` and its
+#     `test_docs.py` half runs in ci.yml as `make test`, so every check it
+#     performs gates a merge -- only the name does not.
+#
+# The first was the only reason this variable documented when it landed, which
+# would have pushed the second case into either a wrong remedy or a wrong
+# exemption. An escape hatch described more narrowly than the cases it must
+# take is one that gets used for the wrong reason and then means nothing.
+#
+# What does NOT qualify: a gate whose work runs nowhere. That is the finding,
+# not an exception to it.
 GATES_LOCAL_ONLY ?=
 
 # Targets CI runs that the scan cannot see for itself -- one driven from an

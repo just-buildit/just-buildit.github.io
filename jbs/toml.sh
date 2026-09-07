@@ -1,7 +1,7 @@
 #!/bin/bash
 # ############################################################################
 # LIBRARY: toml.sh                                                           #
-# PACKAGE: just-bashit version 0.4.1                                        #
+# PACKAGE: just-bashit version 0.5.0                                        #
 # ############################################################################
 # Pure-bash parser for the TOML subset used by just-bashit dependency files:#
 #   [group.pm] sections with packages = [...] and cmd = [...] arrays.       #
@@ -104,6 +104,12 @@ toml_get_array() {
 	local target="[${group}.${section}]"
 	local in_section=0 in_array=0 line rest
 	while IFS= read -r line; do
+		# A TOML file checked out on Windows has CRLF endings, and `read`
+		# strips only the newline. The section test below is an exact string
+		# compare, so a trailing CR made "[dev.msys2]" match nothing and this
+		# function returned success with no output — a file that parsed to
+		# silence rather than to an error.
+		line="${line%$'\r'}"
 		if [[ "$line" =~ ^\[.*\] ]]; then
 			[[ "$line" == "$target" ]] && in_section=1 || in_section=0
 			in_array=0
@@ -314,6 +320,9 @@ toml_discover_groups() {
 	fi
 	local line inner group pm seen="" out="" k found
 	while IFS= read -r line; do
+		line="${line%$'\r'}"
+		# Anchored at $, so a trailing CR fails the match outright and every
+		# group in a CRLF file goes undiscovered.
 		[[ "$line" =~ ^\[.*\..*\]$ ]] || continue
 		inner="${line:1:${#line}-2}"
 		group="${inner%%.*}"

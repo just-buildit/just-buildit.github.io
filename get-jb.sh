@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ############################################################################
 # SCRIPT: get-jb.sh                                                          #
-# PACKAGE: just-bashit version 0.4.1                                         #
+# PACKAGE: just-bashit version 0.5.0                                         #
 # ############################################################################
 # Installs just-runit (alias: jbx) to ~/.local/bin.                          #
 #                                                                             #

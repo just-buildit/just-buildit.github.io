@@ -1,7 +1,7 @@
 #!/bin/bash
 # ############################################################################
 # EXECUTABLE: install-deps.sh                                                #
-# PACKAGE: just-bashit version 0.4.1                                         #
+# PACKAGE: just-bashit version 0.5.1                                         #
 # ############################################################################
 set -euo pipefail
 IFS=$'\n\t'
@@ -14,6 +14,8 @@ source "${_SCRIPT_DIR}/pkg.sh"
 
 DRY_RUN=0
 VERBOSE=0
+SUDO_MODE="auto"
+PROXY_URL=""
 SECTION_OVERRIDE=""
 GROUPS_STR=""
 GROUPS_EXPLICIT=0
@@ -52,6 +54,19 @@ read -r -d '' HELP <<-'EOF' || true
 
 	  Supported package managers: apt, pacman, brew, dnf, zypper, apk, msys2.
 
+	  Privilege escalation is DERIVED, not assumed: sudo is used only when
+	  the manager needs root, the caller is not already root, and sudo is
+	  on PATH. A root CI container therefore needs no flag and no sudo
+	  package. --sudo / --no-sudo force it either way. `cmd` arrays are
+	  still run verbatim — leave sudo out of them and they work in both.
+
+	  Proxies come from the standard environment variables (http_proxy,
+	  https_proxy, all_proxy, no_proxy, and their uppercase spellings), or
+	  from --proxy. Every supported manager fetches over libcurl or reads
+	  those names directly, so they are all that is needed — but sudo
+	  RESETS the environment, so they are re-applied explicitly on the far
+	  side of it rather than relying on the sudoers env_keep list.
+
 	  Default groups: all groups found in the file. To restrict defaults,
 	  set groups = [...] under [tools.install-deps] in bootstrap.toml.
 
@@ -62,6 +77,14 @@ read -r -d '' HELP <<-'EOF' || true
 	  -s / --section SECTION   Override auto-detected package manager.
 	  -g / --groups  GROUP     Comma-separated groups to install (overrides all
 	                           defaults; e.g. -g runtime or -g runtime,dev).
+	       --no-sudo           Never prefix sudo (root containers, CI images
+	                           with no sudo package installed).
+	       --sudo              Always prefix sudo, even when already root.
+	       --proxy URL         Proxy for package downloads. Overrides the
+	                           environment; passed through sudo. Applies to
+	                           http_proxy/https_proxy and their uppercase
+	                           spellings. all_proxy and no_proxy are taken
+	                           from the environment when already set.
 	       --template [PATH]   Write a scaffold deps.toml to PATH (default: stdout).
 
 	Arguments:
@@ -93,6 +116,18 @@ while [[ $# -gt 0 ]]; do
 	-g | --groups)
 		GROUPS_STR="${2:?Option $1 requires an argument.}"
 		GROUPS_EXPLICIT=1
+		shift 2
+		;;
+	--no-sudo)
+		SUDO_MODE="no"
+		shift
+		;;
+	--sudo)
+		SUDO_MODE="yes"
+		shift
+		;;
+	--proxy)
+		PROXY_URL="${2:?Option $1 requires an argument.}"
 		shift 2
 		;;
 	--template)
@@ -135,74 +170,160 @@ _template() {
 	fi
 }
 
+# Every proxy variable this script knows how to carry. Both spellings are
+# listed because the managers disagree: apt, apk and libcurl read the
+# lowercase names, Homebrew's Ruby reads the uppercase ones, and a machine
+# that has only ever been used interactively usually has just one of them.
+# An array, not a string: this script runs under IFS=$'\n\t', so a
+# space-separated list would expand as one long word.
+_PROXY_VARS=(
+	http_proxy https_proxy all_proxy no_proxy
+	HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY
+)
+
+# ---------------------------------------------------------------------------
+# _resolve_proxy: settle the proxy environment once, for every group.
+#
+# --proxy sets the http/https names in both spellings; all_proxy and no_proxy
+# are only ever carried through from the environment, since a single URL says
+# nothing about which hosts to bypass.
+#
+# The variables are exported here so that verbatim `cmd` arrays inherit them
+# too — a cmd is not rewritten, but it does run in this process's environment.
+# _PROXY_ENV then holds the same values as NAME=VALUE arguments, because sudo
+# resets the environment and would otherwise drop every one of them. That is
+# the actual reason `http_proxy=... make install-deps` appears to be ignored
+# today, and it is not fixable from the caller's side.
+# ---------------------------------------------------------------------------
+_PROXY_ENV=()
+_resolve_proxy() {
+	local _v _name
+
+	if [ -n "${PROXY_URL}" ]; then
+		export http_proxy="${PROXY_URL}"
+		export https_proxy="${PROXY_URL}"
+		export HTTP_PROXY="${PROXY_URL}"
+		export HTTPS_PROXY="${PROXY_URL}"
+	fi
+
+	# A no_proxy on its own describes exceptions to a proxy that is not
+	# configured, so it is not worth wrapping any command in `env` for.
+	local _have=0
+	for _name in http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY; do
+		_v="${!_name:-}"
+		[ -n "${_v}" ] && _have=1
+	done
+	[ "${_have}" -eq 0 ] && return 0
+
+	for _name in "${_PROXY_VARS[@]}"; do
+		_v="${!_name:-}"
+		[ -z "${_v}" ] && continue
+		export "${_name}=${_v}"
+		_PROXY_ENV+=("${_name}=${_v}")
+	done
+}
+
+# ---------------------------------------------------------------------------
+# _resolve_prefix: decide once what every install command is prefixed with.
+#
+# Sets _PREFIX — ONE declaration, read by both the dry-run printer and the
+# executor in _run, so what -n prints is exactly what would have run. It holds
+# the sudo binary, if any, followed by `env NAME=VALUE ...` when a proxy is in
+# play, in that order: the assignments have to land on the far side of sudo to
+# survive its env_reset.
+#
+# The sudo half is what lets a single bootstrap.toml serve a workstation
+# (unprivileged, sudo present) and a CI container (already root, no sudo
+# package installed) with no flag and no second package list. brew is exempt
+# on purpose: Homebrew refuses to run under sudo and manages its own prefix,
+# so it never gets one even with --sudo.
+# ---------------------------------------------------------------------------
+_PREFIX=()
+_resolve_prefix() {
+	local section="$1"
+	local sudo_bin=""
+
+	if [ "${section}" != "brew" ]; then
+		case "${SUDO_MODE}" in
+		no) ;;
+		yes)
+			sudo_bin="sudo"
+			;;
+		*)
+			if [ "$(id -u)" -eq 0 ]; then
+				:
+			elif command -v sudo >/dev/null 2>&1; then
+				sudo_bin="sudo"
+			else
+				# Not root and no sudo: run bare and let the package manager
+				# report the permission failure itself. Guessing a different
+				# escalation tool here would only hide the real cause.
+				printf 'warning: not root and sudo not found; running %s\n' \
+					"${section} unprivileged" >&2
+			fi
+			;;
+		esac
+	fi
+
+	_PREFIX=()
+	[ -n "${sudo_bin}" ] && _PREFIX+=("${sudo_bin}")
+	if [ "${#_PROXY_ENV[@]}" -gt 0 ]; then
+		_PREFIX+=("env")
+		_PREFIX+=("${_PROXY_ENV[@]}")
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# _run: print (dry run) or execute one install command, prefix included.
+# ---------------------------------------------------------------------------
+_run() {
+	if [ "${DRY_RUN}" -eq 1 ]; then
+		if [ "${#_PREFIX[@]}" -gt 0 ]; then
+			(
+				IFS=' '
+				echo "${_PREFIX[*]} $*"
+			)
+		else
+			(
+				IFS=' '
+				echo "$*"
+			)
+		fi
+		return
+	fi
+	if [ "${#_PREFIX[@]}" -gt 0 ]; then
+		"${_PREFIX[@]}" "$@"
+	else
+		"$@"
+	fi
+}
+
 # ---------------------------------------------------------------------------
 # _do_install: run or print the install command for the detected section.
 # ---------------------------------------------------------------------------
 _do_install() {
 	local section="$1"
 	shift
+	_resolve_prefix "${section}"
 	case "${section}" in
 	apt)
-		if [ "${DRY_RUN}" -eq 1 ]; then
-			echo "sudo apt-get update"
-			(
-				IFS=' '
-				echo "sudo apt-get install -y --no-install-recommends $*"
-			)
-			return
-		fi
-		sudo apt-get update
-		sudo apt-get install -y --no-install-recommends "$@"
+		_run apt-get update
+		_run apt-get install -y --no-install-recommends "$@"
 		;;
 	pacman)
-		if [ "${DRY_RUN}" -eq 1 ]; then
-			(
-				IFS=' '
-				echo "sudo pacman -Sy --needed --noconfirm $*"
-			)
-			return
-		fi
-		sudo pacman -Sy --needed --noconfirm "$@"
+		_run pacman -Sy --needed --noconfirm "$@"
 		;;
 	brew)
-		if [ "${DRY_RUN}" -eq 1 ]; then
-			(
-				IFS=' '
-				echo "brew install $*"
-			)
-			return
-		fi
-		brew install "$@"
+		_run brew install "$@"
 		;;
 	dnf)
-		if [ "${DRY_RUN}" -eq 1 ]; then
-			(
-				IFS=' '
-				echo "sudo dnf install -y $*"
-			)
-			return
-		fi
-		sudo dnf install -y "$@"
+		_run dnf install -y "$@"
 		;;
 	zypper)
-		if [ "${DRY_RUN}" -eq 1 ]; then
-			(
-				IFS=' '
-				echo "sudo zypper install -y $*"
-			)
-			return
-		fi
-		sudo zypper install -y "$@"
+		_run zypper install -y "$@"
 		;;
 	apk)
-		if [ "${DRY_RUN}" -eq 1 ]; then
-			(
-				IFS=' '
-				echo "sudo apk add $*"
-			)
-			return
-		fi
-		sudo apk add "$@"
+		_run apk add "$@"
 		;;
 	msys2)
 		# msys2 is Windows — always print instructions, never run.
@@ -271,8 +392,19 @@ fi
 
 SECTION="${SECTION_OVERRIDE:-$(get-pkg-mgr)}"
 
+# Settled once, before any group runs: the proxy does not vary per group or
+# per section, and exporting it here is what puts it in scope for verbatim
+# `cmd` arrays as well as for the managers.
+_resolve_proxy
+
 _log "section:  ${SECTION}"
 _log "groups:   ${GROUPS_STR}"
+if [ "${#_PROXY_ENV[@]}" -gt 0 ]; then
+	(
+		IFS=' '
+		_log "proxy:    ${_PROXY_ENV[*]}"
+	)
+fi
 
 # Process each group: cmd wins over packages; each runs independently.
 _any=0

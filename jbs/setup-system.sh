@@ -375,6 +375,65 @@ step_shell() {
 	_result "shell:   ok (${PREFIX})"
 }
 
+# ---------------------------------------------------------------------------
+# _ssh_harden: strip group and other off everything in ~/.ssh that must not
+# be readable by them.
+#
+# For a directory that arrived from somewhere unable to carry POSIX modes.
+# rsync -a and tar both preserve permissions, so a Linux-to-Linux copy needs
+# nothing; this is for the crossings where no copy command can help — a
+# Windows filesystem under WSL (DrvFs has no modes and reports 0777), a FAT
+# stick, a zip, or a git checkout, which records only the exec bit. ssh then
+# refuses the key with UNPROTECTED PRIVATE KEY FILE and does not say how to
+# fix it.
+#
+# `go-rwx` rather than a literal 0600, so this only ever TIGHTENS: a key
+# already at 0400 keeps its 0400 instead of gaining owner-write, and running
+# it twice changes nothing the second time.
+#
+# A private key is recognised by its PEM header rather than its name — a key
+# with no matching .pub, or not called id_*, still has to be locked down.
+# `read` is a builtin, so this adds nothing to the set of commands a
+# PATH-restricted machine needs to reach this step.
+#
+# .pub files are left alone: they are public, and rewriting them would be
+# churn for its own sake.
+# ---------------------------------------------------------------------------
+_ssh_harden() {
+	local dir="$1" f name first
+
+	# u+rwx as well here: a directory arriving at 0000 would otherwise stay
+	# unusable, and ~/.ssh has to be enterable by its owner to be any use.
+	_run chmod u+rwx,go-rwx "${dir}"
+
+	for f in "${dir}"/* "${dir}"/.*; do
+		[[ -e ${f} ]] || continue
+		name="${f##*/}"
+		[[ ${name} == "." || ${name} == ".." ]] && continue
+
+		if [[ -d ${f} ]]; then
+			_run chmod u+rwx,go-rwx "${f}"
+			continue
+		fi
+		[[ -f ${f} ]] || continue
+
+		case "${name}" in
+		*.pub) continue ;;
+		config | authorized_keys | authorized_keys2)
+			_run chmod go-rwx "${f}"
+			continue
+			;;
+		esac
+
+		# Anything else is only touched if it actually IS a private key.
+		first=""
+		read -r first <"${f}" 2>/dev/null || true
+		case "${first}" in
+		-----BEGIN*PRIVATE\ KEY-----*) _run chmod go-rwx "${f}" ;;
+		esac
+	done
+}
+
 # ssh — directory permissions, then a key if the user has none.
 step_ssh() {
 	_head "ssh — agent keys"
@@ -385,7 +444,7 @@ step_ssh() {
 	# skipped. Only generation requires the binary.
 	local dir="${HOME}/.ssh"
 	_run mkdir -p "${dir}"
-	_run chmod 700 "${dir}"
+	_ssh_harden "${dir}"
 
 	# Any private key with a matching .pub counts; a machine that already
 	# has an identity does not need another one.
@@ -426,7 +485,8 @@ step_ssh() {
 	fi
 
 	if [[ ${DRY_RUN} -eq 0 && -r "${key}.pub" ]]; then
-		_run chmod 600 "${key}"
+		# Still explicit: the sweep above ran before this key existed.
+		_run chmod go-rwx "${key}"
 		_say ""
 		_info "public key — add it to GitHub:"
 		_say ""

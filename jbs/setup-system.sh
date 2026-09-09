@@ -1,7 +1,7 @@
 #!/bin/bash
 # ############################################################################
 # EXECUTABLE: setup-system.sh                                                #
-# PACKAGE: just-bashit version 0.5.1                                         #
+# PACKAGE: just-bashit version 0.6.0                                         #
 # ############################################################################
 # One command to take a freshly installed machine to a working one: system   #
 # packages, shell configuration, ssh, git defaults, and dev tooling. Every   #

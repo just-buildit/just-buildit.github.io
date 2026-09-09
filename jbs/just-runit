@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ############################################################################
 # EXECUTABLE: just-runit (alias: jbx)                                        #
-# PACKAGE: just-bashit version 0.5.1                                         #
+# PACKAGE: just-bashit version 0.6.0                                         #
 # ############################################################################
 # Ephemeral bash tool runner. Fetch a script from a URL or namespace, call   #
 # an optional function, then discard — no installation, no env pollution.    #
@@ -14,7 +14,7 @@ IFS=$'\n\t'
 
 _CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/just-runit"
 _ME="$(basename "$0")"
-_VERSION="0.5.1"
+_VERSION="0.6.0"
 _DEFAULT_TTL=3600
 
 # Default namespace base URL (just-buildit org pages root).

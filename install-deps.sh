@@ -1,7 +1,7 @@
 #!/bin/bash
 # ############################################################################
 # EXECUTABLE: install-deps.sh                                                #
-# PACKAGE: just-bashit version 0.5.1                                         #
+# PACKAGE: just-bashit version 0.6.0                                         #
 # ############################################################################
 set -euo pipefail
 IFS=$'\n\t'

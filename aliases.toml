@@ -1,7 +1,11 @@
 # just-buildit org default-namespace alias manifest.
 #
-# `jx NAME` consults this table when there is no script served directly
-# at https://just-buildit.github.io/${NAME}.{sh,py}.
+# `jx NAME` consults this table FIRST, and only probes
+# https://just-buildit.github.io/${NAME}.{sh,py} when a name is not listed
+# here — see the resolution order in just-runit, which checks aliases.toml
+# before falling through to the direct probe. This comment said the reverse
+# until 2026-09-08, which matters: it makes a root-level script look like
+# the thing being served when an alias is in fact shadowing it.
 #
 # Third-party tools welcomed via PR — keep entries pinned to a tag/sha
 # rather than a moving branch.

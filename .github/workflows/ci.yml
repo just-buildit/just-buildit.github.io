@@ -394,6 +394,61 @@ jobs:
           exit 1
 
   # ------------------------------------------------------------------
+  # scripts/ is CANONICAL too: every repo vendors these and compares against
+  # them on every `make lint`, exactly like standard.mk. Until now nothing
+  # here ran on them at all, so a syntax error or a bad diagnosis shipped to
+  # every adopter and was caught, if at all, mid-release.
+  # ------------------------------------------------------------------
+  scripts:
+    name: scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Every script parses
+        run: |
+          set -euo pipefail
+          n=0
+          for f in scripts/*.sh; do
+            bash -n "$f"; echo "  ok  $f"; n=$((n+1))
+          done
+          # A loop over an empty glob passes silently, which would make this
+          # job a description of a check rather than a check.
+          [ "$n" -gt 0 ] || { echo "::error::no scripts found"; exit 1; }
+
+      - name: shellcheck
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck --severity=warning scripts/*.sh
+
+      - name: A failure it can attribute is never reported as a flake
+        # just-makeit#1327. `release-watch` printed "likely a flake" for every
+        # pre-publish failure, including the verify-ci one it had diagnosed
+        # two lines above — deterministic, and the cause every single time the
+        # message appeared. "Flake" is the one word that stops the next reader
+        # looking, so it must not be reachable for a failure we can name.
+        #
+        # Scanned over the lines the script PRINTS, not the whole file: a
+        # plain substring scan matches the comment explaining this very fix,
+        # so the detector would be blinded by an example of what it looks for.
+        run: |
+          set -euo pipefail
+          printed="$(grep -n '^[^#]*echo' scripts/release-watch.sh || true)"
+          [ -n "$printed" ] || { echo "::error::no echo lines — not armed"; exit 1; }
+          if echo "$printed" | grep -q 'likely a flake'; then
+            echo "::error::release-watch prints a guess for a failure it can name:"
+            echo "$printed" | grep 'likely a flake'
+            exit 1
+          fi
+          # Replacing the guess with silence would be no better — the reader
+          # needs to know WHICH job failed to judge whether a rerun is worth
+          # anything.
+          echo "$printed" | grep -q 'failed: \${FAILED_JOBS' \
+            || { echo "::error::the failing job names are never printed"; exit 1; }
+          echo "  ok  names the failure instead of guessing at it"
+
+  # ------------------------------------------------------------------
   # Aggregator: the single "CI passed" check the `main` ruleset requires.
   # Adding a job above means adding it to `needs:` here — otherwise the
   # aggregator goes green while the new job is red, and the required check
@@ -404,6 +459,7 @@ jobs:
     name: CI passed
     needs:
       - standard-mk
+      - scripts
     runs-on: ubuntu-latest
     # `always()` so this still runs when a dependency failed — otherwise it
     # would be skipped, the required check would never report, and a red PR

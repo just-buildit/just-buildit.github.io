@@ -195,8 +195,11 @@ jobs:
                    "Canonical commit: $SHA")
                  git commit -qam "$msg"
                  git push -q -u origin "$branch"
-                 base=$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)
-                 gh pr create --fill --base "$base" >/dev/null ); then
+                 base=$(gh repo view "$slug" \
+                        --json defaultBranchRef -q .defaultBranchRef.name)
+                 gh pr create --repo "$slug" --head "$branch" --base "$base" \
+                   --title "chore: re-vendor from canonical $(echo "$SHA" | cut -c1-7)" \
+                   --body "$msg" >/dev/null ); then
               echo "PR opened"; opened=$((opened+1))
             else
               echo "::warning::could not open a PR in $slug"

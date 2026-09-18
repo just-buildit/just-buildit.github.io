@@ -171,6 +171,14 @@ jobs:
               echo "(dry run — no PR)"; echo "::endgroup::"; continue
             fi
 
+            # `gh repo clone` leaves an unauthenticated https remote, so
+            # the push prompts for a username and dies with
+            # "could not read Username for 'https://github.com'". The token
+            # goes on the remote explicitly rather than via a credential
+            # helper -- one fewer moving part, and Actions masks it in logs.
+            git -C work remote set-url origin \
+              "https://x-access-token:${GH_TOKEN}@github.com/$slug.git"
+
             if ( cd work
                  git checkout -b "$branch"
                  msg=$(printf '%s\n' \

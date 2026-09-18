@@ -393,6 +393,79 @@ jobs:
           diff -u served.mk standard.mk || true
           exit 1
 
+      - name: tag-release refuses a red commit, and fails open otherwise
+        # just-makeit#1327 follow-on. `tag-release` checked everything about
+        # the TAG and nothing about the tree it points at -- and a release tag
+        # must not move, so a tag pushed onto a red commit spends a version
+        # number.
+        #
+        # The shipped recipe text is EXTRACTED and RUN, not merely parsed.
+        # `make -n` cannot see either mistake the first cut made: a recipe
+        # line with no `\` continuation (which splits the `if` across two
+        # shells) and a missing `--paginate` (a real release commit carries 47
+        # check-runs against a page size of 30, so the aggregate was never
+        # found and every commit read as "not concluded" -- including a red
+        # one, which is the case the guard exists for).
+        run: |
+          set -euo pipefail
+          awk '/# >>> ci-guard/,/# <<< ci-guard/' standard.mk \
+            | grep -v '^#' \
+            | sed 's/^\t@\?//; s/\$\$/$/g; s/$(CI_CHECK_NAME)/CI passed/g' \
+            > guard.sh
+          test -s guard.sh || { echo "::error::ci-guard markers found nothing"; exit 1; }
+          sh -n guard.sh
+
+          # A recipe line without a trailing `\` splits the `if` across two
+          # shells, so `slug=` is set in one and read empty in the next. The
+          # extracted form above CANNOT see this -- as shell it is simply two
+          # statements and runs fine -- so assert it against the Makefile
+          # text, which is the medium where it matters.
+          bad=$(awk '/# >>> ci-guard/,/# <<< ci-guard/' standard.mk \
+                | grep -vE '^#' | grep -vE '^[[:space:]]*fi$' | grep -vE '\\$' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::guard recipe line(s) missing a continuation:"
+            printf '%s\n' "$bad"
+            exit 1
+          fi
+
+          bin="$(mktemp -d)"
+          printf '%s\n' '#!/bin/sh' \
+            'case "$*" in' \
+            '  "auth status") exit 0 ;;' \
+            '  *nameWithOwner*) echo acme/widget ;;' \
+            '  *--paginate*check-runs*) printf "%s\\n" "$FAKE" ;;' \
+            '  *check-runs*) : "past page 1 - unpaginated finds nothing" ;;' \
+            'esac' > "$bin/gh"
+          chmod +x "$bin/gh"
+
+          # A concluded-bad commit is REFUSED, and says which conclusion.
+          for c in failure timed_out cancelled action_required; do
+            if out=$(FAKE="$c" PATH="$bin:$PATH" sh guard.sh 2>&1); then
+              echo "::error::guard accepted a '$c' commit"; exit 1
+            fi
+            case "$out" in
+              *"concluded '$c'"*) ;;
+              *) echo "::error::wrong message for $c: $out"; exit 1 ;;
+            esac
+          done
+
+          # Green is silent and proceeds.
+          out=$(FAKE=success PATH="$bin:$PATH" sh guard.sh 2>&1) \
+            || { echo "::error::guard rejected a green commit"; exit 1; }
+          test -z "$out" || { echo "::error::green was not silent: $out"; exit 1; }
+
+          # Not concluded -> advisory, never fatal.
+          out=$(FAKE="" PATH="$bin:$PATH" sh guard.sh 2>&1) \
+            || { echo "::error::guard is not fail-open on an unknown state"; exit 1; }
+          case "$out" in *"has not concluded"*) ;; *)
+            echo "::error::no advisory printed: $out"; exit 1 ;; esac
+
+          # No gh at all -> silent, and still fails open.
+          PATH=/usr/bin:/bin sh guard.sh \
+            || { echo "::error::guard is not fail-open without gh"; exit 1; }
+
+          echo "  ok  refuses red, silent on green, advisory + open otherwise"
+
   # ------------------------------------------------------------------
   # scripts/ is CANONICAL too: every repo vendors these and compares against
   # them on every `make lint`, exactly like standard.mk. Until now nothing

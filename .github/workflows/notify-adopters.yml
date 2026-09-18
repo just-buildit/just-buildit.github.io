@@ -1,0 +1,182 @@
+name: Re-vendor adopters
+
+# Publishing here turns every adopter's `standard-check` red at once, and
+# nothing used to tell them (#41). Measured: `just-buildit` and `doppler` sat
+# red on `main` with nobody aware, and two open re-vendor PRs silently went
+# stale between being cut and being reviewed.
+#
+# So this opens the re-vendor PR for them rather than reminding them to. A
+# reminder is a chore; a PR is a review.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - standard.mk
+      - scripts/**
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "List adopters and diffs, open no PRs"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: re-vendor-adopters
+  cancel-in-progress: false
+
+jobs:
+  fan-out:
+    name: Open a re-vendor PR in every adopter
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # "Canonical merged" and "canonical is SERVING it" are different events,
+      # and only the second is safe to vendor from. Measured the hard way: a
+      # `standard-update` run straight after a merge fetched the PRE-merge
+      # file, reported every vendored file matching, and would have re-drifted
+      # minutes later once Pages caught up. Fanning out before the deploy
+      # would send every adopter to fetch a stale copy — worse than not
+      # fanning out at all.
+      - name: Wait for Pages to serve this commit's files
+        run: |
+          set -euo pipefail
+          for f in standard.mk $(git ls-files 'scripts/*'); do
+            want=$(sha256sum "$f" | cut -d' ' -f1)
+            echo "waiting for $f ($want)"
+            for i in $(seq 1 60); do
+              got=$(curl -fsSL "https://just-buildit.github.io/$f" 2>/dev/null \
+                    | sha256sum | cut -d' ' -f1 || true)
+              [ "$got" = "$want" ] && { echo "  served after $((i*10))s"; break; }
+              if [ "$i" = 60 ]; then
+                echo "::error::Pages never served the current $f — not fanning out"
+                exit 1
+              fi
+              sleep 10
+            done
+          done
+
+      # Derived from the tree, never from a written list.
+      #
+      # A hand-maintained repo list is the exact bug class this whole exercise
+      # started from: just-makeit's CI allow-list named `jb.toml` for months
+      # after the rename, silently costing an hour of CI per release. A list
+      # of ORGS is far more stable than a list of repos, and a wrong one is
+      # visible here because an org contributing zero adopters fails the job.
+      #
+      # NOT `gh search code`: measured, it returned only 1 of the 4
+      # just-buildit adopters and 0 of the hunterdsp ones. A fan-out that
+      # silently skips adopters reproduces the bug it exists to fix.
+      - name: Derive the adopter list
+        id: derive
+        env:
+          GH_TOKEN: ${{ secrets.ADOPTER_PR_TOKEN }}
+          ORGS: just-buildit hunterdsp doppler-dsp
+          SELF: just-buildit/just-buildit.github.io
+        run: |
+          set -euo pipefail
+          # Named explicitly: without it the symptom is "0 adopters", which
+          # reads like a broken derivation rather than a missing secret.
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::ADOPTER_PR_TOKEN is not set. This workflow needs a"
+            echo "::error::token that can read every adopter org and open PRs"
+            echo "::error::in them — the repos span three orgs, so the default"
+            echo "::error::GITHUB_TOKEN cannot reach them."
+            exit 1
+          fi
+          : > adopters.txt
+          for org in $ORGS; do
+            found=0
+            for r in $(gh repo list "$org" --limit 100 --json name --jq '.[].name'); do
+              slug="$org/$r"
+              [ "$slug" = "$SELF" ] && continue
+              if gh api "repos/$slug/contents/standard.mk" --jq .name >/dev/null 2>&1; then
+                echo "$slug" >> adopters.txt
+                found=$((found + 1))
+              fi
+            done
+            echo "$org: $found adopter(s)"
+            if [ "$found" -eq 0 ]; then
+              echo "::error::$org yielded no adopters — the derivation is broken,"
+              echo "::error::or the token cannot see the org. Refusing to fan out"
+              echo "::error::a partial list, which is how an adopter gets missed."
+              exit 1
+            fi
+          done
+          echo "--- adopters ---"; cat adopters.txt
+
+      - name: Open a re-vendor PR where the vendored files have moved
+        env:
+          GH_TOKEN: ${{ secrets.ADOPTER_PR_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git config --global user.name "just-buildit[bot]"
+          git config --global user.email "noreply@just-buildit.invalid"
+          branch="chore/re-vendor-$(echo "$SHA" | cut -c1-7)"
+          opened=0; clean=0; failed=0
+
+          while read -r slug; do
+            [ -n "$slug" ] || continue
+            echo "::group::$slug"
+            rm -rf work && gh repo clone "$slug" work -- --depth 1 >/dev/null 2>&1 || {
+              echo "::warning::cannot clone $slug"; failed=$((failed+1))
+              echo "::endgroup::"; continue; }
+
+            # `make standard-update` rather than fetching files here: the
+            # adopter's own Makefile is the only thing that knows which files
+            # IT vendors. Guessing that list centrally is the hand-written-list
+            # trap again, one layer up.
+            if ! ( cd work && make standard-update >/dev/null 2>&1 ); then
+              echo "::warning::standard-update failed in $slug"
+              failed=$((failed+1)); echo "::endgroup::"; continue
+            fi
+
+            if ( cd work && git diff --quiet ); then
+              echo "already current"; clean=$((clean+1))
+              echo "::endgroup::"; continue
+            fi
+
+            ( cd work && git diff --stat )
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "(dry run — no PR)"; echo "::endgroup::"; continue
+            fi
+
+            ( cd work
+              git checkout -b "$branch"
+              msg=$(printf '%s\n' \
+                "chore: re-vendor from canonical $SHA" \
+                "" \
+                "Opened automatically: publishing to just-buildit.github.io" \
+                "turns every adopter's standard-check red at once, and nothing" \
+                "used to say why (just-buildit.github.io#41)." \
+                "" \
+                "make standard-update, not an edit -- vendored files are" \
+                "verbatim and the drift gate fails make lint on any difference." \
+                "" \
+                "Canonical commit: $SHA")
+              git commit -qam "$msg"
+              git push -q -u origin "$branch"
+              gh pr create --fill --base "$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)" \
+                 >/dev/null
+            ) && { echo "PR opened"; opened=$((opened+1)); } || {
+              echo "::warning::could not open a PR in $slug"; failed=$((failed+1)); }
+            echo "::endgroup::"
+          done < adopters.txt
+
+          echo "## Re-vendor fan-out" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| result | count |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| PR opened | $opened |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| already current | $clean |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| failed | $failed |" >> "$GITHUB_STEP_SUMMARY"
+
+          # A fan-out that quietly skipped half its adopters is the failure
+          # this exists to prevent, so a failure here is a job failure.
+          [ "$failed" -eq 0 ]

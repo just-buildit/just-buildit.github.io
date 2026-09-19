@@ -40,7 +40,7 @@ jobs:
           echo "$out" | grep -q "TEST_CMD is empty" \
             || { echo "::error::expected a parse-time error naming TEST_CMD"; exit 1; }
 
-      - name: Every feature group defines its targets
+      - name: Every feature group defines its targets, and passes the gates
         # Turns ON every flag with a command behind each one, so a group whose
         # variables and targets have drifted apart shows up here rather than in
         # whichever adopter enables that flag next.
@@ -78,6 +78,12 @@ jobs:
           n="$(make -C "$tmp" help | grep -cE '^  [a-z]')"
           echo "targets listed: $n"
           [ "$n" -ge 38 ] || { echo "::error::expected >=38 targets, got $n"; exit 1; }
+          # ...and the gates adopters run hold with every group ON. The step
+          # below runs them with every group OFF, so a target a feature group
+          # adds was never shown to either: `ci-changes` shipped in HAS_RELEASE
+          # with no _STD_SECTION arm, and help-check failed `make lint` in the
+          # first adopter to re-vendor (just-makeit#1388).
+          make -C "$tmp" help-check ghost-check
 
       - name: Its own gates pass, and can fail
         # help-check and ghost-check are what adopters rely on. Prove both

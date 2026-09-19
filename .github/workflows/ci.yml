@@ -466,6 +466,60 @@ jobs:
 
           echo "  ok  refuses red, silent on green, advisory + open otherwise"
 
+      - name: ci-changes skips a version bump and nothing else
+        # The classifier a workflow's `changes` job calls to let a bump-only
+        # release commit skip the matrix. Its failure mode is the dangerous
+        # one -- a real change classified as a bump merges untested -- so the
+        # cases that must RUN outnumber the one that may skip: a code edit
+        # beside a bump, a dependency moving in a lockfile, a bump that adds a
+        # file, no bump at all, an unreadable base. Sabotaged when written:
+        # with the substitution comparison disabled, "bump + code" and
+        # "bump + dependency" both go red here.
+        run: |
+          set -eu
+          mk="$PWD/standard.mk"
+          t="$(mktemp -d)"; o="$(mktemp -d)"; trap 'rm -rf "$t" "$o"' EXIT
+          cd "$t"; git init -q; git config user.email t@t; git config user.name t
+          cp "$mk" standard.mk
+          cat > Makefile <<'EOF'
+          TEST_CMD = @echo test
+          TEST_FAST_CMD = @echo test-fast
+          CLEAN_PATHS = dist/
+          HAS_RELEASE = 1
+          BUMP_VERSION_CMD = @echo bump
+          RELEASE_WATCH_CMD = @echo watch
+          VERSION_PROBES = pyproject.toml|sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml
+          include standard.mk
+          EOF
+          printf '[project]\nname = "x"\nversion = "1.2.3"\n' > pyproject.toml
+          printf 'project(x VERSION 1.2.3 LANGUAGES C)\n' > CMakeLists.txt
+          printf '[[package]]\nname = "x"\nversion = "1.2.3"\n\n[[package]]\nname = "dep"\nversion = "4.0.0"\n' > uv.lock
+          printf 'int f(void) { return 1; }\n' > src.c
+          printf '# Changelog\n' > CHANGELOG.md
+          git add -A; git commit -qm base
+          fail=0
+          case_() {  # name expect -- then the edits already applied; commits, runs, resets
+              name=$1 want=$2
+              git add -A; git commit -qm "$name"
+              got=$(make -s ci-changes 2>"$o/why" | sed -n 's/^src=//p')
+              if [ "$got" = "$want" ]; then echo "ok   $name: src=$got ($(cat "$o/why"))"
+              else echo "FAIL $name: src=$got, want $want ($(cat "$o/why"))"; fail=1; fi
+              git reset -q --hard HEAD^
+          }
+          bump() { sed -i "s/1\.2\.3/1.3.0/" pyproject.toml CMakeLists.txt uv.lock; }
+
+          bump; printf '## 1.3.0\n' >> CHANGELOG.md;           case_ "bump alone"           false
+          bump; printf 'int g(void);\n' >> src.c;             case_ "bump + code"          true
+          bump; sed -i 's/4\.0\.0/4.1.0/' uv.lock;            case_ "bump + dependency"    true
+          printf 'int g(void);\n' >> src.c;                   case_ "code, no bump"        true
+          bump; printf 'x\n' > new.txt;                       case_ "bump + added file"    true
+          bump; git add -A; git commit -qm b
+          got=$(BASE=deadbeef make -s ci-changes 2>/dev/null | sed -n 's/^src=//p')
+          [ "$got" = true ] && echo "ok   unknown base: src=true" || { echo "FAIL unknown base: src=$got"; fail=1; }
+          : > "$o/gho"; GITHUB_OUTPUT="$o/gho" make -s ci-changes >/dev/null 2>"$o/why2"
+          grep -qx 'src=false' "$o/gho" && echo "ok   GITHUB_OUTPUT written" || { echo "FAIL GITHUB_OUTPUT: $(cat "$o/gho")"; fail=1; }
+          exit $fail
+
   # ------------------------------------------------------------------
   # scripts/ is CANONICAL too: every repo vendors these and compares against
   # them on every `make lint`, exactly like standard.mk. Until now nothing

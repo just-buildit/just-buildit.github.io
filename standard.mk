@@ -1130,7 +1130,7 @@ _STD_SECTION = case "$$t" in \
     bench|bench-save|bench-compare) tsec="Bench";; \
     coverage|coverage-gate) tsec="Coverage";; \
     bump-version|version-check|release-branch|tag-release|release-watch \
-        |ship) tsec="Release";; \
+        |ship|ci-changes) tsec="Release";; \
     test-examples) tsec="Examples";; \
     standard-check|standard-update|help-check|ghost-check|hook-dispatch-check|hook-stage-check) \
         tsec="Gates";; \

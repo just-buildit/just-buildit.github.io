@@ -56,6 +56,22 @@ drift gate switched off while everything still reports green.
 - **A new linter** → add it to `LINT_TOOLS` and define `LINT_<tool>`; the
     pre-commit hook dispatches to the `make -s lint-<tool>` that results.
 
+### Changelog fragments (`HAS_CHANGELOG = 1`)
+
+An entry is a **file**, `changelog.d/<section>/<slug>.md`, never a line in
+`CHANGELOG.md`: every PR appending to `[Unreleased]` made each merge conflict
+every other open PR. The directory is the `### Section`; the content is the
+entry verbatim, starting with `- `.
+
+- Set `CHANGELOG_CODE_PATHS` (the paths whose change needs an entry), then
+    `make standard-update` fetches `scripts/changelog.py`.
+- `make lint` runs `changelog-check` (code changed → a fragment added; a
+    hand-written `[Unreleased]` entry is refused) and
+    `changelog-sections-check` (a released section is never edited).
+- `make release-branch VERSION=x.y.z` promotes the fragments into the new
+    section itself, and `tag-release` refuses while any is left.
+- CI must pass the PR's base as `CHANGELOG_BASE`, with `fetch-depth: 0`.
+
 ### What will stop you, and what it means
 
 | message                           | meaning                                              |

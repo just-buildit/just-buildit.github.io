@@ -55,6 +55,7 @@ jobs:
           HAS_BENCH = 1
           HAS_COVERAGE = 1
           HAS_RELEASE = 1
+          HAS_CHANGELOG = 1
           HAS_EXAMPLES = 1
           TEST_CMD = @echo test
           TEST_FAST_CMD = @echo test-fast
@@ -70,6 +71,7 @@ jobs:
           RELEASE_WATCH_CMD = @echo watch
           VERSION_PROBES = pyproject.toml|echo 1.2.3
           TEST_EXAMPLES_CMD = @echo test-examples
+          CHANGELOG_CODE_PATHS = src
           LINT_TOOLS = ruff
           LINT_ruff = @echo lint-ruff
           include standard.mk
@@ -588,11 +590,35 @@ jobs:
   # stops meaning anything. Mirrors doppler and just-buildit/.github so the
   # org has one shape.
   # ------------------------------------------------------------------
+  # scripts/changelog.py is vendored like everything else in scripts/, and
+  # it RUNS in every adopter's `make lint` -- on the adopter's python3, which
+  # may be as old as the oldest one they support. So its behaviour tests run
+  # on that floor as well as today's interpreter: a 3.10-only spelling would
+  # pass here on the newest and break an adopter's lint on the day it
+  # re-vendors.
+  changelog:
+    name: changelog.py (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Doctests
+        run: python -m doctest scripts/changelog.py
+      - name: Behaviour, over real git repos
+        run: python -m unittest discover -s tests -v
+
   ci-passed:
     name: CI passed
     needs:
       - standard-mk
       - scripts
+      - changelog
     runs-on: ubuntu-latest
     # `always()` so this still runs when a dependency failed — otherwise it
     # would be skipped, the required check would never report, and a red PR

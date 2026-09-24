@@ -613,12 +613,52 @@ jobs:
       - name: Behaviour, over real git repos
         run: python -m unittest discover -s tests -v
 
+  # scripts/msvc-env.sh replaces ilammy/msvc-dev-cmd (node20, unmaintained)
+  # at every adopter's Windows build. It can only be proven on Windows, so
+  # it is proven here: the toolchain is ABSENT before it runs (the job can
+  # fail), present in the NEXT step (it went through $GITHUB_ENV), and both
+  # compilers an adopter uses -- cl.exe and clang-cl, which drives MSVC's
+  # headers and linker -- build and run a program with it. A bad arch is
+  # refused rather than half-applied.
+  msvc-env:
+    name: msvc-env.sh (windows-latest)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Without it, there is no MSVC environment
+        run: |
+          if command -v cl.exe || [ -n "${VSCMD_ARG_TGT_ARCH:-}" ]; then
+            echo "::error::the runner already has an MSVC environment, so"
+            echo "  the checks below could pass without msvc-env.sh"
+            exit 1
+          fi
+      - name: A bad arch is refused
+        run: |
+          if scripts/msvc-env.sh no-such-arch; then
+            echo "::error::msvc-env.sh accepted an arch vcvarsall rejects"
+            exit 1
+          fi
+      - name: MSVC developer environment (x64)
+        run: scripts/msvc-env.sh x64
+      - name: A later step builds with cl.exe and clang-cl
+        run: |
+          [ "$VSCMD_ARG_TGT_ARCH" = x64 ]
+          printf '#include <stdio.h>\nint main(void) { puts("ok"); return 0; }\n' >t.c
+          cl.exe //nologo t.c //Fe:t_cl.exe
+          [ "$(./t_cl.exe | tr -d '\r')" = ok ]
+          clang-cl //nologo t.c //Fe:t_clang.exe
+          [ "$(./t_clang.exe | tr -d '\r')" = ok ]
+
   ci-passed:
     name: CI passed
     needs:
       - standard-mk
       - scripts
       - changelog
+      - msvc-env
     runs-on: ubuntu-latest
     # `always()` so this still runs when a dependency failed — otherwise it
     # would be skipped, the required check would never report, and a red PR

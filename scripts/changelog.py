@@ -59,7 +59,6 @@ import os
 import pathlib
 import re
 import subprocess
-import sys
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
 #: Keep a Changelog's order, ``breaking`` first because a reader scanning a

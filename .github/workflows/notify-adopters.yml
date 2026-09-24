@@ -44,7 +44,7 @@ jobs:
     name: Wait for Pages to serve this commit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       - name: Compare what is served against what is committed
         run: |

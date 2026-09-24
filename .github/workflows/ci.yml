@@ -233,6 +233,43 @@ jobs:
             || { cat "$tmp/log"; echo "::error::did not name the drifted file"; exit 1; }
           echo "OK — walks the list, names what broke, cannot pass on nothing."
 
+      - name: A vendored .github/ path is fetched from github/
+        # Pages never serves `.github/`, so `.github/dependabot.yml` is
+        # published as `github/dependabot.yml`; _std_vendor_src maps one to
+        # the other for BOTH standard-update and standard-check. Hermetic: a
+        # file:// canonical that has only `github/`, so the fetch can only
+        # succeed through the mapping, and without it the update fails.
+        run: |
+          tmp="$(mktemp -d)"; canon="$tmp/canon"
+          mkdir -p "$canon/github" "$tmp/a"
+          cp standard.mk "$canon/standard.mk"; cp standard.mk "$tmp/a/"
+          printf 'version: 2\n' > "$canon/github/dependabot.yml"
+          cat > "$tmp/a/Makefile" <<EOF
+          TEST_CMD = @echo test
+          TEST_FAST_CMD = @echo test-fast
+          CLEAN_PATHS = dist/
+          STANDARD_URL = file://$canon/standard.mk
+          VENDORED_FILES = .github/dependabot.yml
+          include standard.mk
+          EOF
+          make -C "$tmp/a" standard-update
+          cmp "$canon/github/dependabot.yml" "$tmp/a/.github/dependabot.yml"
+          make -C "$tmp/a" standard-check | grep -q "2 vendored file(s) match" \
+            || { echo "::error::a clean .github/ vendored file did not pass"; exit 1; }
+          echo "# drift" >> "$tmp/a/.github/dependabot.yml"
+          if make -C "$tmp/a" standard-check > "$tmp/log" 2>&1; then
+            cat "$tmp/log"; echo "::error::a drifted .github/ file passed"; exit 1
+          fi
+          grep -q "differs from file://$canon/github/dependabot.yml" "$tmp/log" \
+            || { cat "$tmp/log"; echo "::error::did not name the github/ source"; exit 1; }
+          echo "OK: .github/ is fetched from github/, and its drift is named."
+
+      - name: Canonical's own Dependabot config is the one it publishes
+        # Dependabot reads only `.github/dependabot.yml`, which Pages cannot
+        # serve; adopters get `github/dependabot.yml`. Two copies in one repo
+        # are the drift this file exists to stop, so they are compared.
+        run: cmp .github/dependabot.yml github/dependabot.yml
+
       - name: gates-check verifies gates covers CI, and names the gap when not
         # Same both-directions proof for the newest gate. A `make <target>` CI
         # runs that `gates` cannot reach must fail here, naming it — that is the

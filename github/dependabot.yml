@@ -1,0 +1,33 @@
+# Keep the Actions pins from going stale.
+#
+# Vendored from canonical (just-buildit.github.io, published at
+# github/dependabot.yml and fetched to .github/dependabot.yml by
+# `make standard-update`); `standard-check` holds every copy to it. Change it
+# there, not here.
+#
+# Pins drifted three to five majors before anyone looked, in doppler and in
+# just-makeit alike, and almost every major in that gap was "now runs on
+# Node 24" -- invisible until GitHub printed a deprecation notice on every
+# run. A weekly PR makes it a diff instead.
+#
+# Only `github-actions` is watched. Python dependencies are pinned by each
+# repo's `uv.lock`, and moving them is deliberately a human's job.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # One PR for everything, not fourteen. These move together in practice --
+    # a Node runtime bump lands across the whole ecosystem within weeks --
+    # and reviewing them as a set is the only way to see that shape.
+    groups:
+      actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: chore
+      include: scope
+    labels:
+      - dependencies
+    open-pull-requests-limit: 3

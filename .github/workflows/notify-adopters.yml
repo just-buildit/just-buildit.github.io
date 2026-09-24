@@ -16,6 +16,7 @@ on:
     paths:
       - standard.mk
       - scripts/**
+      - github/**
   workflow_dispatch:
     inputs:
       dry_run:
@@ -48,7 +49,7 @@ jobs:
       - name: Compare what is served against what is committed
         run: |
           set -euo pipefail
-          for f in standard.mk $(git ls-files 'scripts/*'); do
+          for f in standard.mk $(git ls-files 'scripts/*' 'github/*'); do
             want=$(sha256sum "$f" | cut -d' ' -f1)
             echo "waiting for $f ($want)"
             for i in $(seq 1 60); do

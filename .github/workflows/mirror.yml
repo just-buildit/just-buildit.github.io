@@ -106,4 +106,5 @@ jobs:
               --title "mirror: refresh upstream scripts" \
               --body "Automated by mirror.yml: just-bashit's shipped scripts, copied to jbs/ and the root fetch fallbacks. Merges itself once the required checks pass."
           fi
-          gh pr merge "$BRANCH" --auto --squash
+          # Rebase: the only method this repo allows (linear history).
+          gh pr merge "$BRANCH" --auto --rebase

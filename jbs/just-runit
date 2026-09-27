@@ -29,7 +29,7 @@ _JBS_BASE="https://just-buildit.github.io/jbs"
 _JBS_LIBS=(
 	datetime environment file format
 	function-template logging match network path
-	pkg toml
+	pkg toml windows
 )
 
 # ---- portable checksums -----------------------------------------------------

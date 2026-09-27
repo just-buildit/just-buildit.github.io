@@ -15,17 +15,26 @@ _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${_SCRIPT_DIR}/toml.sh"
 # shellcheck source=/dev/null
 source "${_SCRIPT_DIR}/file.sh"
+# shellcheck source=/dev/null
+source "${_SCRIPT_DIR}/windows.sh"
 
 # Pages CDN mirror of src/just_bashit/ — used only when a sibling asset is
 # missing, i.e. when this script was fetched standalone by jbx.
 _JBS_BASE="${JB_JBS_BASE:-https://just-buildit.github.io/jbs}"
 
 # Order matters: packages first (later steps want git, curl and ssh), shell
-# before ssh (the agent lives in the shell config), tools before claude.
+# before ssh (the agent lives in the shell config), tools and pwsh before
+# claude. pwsh comes after deps because it downloads with curl and unpacks
+# with tar, both of which the deps step is what puts on a bare machine.
 # Kept as an array as well as a string because IFS is newline+tab here, so
 # a space-separated string does not word-split.
-_STEPS_ALL=(deps shell ssh git tools claude)
-_STEPS_ALL_STR="deps shell ssh git tools claude"
+_STEPS_ALL=(deps shell ssh sshd git tools pwsh claude)
+_STEPS_ALL_STR="deps shell ssh sshd git tools pwsh claude"
+
+# Steps that run only when named with -s or in bootstrap.toml. sshd opens a
+# listening port on the machine, which is not something a default run gets
+# to decide on the user's behalf.
+_STEPS_OPT_IN_STR="sshd"
 
 DRY_RUN=0
 VERBOSE=0
@@ -35,6 +44,8 @@ STEPS_EXPLICIT=0
 SKIP_STR=""
 PREFIX="${JB_CONFIG_DIR:-${XDG_CONFIG_HOME:-${HOME}/.config}/just-bashit}"
 KEY_NAME=""
+SSHD_GITHUB_USER=""
+SSHD_ALLOW=""
 TEMPLATE=""
 TEMPLATE_PATH="-"
 
@@ -45,18 +56,28 @@ read -r -d '' HELP <<-'EOF' || true
 	  and every step is safe to re-run — nothing is duplicated or clobbered.
 
 	Steps:
-	  deps    Install system packages from bootstrap.toml in the
-	          current directory (delegates to install-deps). Skipped when no
-	          deps file is present.
+	  deps    Install a baseline toolchain (C compiler, make, cmake,
+	          pkg-config, git, curl, ssh), then the packages of any
+	          bootstrap.toml in the current directory (delegates to
+	          install-deps).
 	  shell   Install the opinionated bash configuration to
 	          ~/.config/just-bashit/{bashrc,profile}.sh and add one source
 	          line to ~/.bashrc and ~/.profile. Your files stay yours.
 	  ssh     Ensure ~/.ssh permissions and an ed25519 key named after this
 	          host; print the public key to register with GitHub.
-	  git     Set global git defaults that are not already set. Never touches
-	          user.name or user.email — those are per-repo identity.
+	  sshd    Windows only (WSL or native MSYS2 / Git Bash), and only
+	          when asked for (-s sshd): run Windows' OpenSSH server as a
+	          boot-time service -- key-only, keys from
+	          github.com/<user>.keys, pwsh.exe as the login shell -- so
+	          the machine is reachable over ssh even when WSL is not
+	          running. Raises one UAC prompt on the Windows desktop.
+	  git     Set global git defaults that are not already set. An unset
+	          user.name / user.email comes from GIT_AUTHOR_NAME /
+	          GIT_AUTHOR_EMAIL, else is asked for at a terminal.
 	  tools   Install uv if missing; install pre-commit hooks when the
 	          current directory is a repo with .pre-commit-config.yaml.
+	  pwsh    Install PowerShell 7 and the PSScriptAnalyzer module, so
+	          .ps1 files can be linted here. Linux and macOS only.
 	  claude  Install Claude Code if the claude command is missing.
 
 	Options:
@@ -71,11 +92,17 @@ read -r -d '' HELP <<-'EOF' || true
 	       --prefix DIR          Config directory to install into
 	                             (default: ~/.config/just-bashit).
 	       --key-name NAME       ssh key filename (default: this hostname).
+	       --github-user NAME    sshd: authorize github.com/NAME.keys
+	                             (default: the account gh is signed in to).
+	       --sshd-allow ADDRS    sshd: comma-separated addresses the
+	                             firewall admits to port 22 (default: any),
+	                             e.g. 100.64.0.0/10,fd7a:115c:a1e0::/48
+	                             for a Tailscale tailnet only.
 	       --template [PATH]     Write the bashrc template to PATH (or stdout).
 	       --template-profile [PATH]
 	                             Write the profile template to PATH (or stdout).
 
-	Default steps: all of them. To restrict the default set, declare
+	Default steps: all of them except sshd. To restrict the default set, declare
 	steps = [...] under [tools.setup-system] in bootstrap.toml.
 
 	Examples:
@@ -120,6 +147,14 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--key-name)
 		KEY_NAME="${2:?Option $1 requires an argument.}"
+		shift 2
+		;;
+	--github-user)
+		SSHD_GITHUB_USER="${2:?Option $1 requires an argument.}"
+		shift 2
+		;;
+	--sshd-allow)
+		SSHD_ALLOW="${2:?Option $1 requires an argument.}"
 		shift 2
 		;;
 	--template | --template-profile)
@@ -293,16 +328,72 @@ _find_bootstrap_toml() {
 	return 1
 }
 
-step_deps() {
-	_head "deps — system packages"
+# The toolchain every machine gets, whatever directory this runs from: a C
+# compiler, make, cmake, pkg-config, and the git/curl/ssh the later steps
+# lean on. Before this existed, deps read only a bootstrap.toml in the
+# current directory, so the documented fresh-machine run -- from $HOME --
+# installed nothing, and the first C build on a new box failed with no
+# compiler at all.
+#
+# It is a manifest in bootstrap.toml's own format and goes through the same
+# install-deps call as a project's, so there is one installer and one
+# per-manager naming scheme, not a second list with its own rules. It lives
+# in this file rather than beside it because the jbs Pages mirror copies
+# only *.sh: a sibling .toml would never reach a standalone jbx run.
+#
+# Deliberately a toolchain and nothing more. Language runtimes and project
+# libraries (python3-dev, numpy, rust) are a project's to declare, in its
+# own bootstrap.toml, which this step still installs afterwards.
+read -r -d '' _BASELINE_TOML <<-'EOF' || true
+	[baseline.apt]
+	packages = ["build-essential", "cmake", "pkg-config", "git", "curl", "ca-certificates", "openssh-client", "tar"]
 
-	local deps_file=""
-	deps_file="$(_find_bootstrap_toml || true)"
-	if [[ -z ${deps_file} ]]; then
-		_info "no bootstrap.toml in $(pwd) — nothing to install"
-		_result "deps:    skipped (no deps file)"
+	[baseline.pacman]
+	packages = ["base-devel", "cmake", "pkgconf", "git", "curl", "openssh", "tar"]
+
+	[baseline.dnf]
+	packages = ["gcc", "make", "cmake", "pkgconf-pkg-config", "diffutils", "git", "curl", "openssh-clients", "tar"]
+
+	[baseline.zypper]
+	packages = ["gcc", "make", "cmake", "pkg-config", "diffutils", "git", "curl", "openssh", "tar"]
+
+	[baseline.apk]
+	packages = ["build-base", "cmake", "pkgconf", "bash", "git", "curl", "openssh-keygen", "tar"]
+
+	# The compiler on macOS is the Xcode Command Line Tools, which brew itself
+	# requires, so brew has only the build tools to add.
+	[baseline.brew]
+	packages = ["cmake", "pkg-config"]
+
+	# Git Bash with no pacman (install-deps' winget section, #60). The
+	# compiler is clang-cl, the toolchain just-makeit builds Windows with; it
+	# also needs the MSVC Build Tools' C++ workload, which winget installs
+	# only with an --override this manifest has no way to pass yet -- see
+	# #67. Windows 10+ ships tar.exe and curl.exe itself.
+	[baseline.winget]
+	packages = ["Kitware.CMake", "Git.Git", "LLVM.LLVM"]
+
+	[baseline.msys2]
+	packages = ["mingw-w64-ucrt-x86_64-gcc", "mingw-w64-ucrt-x86_64-cmake", "make", "pkg-config", "git", "curl", "openssh"]
+EOF
+
+# _install_manifest INSTALLER FILE LABEL — one install-deps run over FILE,
+# reported under LABEL. Returns install-deps' own status.
+_install_manifest() {
+	local installer="$1" file="$2" label="$3"
+	local args=()
+	[[ ${DRY_RUN} -eq 1 ]] && args+=("--dry-run")
+	[[ ${VERBOSE} -eq 1 ]] && args+=("--verbose")
+	_info "installing packages from ${label}"
+	if bash "${installer}" "${args[@]+"${args[@]}"}" "${file}"; then
 		return 0
 	fi
+	_warn "install-deps reported a failure for ${label}"
+	return 1
+}
+
+step_deps() {
+	_head "deps — system packages"
 
 	local installer
 	installer="$(_asset install-deps.sh)" || {
@@ -311,15 +402,26 @@ step_deps() {
 		return 0
 	}
 
-	_info "installing packages from ${deps_file}"
-	local args=()
-	[[ ${DRY_RUN} -eq 1 ]] && args+=("--dry-run")
-	[[ ${VERBOSE} -eq 1 ]] && args+=("--verbose")
-	if bash "${installer}" "${args[@]+"${args[@]}"}" "${deps_file}"; then
-		_result "deps:    ok (${deps_file})"
+	local baseline ok=1 done_list="baseline toolchain"
+	baseline="$(mktemp "${TMPDIR:-/tmp}/jb-baseline.XXXXXX")"
+	printf '%s\n' "${_BASELINE_TOML}" >"${baseline}"
+	_install_manifest "${installer}" "${baseline}" "the baseline toolchain" ||
+		ok=0
+	rm -f "${baseline}"
+
+	local deps_file=""
+	deps_file="$(_find_bootstrap_toml || true)"
+	if [[ -n ${deps_file} ]]; then
+		_install_manifest "${installer}" "${deps_file}" "${deps_file}" || ok=0
+		done_list="${done_list} + ${deps_file}"
 	else
-		_warn "install-deps reported a failure"
-		_result "deps:    failed"
+		_log "no bootstrap.toml in $(pwd) — baseline only"
+	fi
+
+	if [[ ${ok} -eq 1 ]]; then
+		_result "deps:    ok (${done_list})"
+	else
+		_result "deps:    failed (${done_list})"
 	fi
 }
 
@@ -497,6 +599,193 @@ step_ssh() {
 	_result "ssh:     ok (created ${key})"
 }
 
+# ---------------------------------------------------------------------------
+# sshd — Windows' own OpenSSH server as a boot-time service, driven from WSL.
+#
+# An ssh server inside WSL2 dies with the WSL VM, and the VM stops on its own
+# when idle or after a crash -- so the machine is unreachable at exactly the
+# moments you need to reach it. Windows' sshd is a service that starts at
+# boot whether or not WSL ever does, and `wsl` is one command away from it.
+#
+# The work is windows-sshd.ps1, which has to run elevated. This step copies
+# it to the Windows temp directory (an elevated process cannot be relied on
+# to read \\wsl.localhost paths), raises the UAC prompt with Start-Process
+# -Verb RunAs, waits, and relays the script's log -- the elevated window is
+# hidden, so without the log a failure would be invisible.
+#
+# It runs from WSL or from native Windows (MSYS2 / Git Bash); the two differ
+# only in how a Windows path becomes a local one (wslpath, cygpath).
+#
+# Nothing is quoted across a process boundary. The elevated body is written
+# to run.ps1 and the UAC hop to launch.ps1, both beside the copied script;
+# each finds its neighbours through $PSScriptRoot, so no path is spliced
+# into PowerShell, and powershell.exe gets only `-File launch.ps1` -- one
+# plain argument. The alternative, a command string, crosses bash, the
+# outer command line and Start-Process's argument list, and each has its
+# own quoting rule (a bash quirk broke it on macOS, gh-69's CI).
+# WaitForExit rather than Start-Process -Wait: in Windows PowerShell -Wait
+# also waits for every descendant, and the MSI installs this triggers can
+# leave one running -- an outer wait that then never returns.
+# ---------------------------------------------------------------------------
+
+# Overridable so the suite can run this on a Linux runner (as ssh-to-windows
+# does): a WSL-only step tested only by hand is eventually not tested.
+_PROC_VERSION="${JB_PROC_VERSION:-/proc/version}"
+
+# _sshd_github_user — whose keys to authorize: --github-user, else the
+# account gh is signed in to. Printed, or return 1 when neither is known.
+_sshd_github_user() {
+	local u="${SSHD_GITHUB_USER}"
+	if [[ -z ${u} ]] && _have gh; then
+		u="$(gh api user --jq .login 2>/dev/null || true)"
+	fi
+	[[ -n ${u} ]] || return 1
+	printf '%s\n' "${u}"
+}
+
+step_sshd() {
+	_head "sshd — Windows OpenSSH server, started at boot"
+
+	# WSL, or native Windows under MSYS2 / Git Bash: the same Windows
+	# service either way, reached through a different path translator.
+	local topath
+	_pwsh_uname_init
+	if [[ -r ${_PROC_VERSION} ]] && grep -qi microsoft "${_PROC_VERSION}"; then
+		topath=wslpath
+	else
+		case "${_UNAME_S}" in
+		MINGW* | MSYS* | CYGWIN*) topath=cygpath ;;
+		*)
+			_info "not Windows — on Linux enable the distro's own sshd unit"
+			_result "sshd:    skipped (not Windows)"
+			return 0
+			;;
+		esac
+	fi
+
+	local ps_exe cmd_exe c
+	ps_exe="$(win-exe powershell.exe)" || ps_exe=""
+	cmd_exe="$(win-exe cmd.exe)" || cmd_exe=""
+	for c in "${ps_exe:-powershell.exe}" "${cmd_exe:-cmd.exe}" "${topath}"; do
+		if [[ ${c} != */* ]] && ! _have "${c}"; then
+			_warn "${c} not found — this step drives Windows from here"
+			_result "sshd:    skipped (no ${c})"
+			return 0
+		fi
+	done
+	# MSYS rewrites any argument that looks like a POSIX path before a
+	# Windows program sees it: `cmd /c` would arrive as `cmd C:/`. Off for
+	# every call below; WSL ignores both variables.
+	local -x MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1
+
+	local user
+	if ! user="$(_sshd_github_user)"; then
+		_warn "no GitHub user: pass --github-user NAME, or sign in to gh"
+		_result "sshd:    skipped (no GitHub user)"
+		return 0
+	fi
+	# Both values are spliced into a PowerShell command. Checked against what
+	# they can legitimately contain, so neither can carry a quote into it.
+	if [[ ! ${user} =~ ^[A-Za-z0-9-]+$ ]]; then
+		_warn "not a GitHub user name: ${user}"
+		_result "sshd:    failed (bad --github-user)"
+		return 0
+	fi
+	if [[ -n ${SSHD_ALLOW} && ! ${SSHD_ALLOW} =~ ^[0-9A-Za-z.:/,-]+$ ]]; then
+		_warn "not an address list: ${SSHD_ALLOW}"
+		_result "sshd:    failed (bad --sshd-allow)"
+		return 0
+	fi
+
+	local ps1
+	if ! ps1="$(_asset windows-sshd.ps1)"; then
+		_result "sshd:    failed (windows-sshd.ps1 unavailable)"
+		return 0
+	fi
+
+	local wtemp
+	wtemp="$( (
+		cd /mnt/c 2>/dev/null || true
+		"${cmd_exe}" /c 'echo %TEMP%' 2>/dev/null
+	) | tr -d '\r\n')" || wtemp=""
+	if [[ -z ${wtemp} ]]; then
+		_warn "could not resolve the Windows %TEMP% through cmd.exe"
+		_result "sshd:    failed (no %TEMP%)"
+		return 0
+	fi
+	local wdir="${wtemp}\\jb-windows-sshd"
+	local dir
+	dir="$("${topath}" -u "${wdir}")"
+
+	# The same PowerShell pin the pwsh step installs on Linux, so every
+	# machine this sets up runs one release. Both values were checked above
+	# to hold no quote. The list is joined through ${sq} rather than an
+	# escaped quote in the replacement, whose meaning changed across bash
+	# releases.
+	local ps_args="-GitHubUser '${user}' -PwshVersion '${_PS_VER}'"
+	if [[ -n ${SSHD_ALLOW} ]]; then
+		local sq="'"
+		ps_args="${ps_args} -RemoteAddress ${sq}${SSHD_ALLOW//,/${sq},${sq}}${sq}"
+	fi
+
+	if [[ ${DRY_RUN} -eq 1 ]]; then
+		_info "would copy windows-sshd.ps1 to ${wdir}"
+		_info "would raise a UAC prompt and run, elevated:"
+		_info "  windows-sshd.ps1 ${ps_args}"
+		_result "sshd:    ok (dry run)"
+		return 0
+	fi
+
+	mkdir -p "${dir}"
+	cp "${ps1}" "${dir}/windows-sshd.ps1"
+	rm -f "${dir}/log.txt"
+	# The elevated window is hidden, so its whole output goes to log.txt.
+	cat >"${dir}/run.ps1" <<-EOF
+		\$log = Join-Path \$PSScriptRoot 'log.txt'
+		try {
+		    & (Join-Path \$PSScriptRoot 'windows-sshd.ps1') ${ps_args} *>&1 |
+		        Out-File -FilePath \$log -Encoding utf8
+		    exit 0
+		} catch {
+		    \$_ | Out-File -FilePath \$log -Append -Encoding utf8
+		    exit 1
+		}
+	EOF
+	# Start-Process joins -ArgumentList with spaces, so the one path in it
+	# is quoted; a Windows path cannot itself hold a double quote. A
+	# declined UAC prompt is a NON-terminating error: without Stop the
+	# script runs on to `exit $null.ExitCode`, which is exit 0 -- success.
+	cat >"${dir}/launch.ps1" <<-'EOF'
+		$ErrorActionPreference = 'Stop'
+		$run = Join-Path $PSScriptRoot 'run.ps1'
+		$p = Start-Process powershell.exe -Verb RunAs -PassThru -WindowStyle Hidden `
+		    -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$run`""
+		$p.WaitForExit()
+		exit $p.ExitCode
+	EOF
+
+	_info "approve the UAC prompt on the Windows desktop to continue"
+	local rc=0
+	(
+		cd /mnt/c 2>/dev/null || true
+		"${ps_exe}" -NoProfile -ExecutionPolicy Bypass -File "${wdir}\\launch.ps1"
+	) || rc=$?
+
+	if [[ -r "${dir}/log.txt" ]]; then
+		# Out-File's utf8 in Windows PowerShell writes a BOM; drop it and the
+		# CRs so the relayed lines read like the rest of this output.
+		sed -e '1s/^\xEF\xBB\xBF//' -e 's/\r$//' "${dir}/log.txt"
+	fi
+	if [[ ${rc} -eq 0 ]]; then
+		_result "sshd:    ok (keys from github.com/${user}.keys)"
+	elif [[ ! -r "${dir}/log.txt" ]]; then
+		_warn "the elevated run did not start — was the UAC prompt declined?"
+		_result "sshd:    failed (not elevated)"
+	else
+		_result "sshd:    failed (see the log above)"
+	fi
+}
+
 # git — opinionated global defaults, none of which overwrite a choice the
 # user has already made.
 step_git() {
@@ -535,8 +824,62 @@ step_git() {
 		set_count=$((set_count + 1))
 	done
 
-	_info "user.name / user.email deliberately untouched — set them per repo"
-	_result "git:     ok (${set_count} default(s) set)"
+	local who_count=0
+	_git_identity user.name "${GIT_AUTHOR_NAME:-}" "your name" &&
+		who_count=$((who_count + 1))
+	_git_identity user.email "${GIT_AUTHOR_EMAIL:-}" "your email" &&
+		who_count=$((who_count + 1))
+	_result "git:     ok (${set_count} default(s) set, ${who_count} identity value(s) set)"
+}
+
+# _git_identity KEY FROM_ENV LABEL — set a global identity value that is
+# absent, taking it from the environment or, failing that, from the person.
+#
+# A fresh machine with no identity is not neutral: tools that decide what a
+# machine is FOR from `git config --global user.email` see nothing and quietly
+# do nothing, and the first commit fails or goes out under a guessed
+# `user@host` address. So an unset value is filled rather than left for later,
+# in this order:
+#
+#   1. already set globally -> left alone, like every default above;
+#   2. GIT_AUTHOR_NAME / GIT_AUTHOR_EMAIL set -> used as-is (git's own names
+#      for these, so a CI job or provisioning script already exporting them
+#      needs nothing new);
+#   3. stdin is a terminal and --yes was not given -> asked; an empty answer
+#      skips, because a blank identity is worse than none;
+#   4. otherwise -> a warning naming the exact command, never a guess.
+#
+# Global, not per-repo: a per-repo identity still overrides it wherever one
+# is set, so this only fills the gap no repo covers.
+#
+# Returns 0 when it set a value, 1 otherwise, so the caller can count.
+_git_identity() {
+	local key="$1" value="$2" label="$3" current
+	current="$(git config --global --get "${key}" 2>/dev/null || true)"
+	if [[ -n ${current} ]]; then
+		_log "${key} already set to ${current} — left alone"
+		return 1
+	fi
+
+	if [[ -z ${value} ]]; then
+		if [[ ${ASSUME_YES} -eq 1 || ! -t 0 ]]; then
+			_warn "${key} is not set — run: git config --global ${key} \"${label}\""
+			return 1
+		fi
+		if [[ ${DRY_RUN} -eq 1 ]]; then
+			_info "would ask for ${label} (git ${key} is not set)"
+			return 1
+		fi
+		read -r -p "    git ${key} is not set — ${label} (empty to skip): " \
+			value || true
+		if [[ -z ${value} ]]; then
+			_warn "${key} left unset"
+			return 1
+		fi
+	fi
+
+	_info "git config --global ${key} ${value}"
+	_run git config --global "${key}" "${value}"
 }
 
 # tools — uv, then this repo's pre-commit hooks if that applies here.
@@ -570,6 +913,215 @@ step_tools() {
 	fi
 
 	_result "tools:   ok"
+}
+
+# ---------------------------------------------------------------------------
+# pwsh — native PowerShell 7, plus the PSScriptAnalyzer module the .ps1 lint
+# gate needs.
+#
+# Unix side only, for now: install-deps has a winget section (#60), but this
+# step does not route through it yet (#59), so on Windows it reports that it
+# skipped rather than pretending to have done something.
+#
+# A native interpreter is what removes the WSL path-translation problem
+# wholesale: with pwsh on PATH, Linux paths are passed through untouched
+# instead of being rewritten with `wslpath -w` for pwsh.exe.
+#
+# The version is PINNED so an upgrade is one you chose, not whatever was
+# released this morning. Bump it here.
+# ---------------------------------------------------------------------------
+_PS_VER="7.6.6"
+_PWSH_DIR="/opt/microsoft/powershell/7"
+_PWSH_LINK="/usr/bin/pwsh"
+
+# The interpreter this step looks for and then drives. Named through a
+# variable so a test can point it at an interpreter that is not there, or at
+# a stub that is: PATH cannot express either, since /bin is a symlink to
+# /usr/bin on Debian and a name removed from one is still found through the
+# other. Every runner that already ships pwsh — GitHub's macOS and Windows
+# images do — would otherwise take the "already installed" path and test
+# nothing.
+_PWSH_BIN="${JB_PWSH:-pwsh}"
+
+# Why the step could not install anything here, phrased for the summary. An
+# install helper returns 2 and sets this when the machine cannot have pwsh
+# (no upstream build, no downloader, no Homebrew), and 1 when it tried and
+# the install itself failed — the summary must not call the first a failure.
+_PWSH_SKIP=""
+
+# uname is read through these so a test can pin a platform. PATH cannot do
+# that job: hiding `pwsh` by editing PATH would hide it from the check AND
+# from the install, so the test would pass with the feature deleted.
+#
+# Read inside the step, never at file scope: every other step — and --help —
+# would otherwise die under `set -e` on a machine with no uname, which is
+# what a PATH-restricted run is. An absent uname leaves the platform
+# "unknown", and the step says so rather than guessing Linux.
+_UNAME_S=""
+_UNAME_M=""
+_pwsh_uname_init() {
+	_UNAME_S="${JB_UNAME_S:-$(uname -s 2>/dev/null || echo unknown)}"
+	_UNAME_M="${JB_UNAME_M:-$(uname -m 2>/dev/null || echo unknown)}"
+}
+
+# ---------------------------------------------------------------------------
+# _pwsh_arch — the PowerShell build name for this machine, DERIVED from
+# uname rather than typed. Several of these boxes are arm64, and a hardcoded
+# x64 tarball fails inside tar with a message that names neither the
+# architecture nor the download.
+# ---------------------------------------------------------------------------
+_pwsh_arch() {
+	case "${_UNAME_M}" in
+	x86_64) printf 'x64\n' ;;
+	aarch64 | arm64) printf 'arm64\n' ;;
+	armv7l) printf 'arm32\n' ;;
+	*) return 1 ;;
+	esac
+}
+
+# ---------------------------------------------------------------------------
+# _pwsh_sudo_init — the privilege prefix, derived the same way install-deps
+# derives its own: nothing when already root, sudo when it exists, and bare
+# otherwise so the failure comes from the command that actually needed root.
+#
+# An ARRAY, because IFS is newline+tab here: an empty string variable would
+# expand to one empty argument rather than to nothing.
+# ---------------------------------------------------------------------------
+_PWSH_SUDO=()
+_pwsh_sudo_init() {
+	if [[ $(id -u) -ne 0 ]] && _have sudo; then
+		_PWSH_SUDO=(sudo)
+	fi
+}
+
+# _pwsh_priv CMD... — _run with that prefix in front, so --dry-run prints
+# exactly the command a real run would execute, sudo included.
+_pwsh_priv() {
+	_run "${_PWSH_SUDO[@]+"${_PWSH_SUDO[@]}"}" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# _pwsh_install_linux — the pinned tarball into /opt, symlinked onto PATH.
+# ---------------------------------------------------------------------------
+_pwsh_install_linux() {
+	local arch url tarball
+	if ! arch="$(_pwsh_arch)"; then
+		_warn "no PowerShell build for ${_UNAME_M}"
+		_PWSH_SKIP="no build for ${_UNAME_M}"
+		return 2
+	fi
+	if ! _have curl; then
+		_warn "curl not installed — cannot download PowerShell"
+		_PWSH_SKIP="no curl"
+		return 2
+	fi
+	if ! _have tar; then
+		_warn "tar not installed — cannot unpack PowerShell"
+		_PWSH_SKIP="no tar"
+		return 2
+	fi
+
+	url="https://github.com/PowerShell/PowerShell/releases/download/v${_PS_VER}/powershell-${_PS_VER}-linux-${arch}.tar.gz"
+	tarball="${TMPDIR:-/tmp}/powershell-${_PS_VER}-linux-${arch}.tar.gz"
+
+	_info "installing PowerShell ${_PS_VER} (linux-${arch}) into ${_PWSH_DIR}"
+	_curl_retry_opts_init
+	if ! _run curl -sSL --fail "${_CURL_RETRY_OPTS[@]}" --connect-timeout 30 \
+		-o "${tarball}" "${url}"; then
+		_warn "could not download ${url}"
+		return 1
+	fi
+
+	_pwsh_sudo_init
+	# -f on the symlink, not a bare ln: re-running this step is how an
+	# upgrade lands, and a second ln over an existing link is an error
+	# rather than a no-op.
+	if _pwsh_priv mkdir -p "${_PWSH_DIR}" &&
+		_pwsh_priv tar zxf "${tarball}" -C "${_PWSH_DIR}" &&
+		_pwsh_priv chmod +x "${_PWSH_DIR}/pwsh" &&
+		_pwsh_priv ln -sf "${_PWSH_DIR}/pwsh" "${_PWSH_LINK}"; then
+		_run rm -f "${tarball}"
+		return 0
+	fi
+	_warn "unpacking PowerShell failed"
+	_run rm -f "${tarball}"
+	return 1
+}
+
+# ---------------------------------------------------------------------------
+# _pwsh_install_darwin — Homebrew, because the tarball above is a LINUX
+# build. Downloading it on a Mac would install something that cannot run,
+# and the first sign of it would be an exec format error from the lint gate.
+# ---------------------------------------------------------------------------
+_pwsh_install_darwin() {
+	if ! _have brew; then
+		_warn "Homebrew not installed — cannot install PowerShell here"
+		_PWSH_SKIP="no brew"
+		return 2
+	fi
+	_info "installing PowerShell via Homebrew"
+	_run brew install --cask powershell
+}
+
+# ---------------------------------------------------------------------------
+# _pwsh_analyzer — the module `make lint-psscriptanalyzer` requires. It fails
+# loudly when the module is absent, deliberately: an analyzer that never ran
+# has checked nothing.
+#
+# -Scope CurrentUser needs no elevation. The Get-Module probe is what keeps
+# this idempotent — Install-Module -Force reinstalls over the network every
+# time it is asked, however recent the copy on disk.
+# ---------------------------------------------------------------------------
+_pwsh_analyzer() {
+	if _have "${_PWSH_BIN}" && "${_PWSH_BIN}" -NoProfile -Command \
+		'if (Get-Module -ListAvailable -Name PSScriptAnalyzer) { exit 0 } else { exit 1 }' \
+		>/dev/null 2>&1; then
+		_info "PSScriptAnalyzer already installed"
+		return 0
+	fi
+	_info "installing PSScriptAnalyzer"
+	_run "${_PWSH_BIN}" -NoProfile -Command \
+		"Install-Module PSScriptAnalyzer -Scope CurrentUser -Force"
+}
+
+step_pwsh() {
+	_head "pwsh — PowerShell and PSScriptAnalyzer"
+	_pwsh_uname_init
+
+	local rc=0
+	if _have "${_PWSH_BIN}"; then
+		_info "pwsh already installed ($("${_PWSH_BIN}" --version 2>/dev/null || echo ok))"
+	else
+		case "${_UNAME_S}" in
+		Linux) _pwsh_install_linux || rc=$? ;;
+		Darwin) _pwsh_install_darwin || rc=$? ;;
+		*)
+			# Not wired to install-deps' winget section yet (#59), so
+			# there is nothing honest to do here but say so.
+			_warn "no PowerShell recipe for ${_UNAME_S} — provision it with that system's own package manager"
+			_PWSH_SKIP="${_UNAME_S}"
+			rc=2
+			;;
+		esac
+		case ${rc} in
+		0) ;;
+		2)
+			_result "pwsh:    skipped (${_PWSH_SKIP})"
+			return 0
+			;;
+		*)
+			_result "pwsh:    failed"
+			return 0
+			;;
+		esac
+	fi
+
+	if _pwsh_analyzer; then
+		_result "pwsh:    ok"
+	else
+		_warn "PSScriptAnalyzer was not installed"
+		_result "pwsh:    failed (PSScriptAnalyzer)"
+	fi
 }
 
 # claude — Anthropic's own installer; it puts the binary in ~/.local/bin,
@@ -631,7 +1183,13 @@ if [[ ${STEPS_EXPLICIT} -eq 0 ]]; then
 	if [[ -n ${_toml_steps} ]]; then
 		STEPS_STR="${_toml_steps}"
 	else
-		STEPS_STR="${_STEPS_ALL_STR// /,}"
+		STEPS_STR=""
+		for _s in "${_STEPS_ALL[@]}"; do
+			case " ${_STEPS_OPT_IN_STR} " in
+			*" ${_s} "*) continue ;;
+			esac
+			STEPS_STR="${STEPS_STR:+${STEPS_STR},}${_s}"
+		done
 	fi
 fi
 

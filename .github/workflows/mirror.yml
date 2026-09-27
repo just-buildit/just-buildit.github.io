@@ -7,8 +7,9 @@ on:
   repository_dispatch:
     types: [mirror]        # remote trigger from source repos
 
+# GITHUB_TOKEN only checks out; every write goes through the App token.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   mirror:
@@ -60,15 +61,44 @@ jobs:
           cp "${tmp}"/jb/src/just_bashit/just-runit jbs/
           rm -rf "${tmp}"
 
-      - name: Commit & push if changed
+      # main is ruleset-protected (CI passed + standard.mk, bypass: org
+      # admins only), so a direct push is refused (GH013). It was, every run
+      # from 2026-09-20 on, which left jbs/ serving just-bashit as of
+      # 2026-09-09. The refresh goes through a PR like any other change.
+      #
+      # Pushed with the org App's token, not GITHUB_TOKEN: a push made with
+      # GITHUB_TOKEN triggers no workflows, so the required checks would
+      # never run and the PR could never merge. One fixed branch, so repeat
+      # runs update the open PR instead of stacking new ones.
+      - name: Mint an App token
+        id: token
+        uses: actions/create-github-app-token@v3.2.0
+        with:
+          app-id: ${{ secrets.ADOPTER_APP_ID }}
+          private-key: ${{ secrets.ADOPTER_APP_PRIVATE_KEY }}
+
+      - name: Open or update the refresh PR
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          BRANCH: mirror/refresh
         run: |
           set -euo pipefail
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "nothing to commit"
+            exit 0
+          fi
           git config user.name  "just-buildit-bot"
           git config user.email "bot@just-buildit.invalid"
-          if [ -n "$(git status --porcelain)" ]; then
-            git add -A
-            git commit -m "mirror: refresh upstream scripts"
-            git push
-          else
-            echo "nothing to commit"
+          git switch -c "$BRANCH"
+          git add -A
+          git commit -m "mirror: refresh upstream scripts"
+          git push --force \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "HEAD:refs/heads/${BRANCH}"
+          pr=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -z "$pr" ]; then
+            gh pr create --head "$BRANCH" --base main \
+              --title "mirror: refresh upstream scripts" \
+              --body "Automated by mirror.yml: just-bashit's shipped scripts, copied to jbs/ and the root fetch fallbacks. Merges itself once the required checks pass."
           fi
+          gh pr merge "$BRANCH" --auto --squash

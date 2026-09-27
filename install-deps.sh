@@ -52,7 +52,13 @@ read -r -d '' HELP <<-'EOF' || true
 	    [pinned.apt]
 	    cmd = ["apt-get", "install", "-y", "libzmq3-dev=4.3.4-1"]
 
-	  Supported package managers: apt, pacman, brew, dnf, zypper, apk, msys2.
+	  Supported package managers: apt, pacman, brew, dnf, zypper, apk,
+	  msys2, winget.
+
+	  Windows has two sections. msys2 never runs anything — it prints the
+	  pacman line to paste into a UCRT64 shell. winget DOES install, one
+	  package per invocation, skipping any id `winget list` already finds.
+	  Package names there are winget ids, e.g. "Python.Python.3.13".
 
 	  Privilege escalation is DERIVED, not assumed: sudo is used only when
 	  the manager needs root, the caller is not already root, and sudo is
@@ -243,7 +249,12 @@ _resolve_prefix() {
 	local section="$1"
 	local sudo_bin=""
 
-	if [ "${section}" != "brew" ]; then
+	# brew and winget are both exempt. Homebrew refuses to run under sudo and
+	# manages its own prefix. winget is a Windows binary: there is no sudo to
+	# find on that side, and reached from WSL a sudo prefix would only run the
+	# interop call as Linux root, which changes nothing about the install and
+	# breaks the elevation prompt Windows raises for a machine-scope package.
+	if [ "${section}" != "brew" ] && [ "${section}" != "winget" ]; then
 		case "${SUDO_MODE}" in
 		no) ;;
 		yes)
@@ -268,9 +279,41 @@ _resolve_prefix() {
 	_PREFIX=()
 	[ -n "${sudo_bin}" ] && _PREFIX+=("${sudo_bin}")
 	if [ "${#_PROXY_ENV[@]}" -gt 0 ]; then
-		_PREFIX+=("env")
-		_PREFIX+=("${_PROXY_ENV[@]}")
+		# winget reads none of these: it fetches through WinHTTP and takes
+		# its proxy from the system configuration. Its own --proxy flag is
+		# refused until an administrator runs
+		# `winget settings --enable ProxyCommandLineOptions` — measured
+		# 2026-09-20 against winget v1.29.290, which exits 2 with exactly
+		# that sentence. Passing the flag by default would therefore break
+		# every install on a stock machine, so the proxy is reported rather
+		# than applied, and an `env NAME=VALUE` prefix winget would ignore
+		# is not added either.
+		if [ "${section}" = "winget" ]; then
+			echo "install-deps: warning: winget uses the SYSTEM proxy, not" >&2
+			echo "install-deps: http_proxy/https_proxy. To pass one on the" >&2
+			echo "install-deps: command line, an administrator must first run" >&2
+			echo "install-deps: winget settings --enable ProxyCommandLineOptions" >&2
+		else
+			_PREFIX+=("env")
+			_PREFIX+=("${_PROXY_ENV[@]}")
+		fi
 	fi
+}
+
+# ---------------------------------------------------------------------------
+# _winget_installed BIN ID — is this exact id installed already?
+#
+# A `list` probe rather than a reading of the install's own exit code. winget
+# returns HRESULTs and a shell sees only the low byte: `list` for an absent
+# package returns 0x8A150014 and arrives as 20 — a value another tool would
+# use for something else entirely, and nothing in the byte says which. That
+# much was measured on 2026-09-20 against winget v1.29.290, where a present
+# id exits 0 and an absent one exits 20. The 0/non-zero answer needs no
+# decoding, which is why the probe reads it and the install's code is left
+# alone.
+# ---------------------------------------------------------------------------
+_winget_installed() {
+	"$1" list --id "$2" --exact --disable-interactivity >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------------------
@@ -307,7 +350,28 @@ _do_install() {
 	_resolve_prefix "${section}"
 	case "${section}" in
 	apt)
-		_run apt-get update
+		# `apt-get update` exits non-zero if ANY configured source fails, and a
+		# CI runner carries sources the project neither chose nor controls:
+		# GitHub's Ubuntu image ships packages.microsoft.com, which 403s often
+		# enough to matter. Measured 2026-08-12 on doppler CI — the azure-cli
+		# and prod repos returned 403, `update` exited 100, and the leg died
+		# without ever attempting an install, while the Ubuntu archive holding
+		# every package it actually wanted was fine. Four sibling matrix legs
+		# on the same commit passed.
+		#
+		# So `update` warns and `install` is the gate. A package that genuinely
+		# cannot be resolved still fails below, loudly and by name; an outage in
+		# somebody else's repository no longer reads as a dependency failure.
+		#
+		# Wrapped around _run rather than a bare sudo apt-get, so the dry run and
+		# the privilege prefix keep coming from the one place that owns them. In
+		# a dry run _run prints and returns 0, so the warning cannot fire there.
+		if ! _run apt-get update; then
+			echo "install-deps: warning: apt-get update reported errors." >&2
+			echo "install-deps: continuing — a source this project does not" >&2
+			echo "install-deps: use cannot block the install, and the install" >&2
+			echo "install-deps: below is the real check." >&2
+		fi
 		_run apt-get install -y --no-install-recommends "$@"
 		;;
 	pacman)
@@ -324,6 +388,32 @@ _do_install() {
 		;;
 	apk)
 		_run apk add "$@"
+		;;
+	winget)
+		local _w _p
+		if ! _w="$(winget-bin)"; then
+			echo "error: winget not found (looked for winget, then" >&2
+			echo "       winget.exe). It ships with App Installer on Windows" >&2
+			echo "       10 1809 and later; from WSL it is reached as" >&2
+			echo "       winget.exe through interop." >&2
+			exit 1
+		fi
+		# One invocation per package: `winget install` takes a single query,
+		# unlike every other manager here, each of which takes a list. A
+		# second id on the line is read as an argument to the first and the
+		# install silently covers less than the manifest asked for.
+		for _p in "$@"; do
+			# Not probed during a dry run: -n has to print the same plan on
+			# a machine with no winget at all, which is where a manifest is
+			# usually checked.
+			if [ "${DRY_RUN}" -eq 0 ] && _winget_installed "${_w}" "${_p}"; then
+				echo "install-deps: ${_p} already installed" >&2
+				continue
+			fi
+			_run "${_w}" install --id "${_p}" --exact --source winget \
+				--silent --accept-package-agreements \
+				--accept-source-agreements --disable-interactivity
+		done
 		;;
 	msys2)
 		# msys2 is Windows — always print instructions, never run.

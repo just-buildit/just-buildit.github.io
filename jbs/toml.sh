@@ -11,6 +11,26 @@
 (return 0 2>/dev/null) || (echo "This file must be sourced." && exit)
 
 # ---------------------------------------------------------------------------
+# TOML_KNOWN_PMS — the package-manager section names this project knows.
+#
+# THE declaration. A manifest section is only recognised as a group when its
+# second component is one of these, so a name added to install-deps but not
+# to this list produces "no packages or cmd found" — a message about the
+# manifest, for a bug in the code. That is how the winget section first
+# failed.
+#
+# Other places restate it for a reader. Four of them are gated: an arm in
+# install-deps' _do_install, the "Supported package managers" block of its
+# --help, the "One of:" line in get-pkg-mgr's help, the manager table in
+# docs/install-deps.md and the sections in template.toml — `every known
+# package manager is installable and documented` in test/install-deps.bats
+# derives the set from HERE and fails on any that disagrees, and its sibling
+# fails on a _do_install arm this array omits. toml_discover_groups's own
+# help below is prose about this array and is not gated.
+# ---------------------------------------------------------------------------
+TOML_KNOWN_PMS=(apt pacman brew dnf zypper apk msys2 winget)
+
+# ---------------------------------------------------------------------------
 # toml_strings
 # ---------------------------------------------------------------------------
 toml_strings() {
@@ -289,7 +309,8 @@ toml_discover_groups() {
 
 		Arguments:
 		  PM ...  Optional list of package manager names to recognise.
-		          Defaults to: apt pacman brew dnf zypper apk msys2.
+		          Defaults to TOML_KNOWN_PMS: apt pacman brew dnf zypper
+		          apk msys2 winget.
 
 		Examples:
 		  cat deps.toml | toml_discover_groups
@@ -316,7 +337,7 @@ toml_discover_groups() {
 	if [[ $# -gt 0 ]]; then
 		known=("$@")
 	else
-		known=(apt pacman brew dnf zypper apk msys2)
+		known=("${TOML_KNOWN_PMS[@]}")
 	fi
 	local line inner group pm seen="" out="" k found
 	while IFS= read -r line; do

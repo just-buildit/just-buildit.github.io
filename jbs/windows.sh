@@ -54,3 +54,54 @@ win-exe() {
 	done
 	return 1
 }
+
+# win-admin-channel -- print the ssh destination (user@host) of this
+# machine's OWN Windows sshd when WSL can reach it as an elevated admin, or
+# return 1. With it, every elevated step after a box's first runs over ssh:
+# an admin logged in by key over Windows OpenSSH gets the full (High
+# Mandatory Level) token, with no UAC prompt -- nobody has to be at the
+# desktop (measured on yoga-x2p and zen-x2elite, 2026-09-28).
+#
+# The host is WSL's default gateway (NAT networking), overridable with
+# JB_WIN_HOST. It is trusted only after one round trip proves two things:
+# the far end's %COMPUTERNAME% is this machine's -- so a gateway that is some
+# other box is never mistaken for the host -- and the session is elevated.
+# The key is the one named after this host (~/.ssh/<hostname>) when present,
+# the ssh step's convention; otherwise ssh's defaults.
+#
+# Example:
+#   . windows.sh
+#   if dest="$(win-admin-channel)"; then ssh "${WIN_SSH_OPTS[@]}" "$dest" whoami; fi
+# Built here, at source time, not inside win-admin-channel: callers run that
+# in $(...), a subshell, so an option it added would never reach them.
+WIN_SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new)
+# The same name setup-system's ssh step gives the key. Derived once, with a
+# fallback, and required to be a FILE: a box with no hostname command (a
+# minimal Fedora image) made the path ~/.ssh/ -- a readable directory -- and
+# the second, failing $(hostname) then killed any `set -e` caller with 127.
+_win_key="$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)"
+if [[ -n ${_win_key} && -f "${HOME}/.ssh/${_win_key}" ]]; then
+	WIN_SSH_OPTS+=(-i "${HOME}/.ssh/${_win_key}")
+fi
+unset _win_key
+win-admin-channel() {
+	local cmd host user name out
+	cmd="$(win-exe cmd.exe)" || return 1
+	host="${JB_WIN_HOST:-$(ip route show default 2>/dev/null | awk '{ print $3; exit }')}"
+	[[ -n ${host} ]] || return 1
+	user="$( (
+		cd /mnt/c 2>/dev/null || true
+		"${cmd}" /c 'echo %USERNAME%' 2>/dev/null
+	) | tr -d '\r\n')"
+	name="$( (
+		cd /mnt/c 2>/dev/null || true
+		"${cmd}" /c 'echo %COMPUTERNAME%' 2>/dev/null
+	) | tr -d '\r\n')"
+	[[ -n ${user} && -n ${name} ]] || return 1
+	# S-1-16-12288 is the High Mandatory Level SID: an elevated token.
+	out="$(ssh "${WIN_SSH_OPTS[@]}" "${user}@${host}" \
+		'$env:COMPUTERNAME; [bool](whoami /groups | Select-String "S-1-16-12288")' \
+		2>/dev/null | tr -d '\r')" || return 1
+	[[ ${out} == "${name}"$'\n'True ]] || return 1
+	printf '%s\n' "${user}@${host}"
+}

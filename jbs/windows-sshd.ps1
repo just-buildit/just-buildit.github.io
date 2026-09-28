@@ -27,9 +27,12 @@
       3. sshd_config gets PasswordAuthentication no and
          PubkeyAuthentication yes. The edit is validated with `sshd -t`
          and rolled back if sshd rejects it.
-      4. The login shell is pwsh.exe (PowerShell 7), installed from the
-         pinned -PwshVersion release MSI when it is missing.
-      5. The firewall rule for port 22 is limited to -RemoteAddress.
+      4. The login shell is pwsh.exe (PowerShell 7), installed at the pinned
+         -PwshVersion when it is missing: with winget, else the release MSI
+         (winget is refused inside a RunAs-elevated first run).
+      5. The firewall rule for port 22 is limited to -RemoteAddress, and a
+         second rule admits this machine's own WSL (its virtual interface),
+         so later runs can come over an admin ssh session with no prompt.
       6. The sshd service is set to start automatically, and restarted so
          the new configuration is live.
 
@@ -229,6 +232,32 @@ function Edit-SshdOption {
     , $out.ToArray()
 }
 
+function Install-WithWinget {
+    <#
+    .SYNOPSIS
+        Install a package machine-wide with winget, pinned to -Version.
+        Returns $true when winget ran and reported success, $false when
+        winget is absent or failed -- the caller then has a fallback, and
+        says which path it took.
+    #>
+    param([string]$Id, [string]$Version)
+    $winget = Get-Command winget -ErrorAction SilentlyContinue
+    if (-not $winget) {
+        Write-Information "  note  no winget in this session; using the fallback for $Id"
+        return $false
+    }
+    Write-Information "  install $Id $Version with winget"
+    & $winget.Source install --id $Id --version $Version --exact --scope machine `
+        --silent --accept-package-agreements --accept-source-agreements `
+        --disable-interactivity | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Information ("  note  winget exit $LASTEXITCODE for $Id " +
+            '(a RunAs-elevated first run is refused); using the fallback')
+        return $false
+    }
+    return $true
+}
+
 # The test suite dot-sources this file for the functions above and must not
 # fall through into the part that changes the machine.
 if ($MyInvocation.InvocationName -eq '.') { return }
@@ -276,7 +305,14 @@ Write-Information "  keys  $($keys.Count) from $source"
 
 # -- 2. the server itself ---------------------------------------------------
 $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' | Select-Object -First 1
-if ($cap.State -ne 'Installed') {
+# InstallPending is installed: sshd runs, and Windows finishes the servicing
+# at the next reboot. Treated as missing, every re-run -- routine now that
+# re-runs come over ssh -- repeated the slow Add-WindowsCapability for
+# nothing (measured on zen-ai445, 2026-09-28).
+if ($cap.State -eq 'InstallPending') {
+    Write-Information "  ok    $($cap.Name) installed (Windows finishes it at the next reboot)"
+}
+elseif ($cap.State -ne 'Installed') {
     Write-Information "  install $($cap.Name) (this can take a few minutes)"
     Add-WindowsCapability -Online -Name $cap.Name | Out-Null
 }
@@ -361,13 +397,18 @@ else {
 # service, with the machine PATH of the moment, and a stale PATH is no
 # reason to log people into something else.
 $pwsh = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
+if (-not (Test-Path -LiteralPath $pwsh) -and $PwshVersion) {
+    # winget first: it is how everything else on these boxes is installed
+    # (install-deps' winget section), and over an admin ssh session -- how
+    # setup-system runs this once sshd exists -- it installs machine-wide
+    # with no prompt (measured on yoga-x2p, 2026-09-28).
+    Install-WithWinget -Id 'Microsoft.PowerShell' -Version $PwshVersion
+}
 if (-not (Test-Path -LiteralPath $pwsh)) {
-    # The release MSI from GitHub, not winget: winget run inside a process
-    # elevated with Start-Process -Verb RunAs fails with 0x80070005 (access
-    # denied) -- measured on an arm64 box, where that is exactly how
-    # setup-system runs this script. The MSI needs nothing but elevation,
-    # which this process has, and it is the same pinned-release-asset
-    # approach setup-system's pwsh step takes on Linux.
+    # The release MSI, for the one context winget fails in: a process elevated
+    # with Start-Process -Verb RunAs, which is how the FIRST run on a box gets
+    # elevated (0x80070005, access denied -- measured on an arm64 box). The
+    # MSI needs nothing but elevation, which this process has.
     if (-not $PwshVersion) {
         throw "pwsh.exe is not installed and no -PwshVersion was given to install"
     }
@@ -413,6 +454,27 @@ if (-not (Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue)) {
 }
 Set-NetFirewallRule -Name $ruleName -Enabled True -Profile Any -RemoteAddress $RemoteAddress
 Write-Information "  ok    firewall: port 22 from $($RemoteAddress -join ', ')"
+
+# And from this machine's own WSL, whatever -RemoteAddress says. setup-system
+# runs this script -- and a box's later provisioning -- over an admin ssh
+# session from WSL, which needs no UAC prompt; the rule above, limited to a
+# tailnet, drops WSL's traffic (it comes from the WSL virtual switch). Scoped
+# by interface, not address: WSL's subnet is new on every boot. Present only
+# once WSL has started on a box that has it.
+$wslRule = 'jb-sshd-wsl'
+$wslIf = @(Get-NetAdapter -IncludeHidden -Name 'vEthernet (WSL*' -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.Name })
+if ($wslIf.Count -gt 0) {
+    if (Get-NetFirewallRule -Name $wslRule -ErrorAction SilentlyContinue) {
+        Set-NetFirewallRule -Name $wslRule -Enabled True -Profile Any -InterfaceAlias $wslIf
+    }
+    else {
+        New-NetFirewallRule -Name $wslRule -DisplayName 'OpenSSH Server (sshd) from WSL' `
+            -Direction Inbound -Protocol TCP -LocalPort 22 -Action Allow `
+            -Profile Any -InterfaceAlias $wslIf | Out-Null
+    }
+    Write-Information "  ok    firewall: port 22 from this machine's WSL ($($wslIf -join ', '))"
+}
 
 # -- 7. the service ------------------------------------------------------------
 Set-Service -Name sshd -StartupType Automatic

@@ -79,7 +79,7 @@ jobs:
         id: token
         uses: actions/create-github-app-token@v3.2.0
         with:
-          app-id: ${{ secrets.ADOPTER_APP_ID }}
+          client-id: ${{ secrets.ADOPTER_APP_CLIENT_ID }}
           private-key: ${{ secrets.ADOPTER_APP_PRIVATE_KEY }}
 
       - name: Open or update the refresh PR

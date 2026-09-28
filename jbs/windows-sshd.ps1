@@ -402,7 +402,9 @@ if (-not (Test-Path -LiteralPath $pwsh) -and $PwshVersion) {
     # (install-deps' winget section), and over an admin ssh session -- how
     # setup-system runs this once sshd exists -- it installs machine-wide
     # with no prompt (measured on yoga-x2p, 2026-09-28).
-    Install-WithWinget -Id 'Microsoft.PowerShell' -Version $PwshVersion
+    # Captured: an uncaptured return value is printed, and the first real
+    # run (swiftgo-ultra7) showed a bare `False` line in the log.
+    $null = Install-WithWinget -Id 'Microsoft.PowerShell' -Version $PwshVersion
 }
 if (-not (Test-Path -LiteralPath $pwsh)) {
     # The release MSI, for the one context winget fails in: a process elevated

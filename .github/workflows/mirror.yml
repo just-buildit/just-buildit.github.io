@@ -61,8 +61,11 @@ jobs:
           git clone --depth 1 \
             https://github.com/just-buildit/just-bashit "${tmp}/jb"
           mkdir -p jbs
-          rm -f jbs/*.sh jbs/just-runit
+          rm -f jbs/*.sh jbs/*.ps1 jbs/just-runit
           cp "${tmp}"/jb/src/just_bashit/*.sh jbs/
+          # The .ps1 too: setup-system fetches windows-sshd.ps1 from here
+          # when jbx runs it, and a *.sh-only mirror 404'd it (#60).
+          cp "${tmp}"/jb/src/just_bashit/*.ps1 jbs/
           cp "${tmp}"/jb/src/just_bashit/just-runit jbs/
           rm -rf "${tmp}"
 

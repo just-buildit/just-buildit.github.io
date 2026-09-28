@@ -11,12 +11,6 @@ set -euo pipefail
 IFS=$'\n\t'
 
 _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=/dev/null
-source "${_SCRIPT_DIR}/toml.sh"
-# shellcheck source=/dev/null
-source "${_SCRIPT_DIR}/file.sh"
-# shellcheck source=/dev/null
-source "${_SCRIPT_DIR}/windows.sh"
 
 # Pages CDN mirror of src/just_bashit/ — used only when a sibling asset is
 # missing, i.e. when this script was fetched standalone by jbx.
@@ -258,6 +252,19 @@ _asset() {
 	fi
 	printf '%s\n' "${dest}"
 }
+
+# The libraries this script sources, loaded through _asset: the sibling copy
+# when there is one (a checkout, or jbx's co-fetch), else fetched from the
+# mirror beside this script. A jbx install carries its own list of libraries
+# to co-fetch and nothing updates it, so one older than a library -- windows.sh
+# against a 0.4.1 jbx, measured on zen-ai445 -- would otherwise die here on a
+# missing file (#75).
+for _lib in toml.sh file.sh windows.sh; do
+	_lib_path="$(_asset "${_lib}")" || exit 1
+	# shellcheck source=/dev/null
+	source "${_lib_path}"
+done
+unset _lib _lib_path
 
 # ---------------------------------------------------------------------------
 # _install_file SRC DEST — copy when the content differs, keeping a .bak of

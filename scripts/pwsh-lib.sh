@@ -41,6 +41,36 @@ pwsh_find() {
 		PWSH_TRANSLATE=1
 		return 0
 	fi
+	# A WSL shell reached over ssh (Tailscale SSH, VS Code Remote-SSH) has no
+	# Windows directories on PATH, so pwsh.exe resolves nowhere above even
+	# though interop runs it by full path. win-exe (just-bashit's windows.sh,
+	# the one owner of that lookup) finds it under the C: mount.
+	local w p
+	if command -v wslpath >/dev/null 2>&1 && w="$(_pwsh_windows_sh)"; then
+		# shellcheck source=/dev/null
+		. "$w"
+		if p="$(win-exe pwsh.exe)"; then
+			PWSH="$p"
+			PWSH_TRANSLATE=1
+			return 0
+		fi
+	fi
+	return 1
+}
+
+# Where windows.sh sits beside this file, in the two layouts that vendor
+# it: jbs/windows.sh (this site's mirror path, which a consumer vendors to
+# the same path) and src/just_bashit/windows.sh (just-bashit, its owner).
+# Printed, or return 1 -- and pwsh_find then fails as it always did.
+_pwsh_windows_sh() {
+	local here c
+	here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+	for c in "$here/../jbs/windows.sh" "$here/../src/just_bashit/windows.sh"; do
+		if [ -r "$c" ]; then
+			printf '%s\n' "$c"
+			return 0
+		fi
+	done
 	return 1
 }
 

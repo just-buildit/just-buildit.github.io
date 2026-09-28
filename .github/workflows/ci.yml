@@ -594,6 +594,29 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
           shellcheck --severity=warning scripts/*.sh
 
+      - name: pwsh_find reaches pwsh.exe when PATH does not (just-buildit.github.io#61)
+        # A WSL shell reached over ssh has no Windows directories on PATH;
+        # pwsh_find must fall back to win-exe (jbs/windows.sh) rather than
+        # report no PowerShell on a machine that has one.
+        run: |
+          set -euo pipefail
+          t="$(mktemp -d)"
+          # A fake C: drive holding a stand-in pwsh.exe, and a mount table naming it.
+          mkdir -p "$t/c/Program Files/PowerShell/7" "$t/bin"
+          printf '#!/bin/sh\n' >"$t/c/Program Files/PowerShell/7/pwsh.exe"
+          chmod +x "$t/c/Program Files/PowerShell/7/pwsh.exe"
+          printf 'C:\\134 %s 9p rw,aname=drvfs;path=C:\\ 0 0\n' "$t/c" >"$t/mounts"
+          # A PATH with no pwsh on it (ubuntu runners ship one), only what the lookup
+          # itself runs, plus a wslpath stand-in to mark this as WSL.
+          for c in awk dirname cat; do ln -s "$(command -v "$c")" "$t/bin/$c"; done
+          printf '#!/bin/sh\necho "$2"\n' >"$t/bin/wslpath"; chmod +x "$t/bin/wslpath"
+          got="$(env -i PATH="$t/bin" JB_PROC_MOUNTS="$t/mounts" "$BASH" -c \
+            '. scripts/pwsh-lib.sh; pwsh_find || exit 9; echo "$PWSH|$PWSH_TRANSLATE"')" || got="(pwsh_find found nothing)"
+          want="$t/c/Program Files/PowerShell/7/pwsh.exe|1"
+          rm -rf "$t"
+          [ "$got" = "$want" ] || { echo "::error::pwsh_find gave '$got', want '$want'"; exit 1; }
+          echo "  ok  pwsh_find falls back to win-exe under the C: mount"
+
       - name: A failure it can attribute is never reported as a flake
         # just-makeit#1327. `release-watch` printed "likely a flake" for every
         # pre-publish failure, including the verify-ci one it had diagnosed

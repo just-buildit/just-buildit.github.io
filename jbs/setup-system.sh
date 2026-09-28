@@ -735,9 +735,19 @@ step_sshd() {
 		ps_args="${ps_args} -RemoteAddress ${sq}${SSHD_ALLOW//,/${sq},${sq}}${sq}"
 	fi
 
+	# An elevated ssh session to this machine's own sshd, when one exists
+	# (every run after a box's first): no UAC prompt, so nobody has to be at
+	# the desktop, and the output streams back live (windows.sh says why).
+	local chan=""
+	chan="$(win-admin-channel)" || chan=""
+
 	if [[ ${DRY_RUN} -eq 1 ]]; then
 		_info "would copy windows-sshd.ps1 to ${wdir}"
-		_info "would raise a UAC prompt and run, elevated:"
+		if [[ -n ${chan} ]]; then
+			_info "would run it over the admin ssh channel (${chan}), no UAC prompt:"
+		else
+			_info "would raise a UAC prompt and run, elevated:"
+		fi
 		_info "  windows-sshd.ps1 ${ps_args}"
 		_result "sshd:    ok (dry run)"
 		return 0
@@ -746,6 +756,27 @@ step_sshd() {
 	mkdir -p "${dir}"
 	cp "${ps1}" "${dir}/windows-sshd.ps1"
 	rm -f "${dir}/log.txt"
+
+	if [[ -n ${chan} ]]; then
+		_info "running over the admin ssh channel (${chan}) -- no UAC prompt"
+		# The script is named by the far end's own $env:TEMP -- the same
+		# user, so the same directory -- rather than a Windows path spliced
+		# into the command. The session survives the sshd restart the script
+		# ends with (measured on yoga-x2p).
+		local rc=0
+		# WIN_SSH_OPTS comes from windows.sh; ps_args expands HERE on purpose
+		# (it was checked above to hold no quote).
+		# shellcheck disable=SC2154,SC2029
+		ssh "${WIN_SSH_OPTS[@]}" "${chan}" \
+			"& (Join-Path \$env:TEMP 'jb-windows-sshd\\windows-sshd.ps1') ${ps_args}" |
+			tr -d '\r' || rc=$?
+		if [[ ${rc} -eq 0 ]]; then
+			_result "sshd:    ok (keys from github.com/${user}.keys, over ssh)"
+		else
+			_result "sshd:    failed (see above)"
+		fi
+		return 0
+	fi
 	# The elevated window is hidden, so its whole output goes to log.txt.
 	cat >"${dir}/run.ps1" <<-EOF
 		\$log = Join-Path \$PSScriptRoot 'log.txt'

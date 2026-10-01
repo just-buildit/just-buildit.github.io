@@ -362,7 +362,11 @@ jobs:
           red "GATES_WORKFLOW_DIR pointed at a dir with no home" nightly-check \
             GATES_WORKFLOW_DIR="$tmp/nowhere"
           # A matrix arm is a home, read by the same scan as GATES_CI_FILE --
-          # and a commented one is not.
+          # and a commented one is not. The run line is written by printf
+          # with `\x24` for the dollar: Actions expands every literal
+          # dollar-brace-brace in this script before bash sees it, which
+          # turned the arm into a bare `make` (and this step red) on the
+          # first CI run.
           cat > "$tmp/.github/workflows/nightly.yml" <<'EOF'
           jobs:
             y:
@@ -371,8 +375,11 @@ jobs:
                   chk:
                     - { target: nightly-check }
               steps:
-                - run: make ${{ matrix.chk.target }}
           EOF
+          printf '      - run: make \x24{{ matrix.chk.target }}\n' \
+            >> "$tmp/.github/workflows/nightly.yml"
+          grep -q 'make [$]{{ matrix.chk.target }}' "$tmp/.github/workflows/nightly.yml" \
+            || { cat "$tmp/.github/workflows/nightly.yml"; echo "::error::fixture lost its matrix arm"; exit 1; }
           make -C "$tmp" gates-home-check \
             || { echo "::error::gates-home-check missed a matrix-arm home"; exit 1; }
           echo "ok   green: a matrix arm in another workflow"

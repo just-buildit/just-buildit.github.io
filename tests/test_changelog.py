@@ -301,5 +301,122 @@ class Sections(Base):
         self.ok(self.sections())
 
 
+#: A fragment as an author wraps it: a code span split over the line break.
+SPLIT = "- **Thing.** Run `jm\n    upgrade` and then\n    carry on.\n"
+#: The same fragment after the formatter: exactly what mdformat 1.0.0 wrote
+#: for SPLIT (just-makeit gh-1630) -- the indent joined into the span.
+JOINED = "- **Thing.** Run `jm   upgrade` and then\n    carry on.\n"
+RUN = "a code span holds a run of whitespace"
+
+
+def _module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_changelog", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class CodeSpans(Base):
+    """A spaced code span ships verbatim; the formatter is what makes one."""
+
+    def test_split_span_in_a_fragment_fails(self) -> None:
+        self.r.write("changelog.d/fixed/x.md", SPLIT)
+        self.r.commit()
+        self.bad(self.check(), RUN, "changelog.d/fixed/x.md line 1", "jm\\n")
+
+    def test_formatter_joined_span_in_a_fragment_fails(self) -> None:
+        self.r.write("changelog.d/fixed/x.md", JOINED)
+        self.r.commit()
+        self.bad(self.check(), RUN, "`jm   upgrade`")
+
+    def test_single_spaced_span_passes(self) -> None:
+        self.r.write("src/a.py", "x = 2\n")
+        self.r.write(
+            "changelog.d/fixed/x.md", JOINED.replace("jm   upgrade", "jm upgrade")
+        )
+        self.r.commit()
+        self.ok(self.check())
+
+    def test_deliberate_spacing_in_a_fenced_block_passes(self) -> None:
+        # The remedy the refusal names must itself pass.
+        self.r.write("src/a.py", "x = 2\n")
+        self.r.write(
+            "changelog.d/fixed/x.md",
+            "- **x.** It prints:\n\n    ```\n    `a   b`    aligned\n    ```\n",
+        )
+        self.r.commit()
+        self.ok(self.check())
+
+    def test_assemble_refuses_a_spaced_span(self) -> None:
+        self.r.write("changelog.d/fixed/x.md", JOINED)
+        self.bad(self.r.run("assemble"), "refusing", RUN)
+        self.assertNotIn("jm   upgrade", self.r.read("CHANGELOG.md"))
+
+    def test_rewording_unreleased_into_a_spaced_span_fails(self) -> None:
+        # Rewording is allowed without a fragment, so it is the other way in.
+        base = BASE_CHANGELOG.replace(
+            "## [Unreleased]\n", "## [Unreleased]\n\n- **Run `jm upgrade`.**\n"
+        )
+        self.r.git("checkout", "-q", "main")
+        self.r.write("CHANGELOG.md", base)
+        self.r.commit()
+        self.r.git("checkout", "-q", "-B", "feature")
+        self.r.write("CHANGELOG.md", base.replace("jm upgrade", "jm   upgrade"))
+        self.r.commit()
+        self.bad(self.check(), RUN, "[Unreleased]")
+
+    def test_a_run_already_in_unreleased_at_the_base_passes(self) -> None:
+        # Ratcheted: an adopter re-vendoring does not go red on what it had.
+        base = BASE_CHANGELOG.replace(
+            "## [Unreleased]\n", "## [Unreleased]\n\n- **Run `jm   upgrade`.**\n"
+        )
+        self.r.git("checkout", "-q", "main")
+        self.r.write("CHANGELOG.md", base)
+        self.r.commit()
+        self.r.git("checkout", "-q", "-B", "feature")
+        self.r.write("README.md", "docs\n")
+        self.r.commit()
+        self.ok(self.check())
+
+    def test_a_run_in_a_released_section_is_not_checked(self) -> None:
+        # Released sections are history; changelog-sections-check forbids
+        # the edit that would fix one.
+        self.r.git("checkout", "-q", "main")
+        self.r.write(
+            "CHANGELOG.md",
+            BASE_CHANGELOG.replace("It shipped.", "Ran `jm   upgrade`."),
+        )
+        self.r.commit()
+        self.r.git("checkout", "-q", "-B", "feature")
+        self.r.write("README.md", "docs\n")
+        self.r.commit()
+        self.ok(self.check())
+
+
+class SpanPairing(unittest.TestCase):
+    """CommonMark pairing, so a run BETWEEN spans is not read as inside one."""
+
+    def runs(self, text: str):
+        return _module().span_runs(text)
+
+    def test_a_run_between_spans_is_not_in_one(self) -> None:
+        self.assertEqual(self.runs("`a`  and  `b`"), [])
+
+    def test_a_span_closes_only_on_a_run_of_its_own_length(self) -> None:
+        spans = [c for _, c in _module().code_spans("``x ` y`` z")]
+        self.assertEqual(spans, ["x ` y"])
+
+    def test_an_escaped_tick_opens_nothing(self) -> None:
+        self.assertEqual(self.runs("\\`a  b `c`"), [])
+
+    def test_one_space_of_padding_is_legal(self) -> None:
+        self.assertEqual(self.runs("` padded `"), [])
+
+    def test_line_is_where_the_span_opens(self) -> None:
+        self.assertEqual(self.runs("x\n`a\n    b`"), [(2, "a\n    b")])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -66,8 +66,10 @@ entry verbatim, starting with `- `.
 - Set `CHANGELOG_CODE_PATHS` (the paths whose change needs an entry), then
     `make standard-update` fetches `scripts/changelog.py`.
 - `make lint` runs `changelog-check` (code changed → a fragment added; a
-    hand-written `[Unreleased]` entry is refused) and
-    `changelog-sections-check` (a released section is never edited).
+    hand-written `[Unreleased]` entry is refused; so is a code span holding
+    a run of whitespace, which mdformat makes from a span wrapped across a
+    line break) and `changelog-sections-check` (a released section is never
+    edited).
 - `make release-branch VERSION=x.y.z` promotes the fragments into the new
     section itself, and `tag-release` refuses while any is left.
 - CI must pass the PR's base as `CHANGELOG_BASE`, with `fetch-depth: 0`.

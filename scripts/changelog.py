@@ -131,6 +131,116 @@ def count_entries(body: str) -> int:
     return sum(1 for line in body.splitlines() if line.startswith("- "))
 
 
+# ── code spans ───────────────────────────────────────────────────────────────
+#
+# A code span renders its content VERBATIM, so `jm   upgrade` reaches the
+# release notes as exactly that. The formatter makes them: a fragment is a list
+# item with a 4-space continuation indent, and a span hand-wrapped across its
+# line break is joined by mdformat (markdown-it) with the newline turned into a
+# space and the indent beyond the item's own KEPT -- `jm` / `    upgrade`
+# becomes `jm   upgrade` (measured on mdformat 1.0.0). No later pass touches
+# it, and `assemble` promotes it verbatim. just-makeit had 65 in released
+# sections when this was found (just-makeit gh-1630).
+#
+# So the check looks for the RUN, not the split: by the time lint runs, a
+# pre-commit format has already turned one into the other, and a split span
+# with its indent is a run too. It is a refusal, not a repair, because a run
+# is occasionally meant (a quoted `"    Parameters"`); the remedy for that is a
+# fenced block, where whitespace is content and this does not look.
+
+_FENCE = re.compile(r"^ *(`{3,}|~{3,})")
+_WS_RUN = re.compile(r"\s{2,}")
+
+
+def _blank_fences(text: str) -> str:
+    """*text* with every fenced block's lines emptied, line count kept.
+
+    >>> _blank_fences("a\\n```\\n`x  y`\\n```\\nb\\n")
+    'a\\n\\n\\n\\nb\\n'
+    """
+    out: List[str] = []
+    fence = ""
+    for line in text.splitlines(keepends=True):
+        m = _FENCE.match(line)
+        if fence:
+            if (
+                m
+                and m.group(1)[0] == fence[0]
+                and len(m.group(1)) >= len(fence)
+            ):
+                fence = ""
+            out.append("\n")
+        elif m:
+            fence = m.group(1)
+            out.append("\n")
+        else:
+            out.append(line)
+    return "".join(out)
+
+
+def code_spans(text: str) -> List[Tuple[int, str]]:
+    """(offset, content) of each code span in *text*, paired as CommonMark.
+
+    A run of N backticks opens a span that only the next run of exactly N
+    closes; a run with no partner is literal text. A backslash escapes one
+    backtick outside a span (an opener) and nothing inside one (a closer).
+    Fenced blocks hold no spans.
+
+    >>> [c for _, c in code_spans("a `jm\\n    upgrade` b")]
+    ['jm\\n    upgrade']
+    >>> [c for _, c in code_spans("``x ` y`` and `z`")]
+    ['x ` y', 'z']
+    >>> [c for _, c in code_spans(r"a \\`b `c\\` d")]
+    ['c\\\\']
+    >>> code_spans("```\\n`x  y`\\n```\\n")
+    []
+    """
+    text = _blank_fences(text)
+    runs = [(m.start(), len(m.group(0))) for m in re.finditer(r"`+", text)]
+    out: List[Tuple[int, str]] = []
+    i = 0
+    while i < len(runs):
+        start, n = runs[i]
+        if start > 0 and text[start - 1] == "\\":
+            start, n = start + 1, n - 1
+            if n == 0:
+                i += 1
+                continue
+        for j in range(i + 1, len(runs)):
+            if runs[j][1] == n:
+                out.append((start, text[start + n : runs[j][0]]))
+                i = j + 1
+                break
+        else:
+            i += 1
+    return out
+
+
+def span_runs(text: str) -> List[Tuple[int, str]]:
+    """(line, content) of each code span in *text* holding a whitespace run.
+
+    >>> span_runs("- a `jm   upgrade`\\n    b `ok` `c\\n    d`\\n")
+    [(1, 'jm   upgrade'), (2, 'c\\n    d')]
+    >>> span_runs("`a`  and  `b`, ` padded `")
+    []
+    """
+    return [
+        (text.count("\n", 0, off) + 1, content)
+        for off, content in code_spans(text)
+        if _WS_RUN.search(content)
+    ]
+
+
+def _span_error(where: str, content: str) -> str:
+    shown = content.replace("\n", "\\n")
+    return (
+        f"{where}: a code span holds a run of whitespace (`{shown}`), which "
+        "renders verbatim. Usually a span wrapped across a line break that "
+        "the formatter then joined with the indent inside it: put it on one "
+        "line with single spaces. If the spacing is meant, use a fenced block"
+    )
+
+
 # ── fragments ────────────────────────────────────────────────────────────────
 
 
@@ -144,7 +254,8 @@ def fragment_errors(
     known section directory, be a Markdown file, start with ``- ``, and
     carry no ``### `` line -- the directory is its heading, and a heading in
     the body captures every fragment promoted after it (doppler 0.43.0
-    published five ``changed/`` entries under **Removed** that way).
+    published five ``changed/`` entries under **Removed** that way). Nor may
+    a code span in it hold a run of whitespace (see ``span_runs``).
     """
     base = root / frag_dir
     if not base.is_dir():
@@ -177,6 +288,8 @@ def fragment_errors(
                     "directory IS the heading; delete the line, or move the "
                     "file to the section it belongs under"
                 )
+        for n, content in span_runs(entry):
+            errs.append(_span_error(f"{rel} line {n}", content))
     return errs
 
 
@@ -394,6 +507,17 @@ def check(
                 f"{frag}<section>/<slug>.md instead and revert the hunk -- "
                 "`make changelog-assemble` writes that file at release time"
             )
+        # A reworded [Unreleased] entry is allowed, so it can gain a spaced
+        # span without a fragment. Ratcheted against the base: one that is
+        # already there is not this branch's to fix.
+        base_spans = [
+            c for _, c in span_runs(unreleased_body(show(base, changelog)))
+        ]
+        for _, c in span_runs(unreleased_body(show("HEAD", changelog))):
+            if c in base_spans:
+                base_spans.remove(c)
+            else:
+                problems.append(_span_error(f"{changelog} [Unreleased]", c))
         code = [p for _, p in changed if _under(p, code_paths)]
         if code and not added and not consumed:
             problems.append(

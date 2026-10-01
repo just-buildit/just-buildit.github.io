@@ -301,6 +301,85 @@ jobs:
             || { cat "$tmp/log"; echo "::error::gates-check did not name orphan"; exit 1; }
           echo "OK — gates-check passes when complete, fails naming the gap."
 
+      - name: gates-home-check holds GATES_CI_EXTRA to a real workflow line
+        # GATES_CI_EXTRA names targets run by a workflow other than
+        # GATES_CI_FILE, and used to be taken on trust: naming a target there
+        # gave it an execution home by declaration, so a deleted, renamed or
+        # commented-out workflow line left the gate "covered" and guarding
+        # nothing (just-makeit#1768, found in doppler). Each row below is one
+        # way that home goes missing; every one must go red, naming the
+        # target, while the unchanged tree stays green.
+        run: |
+          tmp="$(mktemp -d)"; cp standard.mk "$tmp/"
+          mkdir -p "$tmp/.github/workflows"
+          cat > "$tmp/Makefile" <<'EOF'
+          TEST_CMD = @echo test
+          TEST_FAST_CMD = @echo test-fast
+          CLEAN_PATHS = dist/
+          GATES_DEPS = lint nightly-check
+          GATES_CI_EXTRA = nightly-check
+          include standard.mk
+          EOF
+          printf 'jobs:\n  x:\n    steps:\n      - run: make lint\n' \
+            > "$tmp/.github/workflows/ci.yml"
+          # The `name:` mentions the target too: it must not count as a home.
+          cat > "$tmp/nightly.yml" <<'EOF'
+          on: {schedule: [{cron: '0 6 * * *'}]}
+          jobs:
+            y:
+              steps:
+                - name: make nightly-check
+                  run: make nightly-check
+          EOF
+          home() { cp "$tmp/nightly.yml" "$tmp/.github/workflows/nightly.yml"; }
+          red() {  # red <row> <name> [make args...]: must fail, naming <name>
+            row="$1"; name="$2"; shift 2
+            if make -C "$tmp" gates-home-check "$@" > "$tmp/log" 2>&1; then
+              cat "$tmp/log"
+              echo "::error::gates-home-check passed: $row"; exit 1
+            fi
+            grep -q "'make $name'" "$tmp/log" \
+              || { cat "$tmp/log"; echo "::error::$row: did not name $name"; exit 1; }
+            echo "ok   red: $row"
+          }
+          home
+          make -C "$tmp" gates-home-check \
+            || { echo "::error::gates-home-check failed on a real home"; exit 1; }
+          echo "ok   green: workflows unchanged"
+          sed -i '/run: make nightly-check/d' "$tmp/.github/workflows/nightly.yml"
+          red "the workflow's make line deleted" nightly-check
+          home
+          sed -i 's/run: make nightly-check/# run: make nightly-check/' \
+            "$tmp/.github/workflows/nightly.yml"
+          red "the workflow's make line commented out" nightly-check
+          home
+          rm "$tmp/.github/workflows/nightly.yml"
+          red "the workflow deleted" nightly-check
+          home
+          red "GATES_CI_EXTRA emptied" nightly-check GATES_CI_EXTRA=
+          red "a ghost extra no workflow runs" ghost-gate \
+            "GATES_DEPS=lint ghost-gate" GATES_CI_EXTRA=ghost-gate
+          red "GATES_WORKFLOW_DIR pointed at a dir with no home" nightly-check \
+            GATES_WORKFLOW_DIR="$tmp/nowhere"
+          # A matrix arm is a home, read by the same scan as GATES_CI_FILE --
+          # and a commented one is not.
+          cat > "$tmp/.github/workflows/nightly.yml" <<'EOF'
+          jobs:
+            y:
+              strategy:
+                matrix:
+                  chk:
+                    - { target: nightly-check }
+              steps:
+                - run: make ${{ matrix.chk.target }}
+          EOF
+          make -C "$tmp" gates-home-check \
+            || { echo "::error::gates-home-check missed a matrix-arm home"; exit 1; }
+          echo "ok   green: a matrix arm in another workflow"
+          sed -i 's/- run: make/# - run: make/' "$tmp/.github/workflows/nightly.yml"
+          red "the matrix arm's make line commented out" nightly-check
+          echo "OK — a GATES_CI_EXTRA name counts only with a real workflow line."
+
       - name: One red gate does not hide the gates behind it
         # `gates` re-invokes its list with -k instead of declaring it as
         # prerequisites, because make stops at the first failing prerequisite

@@ -366,13 +366,23 @@ _do_install() {
 		# Wrapped around _run rather than a bare sudo apt-get, so the dry run and
 		# the privilege prefix keep coming from the one place that owns them. In
 		# a dry run _run prints and returns 0, so the warning cannot fire there.
-		if ! _run apt-get update; then
+		# Retries cover a request that ERRORS; a connection that stalls
+		# mid-transfer never does, so without a per-request timeout one
+		# stalled mirror held every caller until its CI job's ceiling (29
+		# minutes, just-makeit#1792). The timeouts turn a stall into an error
+		# the retries then cover (#89).
+		local -a apt_opts=(
+			-o Acquire::Retries=3
+			-o Acquire::http::Timeout=30
+			-o Acquire::https::Timeout=30
+		)
+		if ! _run apt-get "${apt_opts[@]}" update; then
 			echo "install-deps: warning: apt-get update reported errors." >&2
 			echo "install-deps: continuing — a source this project does not" >&2
 			echo "install-deps: use cannot block the install, and the install" >&2
 			echo "install-deps: below is the real check." >&2
 		fi
-		_run apt-get install -y --no-install-recommends "$@"
+		_run apt-get "${apt_opts[@]}" install -y --no-install-recommends "$@"
 		;;
 	pacman)
 		_run pacman -Sy --needed --noconfirm "$@"

@@ -244,7 +244,7 @@ test-fast: ## Run tests, stopping at the first failure
 # `lint` is the gate — CI runs exactly this and nothing else. The three
 # consistency gates come first because they are near-free and catch the class
 # of rot that review demonstrably does not.
-lint: standard-check help-check ghost-check hook-dispatch-check hook-stage-check tracked-paths-check workflow-timeout-check gates-check gates-home-check ## Run the full lint gate (CI runs this)
+lint: standard-check help-check ghost-check hook-dispatch-check hook-stage-check tracked-paths-check workflow-timeout-check workflow-dispatch-check gates-check gates-home-check ## Run the full lint gate (CI runs this)
 	@hook=$$(git rev-parse --git-path hooks/pre-commit 2>/dev/null); \
 	 if [ -n "$$hook" ] && [ ! -f "$$hook" ]; then \
 	     $(PRE_COMMIT) install >/dev/null 2>&1 \
@@ -1242,7 +1242,8 @@ tracked-paths-check: ## Tracked paths are typeable, and none differ only in case
 	 echo "tracked-paths-check: $$(git ls-files | grep -c .) tracked path(s), every name typeable, none differ only in case"
 
 STD_TARGETS += standard-check standard-update help-check ghost-check hook-dispatch-check
-STD_TARGETS += hook-stage-check tracked-paths-check workflow-timeout-check
+STD_TARGETS += hook-stage-check tracked-paths-check workflow-timeout-check \
+               workflow-dispatch-check
 
 # A temp file, portably: bare `mktemp` is a GNU extension, and the BSD one
 # macOS ships requires a template. The gates parse make's own database, which
@@ -1355,7 +1356,7 @@ _STD_SECTION = case "$$t" in \
     changelog-check|changelog-sections-check|changelog-assemble \
         |changelog-assembled-check) tsec="Changelog";; \
     test-examples) tsec="Examples";; \
-    standard-check|standard-update|help-check|ghost-check|hook-dispatch-check|hook-stage-check|tracked-paths-check|workflow-timeout-check) \
+    standard-check|standard-update|help-check|ghost-check|hook-dispatch-check|hook-stage-check|tracked-paths-check|workflow-timeout-check|workflow-dispatch-check) \
         tsec="Gates";; \
     *) tsec="Local";; \
 esac
@@ -1761,6 +1762,76 @@ workflow-timeout-check: ## Verify every workflow job declares timeout-minutes
 	     exit 1; \
 	 fi; \
 	 echo "workflow-timeout-check: $$total job(s), each with timeout-minutes"
+
+# ── workflow-dispatch-check ─────────────────────────────────────────────────
+#
+# A workflow that runs on its own can also be started by hand (moved here
+# from just-makeit#1799 by just-makeit#1801: an org-wide rule). A run that
+# fails before any job starts -- a startup_failure -- CANNOT be re-run ("This
+# workflow run cannot be retried"). On 2026-10-02 an Actions policy change
+# made every push to jm's main fail that way, and docs.yml, on push and
+# pull_request alone, had no other way to start: Pages stayed two merges
+# stale. `workflow_dispatch` is the way back in.
+#
+# "Runs on its own" = push, pull_request, schedule or workflow_run. A purely
+# reusable workflow (workflow_call alone) never does, and is exempt. All
+# three `on:` spellings parse: a scalar, a flow list, and a block map; and a
+# walk that finds workflows but parses no trigger is refused, because a gate
+# that matched nothing is indistinguishable from one that passed.
+workflow-dispatch-check: ## Verify every self-triggered workflow can be dispatched
+	@dir=.github/workflows; \
+	 set -- $$dir/*.yml $$dir/*.yaml; \
+	 files=""; for f in "$$@"; do [ -f "$$f" ] && files="$$files $$f"; done; \
+	 if [ -z "$$files" ]; then \
+	     echo "workflow-dispatch-check: no workflows — nothing to check"; \
+	     exit 0; \
+	 fi; \
+	 out=$$(awk ' \
+	   function lead(s) { match(s, /^ */); return RLENGTH } \
+	   function add(list,   n, i, a) { \
+	     gsub(/[][,]/, " ", list); n = split(list, a, /[[:space:]]+/); \
+	     for (i = 1; i <= n; i++) if (a[i] != "") { trig[a[i]] = 1; got = 1 } \
+	   } \
+	   function verdict() { \
+	     if (file == "") return; \
+	     if (got) parsed++; \
+	     own = ("push" in trig) || ("pull_request" in trig) || \
+	           ("schedule" in trig) || ("workflow_run" in trig); \
+	     if (own && !("workflow_dispatch" in trig)) print file; \
+	     delete trig; got = 0 \
+	   } \
+	   FNR == 1 { verdict(); file = FILENAME; inon = 0; oi = -1 } \
+	   /^[[:space:]]*(#|$$)/ { next } \
+	   /^("on"|\047on\047|on|true):/ { \
+	     v = $$0; sub(/^[^:]*:[[:space:]]*/, "", v); sub(/[[:space:]]*#.*/, "", v); \
+	     if (v != "") { add(v); inon = 0 } else { inon = 1; oi = -1 } \
+	     next \
+	   } \
+	   inon && /^[^[:space:]]/ { inon = 0; next } \
+	   inon { \
+	     n = lead($$0); if (oi < 0) oi = n; if (n != oi) next; \
+	     v = $$0; sub(/^ *(- *)?/, "", v); sub(/[:[:space:]#].*/, "", v); add(v) \
+	   } \
+	   END { verdict(); print "PARSED " parsed + 0 } \
+	 ' $$files); \
+	 parsed=$$(printf '%s\n' "$$out" | sed -n 's/^PARSED //p'); \
+	 missing=$$(printf '%s\n' "$$out" | grep -v '^PARSED ' || true); \
+	 if [ "$$parsed" -eq 0 ]; then \
+	     echo "ERROR: workflows exist but no \`on:\` trigger was parsed."; \
+	     echo "  A gate that matched nothing is indistinguishable from one that"; \
+	     echo "  passed. Fix the parse, or delete this gate deliberately."; \
+	     exit 1; \
+	 fi; \
+	 if [ -n "$$missing" ]; then \
+	     echo "ERROR: workflows that run on their own but cannot be dispatched:"; \
+	     printf '%s\n' "$$missing" | sed 's/^/  /'; \
+	     echo ""; \
+	     echo "  A run that fails at startup cannot be re-run, so without"; \
+	     echo "  \`workflow_dispatch:\` there is no way to redo it short of"; \
+	     echo "  another push. Add it to each workflow's \`on:\`."; \
+	     exit 1; \
+	 fi; \
+	 echo "workflow-dispatch-check: $$parsed workflow(s); each that runs on its own can be dispatched"
 
 # ── hook-stage-check ────────────────────────────────────────────────────────
 #

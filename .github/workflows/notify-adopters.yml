@@ -206,13 +206,16 @@ jobs:
               done
             }
 
-            if ( cd work && git diff --quiet ); then
+            # --porcelain, not `git diff --quiet`: a NEWLY vendored file is
+            # untracked, and diff never sees it, so a repo owing only that
+            # file read as "already current".
+            if [ -z "$(cd work && git status --porcelain)" ]; then
               echo "already current"; clean=$((clean+1))
               [ "$DRY_RUN" = "true" ] || close_stale ""
               echo "::endgroup::"; continue
             fi
 
-            ( cd work && git diff --stat )
+            ( cd work && git status --short )
             if [ "$DRY_RUN" = "true" ]; then
               echo "(dry run — no PR)"; echo "::endgroup::"; continue
             fi
@@ -239,7 +242,12 @@ jobs:
                    "difference." \
                    "" \
                    "Canonical commit: $SHA")
-                 git commit -qam "$msg"
+                 # add -A, then commit: `commit -a` stages TRACKED files only,
+                 # so every newly vendored script was fetched and then left
+                 # out (fa8477f's PRs carried standard.mk alone, and each
+                 # adopter's standard-check named the missing file).
+                 git add -A
+                 git commit -qm "$msg"
                  git push -q -u origin "$branch"
                  base=$(gh repo view "$slug" \
                         --json defaultBranchRef -q .defaultBranchRef.name)

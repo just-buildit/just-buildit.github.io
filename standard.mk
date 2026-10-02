@@ -313,6 +313,12 @@ STD_TARGETS += test-all gates gates-check gates-home-check
 
 test-all: $(TEST_ALL_DEPS) ## Run every test suite in the repo
 
+# WHAT IT IS FOR: debugging a CI failure, and nothing else. CI runs these
+# gates in parallel on every PR; running them first, serially, on one machine
+# only repeats that work before CI repeats it again. When CI goes red, read
+# the job log; reach for this when the log does not explain the red. It is
+# never a pre-push step.
+#
 # Re-invoked with `-k` rather than declared as prerequisites, so ONE red gate
 # does not hide every gate ordered behind it. As a prerequisite list, make stops
 # at the first failure and the rest never run -- which reads as an ordinary
@@ -330,7 +336,7 @@ test-all: $(TEST_ALL_DEPS) ## Run every test suite in the repo
 # specific flag cannot, because the running make fixed its keep-going mode at
 # startup. Under `-j` the gates still schedule in parallel, which a shell loop
 # over the list would have serialised.
-gates: ## Run every gate that guards a merge
+gates: ## Reproduce CI's gate set locally -- to debug a CI red, never pre-CI
 	@$(MAKE) --no-print-directory -k $(GATES_DEPS)
 	@echo ""
 	@echo "gates: ALL PASS"

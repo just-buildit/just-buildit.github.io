@@ -58,6 +58,7 @@ jobs:
           HAS_RELEASE = 1
           HAS_CHANGELOG = 1
           HAS_EXAMPLES = 1
+          HAS_PR_WATCH = 1
           TEST_CMD = @echo test
           TEST_FAST_CMD = @echo test-fast
           CLEAN_PATHS = dist/

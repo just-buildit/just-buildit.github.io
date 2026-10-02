@@ -200,6 +200,18 @@ class TestTheWorkflow(unittest.TestCase):
     def test_it_repins_only_when_something_moved(self):
         self.assertIn("steps.pin.outputs.changed == '1'", self.text)
 
+    def test_an_unlanded_branch_repin_keeps_the_run_red(self):
+        """Branch landing has no PR to be the signal, and a green run
+        notifies nobody (doppler#1737): every default-branch run must fail
+        while ci/repin-image's pin differs from the default branch's."""
+        i = self.text.index("An unlanded repin keeps this run red")
+        step = self.text[i:]
+        self.assertIn("needs.resolve.outputs.landing == 'branch'", step)
+        self.assertIn("-- .github/ci-images.env", step)
+        self.assertIn("exit 1", step)
+        # It is the LAST step: nothing after it can be skipped by its red.
+        self.assertNotIn("\n      - name:", step[1:])
+
     def test_both_arches_build_natively(self):
         self.assertIn("ubuntu-24.04-arm", self.text)
         self.assertNotIn("setup-qemu", self.text)

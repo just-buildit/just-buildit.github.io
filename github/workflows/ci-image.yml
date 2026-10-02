@@ -251,3 +251,36 @@ jobs:
             fi
           fi
           gh workflow run "$CI_WORKFLOW" --ref "$branch"
+
+      # LAST, and the reason a branch-landing run can end red with nothing
+      # broken. With no PR, a pushed repin is visible only on a branch list,
+      # and a green run notifies nobody: in doppler-dsp an unlanded repin sat
+      # for an hour while it blocked work (doppler#1737). So on the default
+      # branch, EVERY run -- not just the one that pushed -- fails while
+      # ci/repin-image's pin differs from the default branch's, until a
+      # human lands it. PR landing needs none of this: the open PR is the
+      # signal, and only it waits.
+      - name: An unlanded repin keeps this run red
+        if: >-
+          needs.resolve.outputs.landing == 'branch' &&
+          github.ref_name == github.event.repository.default_branch
+        env:
+          DEFAULT: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git fetch -q origin "$DEFAULT"
+          if ! git fetch -q origin ci/repin-image 2>/dev/null; then
+            echo "no ci/repin-image: nothing owed"; exit 0
+          fi
+          if git diff --quiet "origin/$DEFAULT" origin/ci/repin-image \
+               -- .github/ci-images.env; then
+            echo "ci/repin-image matches $DEFAULT: nothing owed"; exit 0
+          fi
+          {
+            echo "## A CI image repin is waiting to land"
+            echo
+            echo 'gh pr create --head ci/repin-image --fill'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::ci/repin-image carries a pin $DEFAULT does not;" \
+               "land it: gh pr create --head ci/repin-image --fill"
+          exit 1

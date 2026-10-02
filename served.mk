@@ -804,7 +804,7 @@ endif
 # two in one go. `release` is NOT part of this — it is the C build type.
 ifeq ($(HAS_RELEASE),1)
 STD_TARGETS += bump-version version-check release-branch tag-release \
-               release-watch ship ci-changes ci-tree-tested ci-docs
+               release-watch ship ci-changes ci-tree-tested
 
 BUMP_VERSION_CMD  ?=
 RELEASE_WATCH_CMD ?=
@@ -994,31 +994,6 @@ VENDORED_FILES += scripts/ci-tree-tested.sh
 
 ci-tree-tested: ## BEFORE=<sha> tested=true when HEAD's tree already passed CI as a merged PR
 	@CI_CHECK_NAME='$(CI_CHECK_NAME)' bash scripts/ci-tree-tested.sh '$(BEFORE)'
-
-# The third lighter lane: a diff that touches only the docs. `make ci-docs`
-# prints docs= (did any changed path match CI_DOCS_RE) and code= (did
-# anything else change). A `changes` job gates every job docs cannot break
-# on `code`, and its aggregator lets them skip only on an explicit
-# code=false. A deletion outside CI_DOCS_DIRS is never docs-only: a docs
-# file can be READ by something that is not docs (pyproject's `readme`),
-# and editing it cannot break that reader where removing it can. Any doubt
-# -- an unreadable BASE, an empty diff -- answers code=true.
-#
-# CI_DOCS_RE minus CI_DOCS_EXCLUDE_RE is the repo's ONE declaration of what
-# its docs are: include-minus-exclude, the C_INCLUDE_RE / C_EXCLUDE_RE shape,
-# so no pattern needs a lookahead. A repo whose docs/ holds GENERATED copies
-# of something that is not docs (just-makeit's docs/examples/, built from
-# example .steps) excludes them, or a change to their source could read as
-# docs-only.
-CI_DOCS_RE         ?= ^(docs/|mkdocs[^/]*\.yml$$|CHANGELOG\.md$$|changelog\.d/|README\.md$$)
-CI_DOCS_EXCLUDE_RE ?=
-CI_DOCS_DIRS       ?= docs/ changelog.d/
-VENDORED_FILES += scripts/ci-docs.py
-
-ci-docs: ## [BASE=<rev>] docs=/code= for a diff -- code=false when only docs changed
-	@python3 scripts/ci-docs.py --base '$(or $(BASE),HEAD^)' \
-	    --re '$(CI_DOCS_RE)' --exclude '$(CI_DOCS_EXCLUDE_RE)' \
-	    --dirs '$(CI_DOCS_DIRS)'
 
 # The explicit origin/main start point matters: a bare `checkout -b` forks from
 # whatever HEAD the invoker happens to be on (a feature branch, a stale main),
@@ -1377,7 +1352,7 @@ _STD_SECTION = case "$$t" in \
     bench|bench-save|bench-compare) tsec="Bench";; \
     coverage|coverage-gate) tsec="Coverage";; \
     bump-version|version-check|release-branch|tag-release|release-watch \
-        |ship|ci-changes|ci-tree-tested|ci-docs) tsec="Release";; \
+        |ship|ci-changes|ci-tree-tested) tsec="Release";; \
     changelog-check|changelog-sections-check|changelog-assemble \
         |changelog-assembled-check) tsec="Changelog";; \
     test-examples) tsec="Examples";; \
@@ -1421,13 +1396,6 @@ standard-update: ## Re-fetch every vendored file from canonical
 	    echo "  in this repo, so there is nothing to update."; \
 	    exit 0; \
 	fi; \
-	: "The list below is the one THIS make parsed, from the OLD standard.mk."; \
-	: "A canonical that adds a vendored file is fetched here, but the new"; \
-	: "entry it lists is not, and standard-check then failed: two passes"; \
-	: "needed, and the adopter bot runs one (just-buildit.github.io#76). So"; \
-	: "a pass that replaced standard.mk re-runs in a FRESH make, which"; \
-	: "re-parses it. That run finds standard.mk unchanged, so it cannot loop."; \
-	std_changed=0; \
 	for f in $(STANDARD_FILE) $(VENDORED_FILES); do \
 	    $(_std_vendor_src); \
 	    tmp=$$(mktemp); \
@@ -1441,13 +1409,8 @@ standard-update: ## Re-fetch every vendored file from canonical
 	    else mkdir -p "$$(dirname "$$f")"; \
 	         if [ -x "$$f" ]; then mv "$$tmp" "$$f"; chmod +x "$$f"; \
 	         else mv "$$tmp" "$$f"; chmod 644 "$$f"; fi; \
-	         echo "  updated $$f"; \
-	         if [ "$$f" = "$(STANDARD_FILE)" ]; then std_changed=1; fi; fi; \
+	         echo "  updated $$f"; fi; \
 	done; \
-	if [ "$$std_changed" = 1 ]; then \
-	    echo "standard-update: $(STANDARD_FILE) changed — re-running with it"; \
-	    exec $(MAKE) --no-print-directory standard-update; \
-	fi; \
 	$(MAKE) --no-print-directory standard-check
 
 standard-check: ## Verify every vendored file matches canonical

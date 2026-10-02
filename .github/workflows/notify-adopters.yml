@@ -171,8 +171,31 @@ jobs:
               failed=$((failed+1)); echo "::endgroup::"; continue
             fi
 
+            # Close this bot's OLDER re-vendor PRs in $slug: each canonical
+            # merge opens one, and none was ever closed, so a repo that could
+            # not merge them for a while held fifteen. $1 is the PR that
+            # supersedes them, or empty when the repo is already current.
+            # Best effort: a failed close is a warning, never the fan-out's
+            # failure.
+            close_stale() {
+              gh pr list --repo "$slug" --state open \
+                --search "chore: re-vendor from canonical in:title" \
+                --json number,headRefName \
+                --jq ".[] | select(.headRefName | startswith(\"chore/re-vendor-\"))
+                          | select(.headRefName != \"$branch\") | .number" |
+              while read -r old; do
+                why="Superseded by #$1: a newer canonical commit."
+                [ -n "$1" ] || why="Superseded: $slug already matches canonical $SHA."
+                gh pr close "$old" --repo "$slug" --delete-branch \
+                  --comment "$why" >/dev/null \
+                  && echo "closed stale #$old" \
+                  || echo "::warning::could not close stale #$old in $slug"
+              done
+            }
+
             if ( cd work && git diff --quiet ); then
               echo "already current"; clean=$((clean+1))
+              [ "$DRY_RUN" = "true" ] || close_stale ""
               echo "::endgroup::"; continue
             fi
 
@@ -209,8 +232,9 @@ jobs:
                         --json defaultBranchRef -q .defaultBranchRef.name)
                  gh pr create --repo "$slug" --head "$branch" --base "$base" \
                    --title "chore: re-vendor from canonical $(echo "$SHA" | cut -c1-7)" \
-                   --body "$msg" >/dev/null ); then
-              echo "PR opened"; opened=$((opened+1))
+                   --body "$msg" > ../pr-url ); then
+              echo "PR opened: $(cat pr-url)"; opened=$((opened+1))
+              close_stale "$(basename "$(cat pr-url)")"
             else
               echo "::warning::could not open a PR in $slug"
               failed=$((failed+1))

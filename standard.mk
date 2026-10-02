@@ -798,7 +798,7 @@ endif
 # two in one go. `release` is NOT part of this — it is the C build type.
 ifeq ($(HAS_RELEASE),1)
 STD_TARGETS += bump-version version-check release-branch tag-release \
-               release-watch ship ci-changes
+               release-watch ship ci-changes ci-tree-tested
 
 BUMP_VERSION_CMD  ?=
 RELEASE_WATCH_CMD ?=
@@ -971,6 +971,23 @@ ci-changes: ## [BASE=<rev>] src=false when HEAD is only a version bump over BASE
 	     n=$$((n + 1)); \
 	 done; \
 	 say false "a version bump alone ($$old -> $$new, $$n manifest(s)); the matrix can skip"
+
+# The other change CI has already tested: a push whose tree is a merged PR's
+# head, when that head already contained the tip the push replaced and passed
+# $(CI_CHECK_NAME) as a PR. The PR's own run tested exactly this tree, so the
+# push run would test it twice. A `changes` job runs this on `push` before
+# ci-changes and, on tested=true, answers src=false -- the one skip path
+# `CI passed` already knows. A branch rebased onto the tip before it merges
+# therefore lands at no CI cost; a stale one gets the full run, which is the
+# composition test it owes. All the logic, and why each condition is needed,
+# is in the vendored script; it fails safe (tested=false) on any doubt.
+#
+# Prints `tested=true|false` and appends it to $GITHUB_OUTPUT when set. BEFORE
+# is the push event's `before`; the workflow step needs GH_TOKEN for `gh api`.
+VENDORED_FILES += scripts/ci-tree-tested.sh
+
+ci-tree-tested: ## BEFORE=<sha> tested=true when HEAD's tree already passed CI as a merged PR
+	@CI_CHECK_NAME='$(CI_CHECK_NAME)' bash scripts/ci-tree-tested.sh '$(BEFORE)'
 
 # The explicit origin/main start point matters: a bare `checkout -b` forks from
 # whatever HEAD the invoker happens to be on (a feature branch, a stale main),
@@ -1328,7 +1345,7 @@ _STD_SECTION = case "$$t" in \
     bench|bench-save|bench-compare) tsec="Bench";; \
     coverage|coverage-gate) tsec="Coverage";; \
     bump-version|version-check|release-branch|tag-release|release-watch \
-        |ship|ci-changes) tsec="Release";; \
+        |ship|ci-changes|ci-tree-tested) tsec="Release";; \
     changelog-check|changelog-sections-check|changelog-assemble \
         |changelog-assembled-check) tsec="Changelog";; \
     test-examples) tsec="Examples";; \

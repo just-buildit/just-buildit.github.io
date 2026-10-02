@@ -63,6 +63,8 @@ class CiDocs(unittest.TestCase):
                 kw.get("re", _default("CI_DOCS_RE")),
                 "--dirs",
                 kw.get("dirs", _default("CI_DOCS_DIRS")),
+                "--exclude",
+                kw.get("exclude", ""),
             ],
             cwd=self.repo,
             capture_output=True,
@@ -116,8 +118,14 @@ class CiDocs(unittest.TestCase):
     def test_a_repo_can_exclude_generated_docs(self) -> None:
         """just-makeit's docs/examples/ is built from example sources."""
         self.write("docs/examples/x.md")
-        rx = r"^(?!docs/examples/)(docs/|README\.md$)"
-        self.assertEqual(self.classify(re=rx)["code"], "true")
+        got = self.classify(exclude=r"^docs/examples/")
+        self.assertEqual(got, {"docs": "false", "code": "true"})
+
+    def test_an_excluded_path_beside_a_real_page_is_still_code(self) -> None:
+        self.write("docs/a.md")
+        self.write("docs/examples/x.md")
+        got = self.classify(exclude=r"^docs/examples/")
+        self.assertEqual(got, {"docs": "true", "code": "true"})
 
     # Fail-safe.
     def test_an_empty_diff_runs_everything(self) -> None:

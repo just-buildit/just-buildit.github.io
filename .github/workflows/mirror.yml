@@ -14,6 +14,7 @@ permissions:
 jobs:
   mirror:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       # No saved credentials: checkout would store GITHUB_TOKEN as an auth
       # header, which overrides the App token on the push below (measured:

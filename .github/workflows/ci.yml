@@ -23,6 +23,7 @@ jobs:
   standard-mk:
     name: standard.mk
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -110,6 +111,61 @@ jobs:
           grep -q "ghosty" "$tmp/log" \
             || { cat "$tmp/log"; echo "::error::ghost-check did not name it"; exit 1; }
           echo "OK — gates pass clean and fail when sabotaged."
+
+      - name: workflow-timeout-check refuses a job with no ceiling
+        # just-makeit#1801 modification 6: a job with no timeout-minutes is
+        # not cancelled for GitHub's six-hour default, and an aggregator
+        # waits that long to go red (jm#1792, nco_tone). Both indent styles,
+        # the two things that must NOT count as a ceiling or a job, the
+        # sabotage, and the walk that parses nothing.
+        run: |
+          tmp="$(mktemp -d)"; cp standard.mk "$tmp/"
+          printf 'TEST_CMD = @echo t\nTEST_FAST_CMD = @echo t\nCLEAN_PATHS = d/\ninclude standard.mk\n' > "$tmp/Makefile"
+          mkdir -p "$tmp/.github/workflows"; w="$tmp/.github/workflows"
+
+          # No workflows at all is inert.
+          make -C "$tmp" workflow-timeout-check
+
+          # 4-space file: a ceiling on each job, a reusable call exempt.
+          cat > "$w/a.yml" <<'EOF'
+          on: push
+          jobs:
+              build:
+                  runs-on: ubuntu-latest
+                  timeout-minutes: 10
+                  steps:
+                      - run: true
+              call:
+                  uses: ./.github/workflows/b.yml
+          EOF
+          make -C "$tmp" workflow-timeout-check | tee "$tmp/log"
+          grep -q "2 job(s)" "$tmp/log" || { echo "::error::wrong job count"; exit 1; }
+
+          # SABOTAGE: a 2-space job whose only timeout is on a STEP.
+          cat > "$w/b.yml" <<'EOF'
+          on: workflow_call
+          jobs:
+            lone:
+              runs-on: ubuntu-latest
+              steps:
+                - run: true
+                  timeout-minutes: 5
+          EOF
+          if make -C "$tmp" workflow-timeout-check > "$tmp/log" 2>&1; then
+            cat "$tmp/log"; echo "::error::a step timeout passed as a job ceiling"; exit 1
+          fi
+          grep -q "b.yml: lone" "$tmp/log" \
+            || { cat "$tmp/log"; echo "::error::it did not name file and job"; exit 1; }
+
+          # SABOTAGE: workflows exist but nothing parses as a job.
+          rm "$w"/*.yml; printf 'on: push\njobs: {}\n' > "$w/c.yml"
+          if make -C "$tmp" workflow-timeout-check > "$tmp/log" 2>&1; then
+            cat "$tmp/log"; echo "::error::an empty walk passed"; exit 1
+          fi
+          echo "OK — workflow-timeout-check counts jobs, refuses step-only and empty walks."
+          # And this repo is held to it too: the rule is org-wide.
+          make -f standard.mk workflow-timeout-check \
+              TEST_CMD=x TEST_FAST_CMD=x CLEAN_PATHS=x
 
       - name: hook-stage-check catches a hook that runs nowhere
         # The gate exists because a hook can be configured, dispatch to a real
@@ -722,6 +778,7 @@ jobs:
   scripts:
     name: scripts
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -807,6 +864,7 @@ jobs:
   changelog:
     name: changelog.py (py${{ matrix.python }})
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -831,6 +889,7 @@ jobs:
   msvc-env:
     name: msvc-env.sh (windows-latest)
     runs-on: windows-latest
+    timeout-minutes: 15
     defaults:
       run:
         shell: bash
@@ -868,6 +927,7 @@ jobs:
       - changelog
       - msvc-env
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     # `always()` so this still runs when a dependency failed — otherwise it
     # would be skipped, the required check would never report, and a red PR
     # would look identical to an unmergeable one.

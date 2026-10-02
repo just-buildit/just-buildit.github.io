@@ -167,6 +167,41 @@ jobs:
           make -f standard.mk workflow-timeout-check \
               TEST_CMD=x TEST_FAST_CMD=x CLEAN_PATHS=x
 
+      - name: workflow-dispatch-check refuses a self-triggered workflow with no way back in
+        # Moved here from just-makeit#1799 (just-makeit#1801): a run that
+        # fails at startup cannot be re-run, so a workflow that runs on its
+        # own must also be dispatchable. Every `on:` spelling, the reusable
+        # exemption, the sabotage, and the walk that parses nothing.
+        run: |
+          tmp="$(mktemp -d)"; cp standard.mk "$tmp/"
+          printf 'TEST_CMD = @echo t\nTEST_FAST_CMD = @echo t\nCLEAN_PATHS = d/\ninclude standard.mk\n' > "$tmp/Makefile"
+          mkdir -p "$tmp/.github/workflows"; w="$tmp/.github/workflows"
+          make -C "$tmp" workflow-dispatch-check            # no workflows: inert
+
+          printf 'on: [push, workflow_dispatch]\njobs: {}\n' > "$w/flow.yml"
+          printf 'on:\n  pull_request:\n  workflow_dispatch:\n    inputs: {}\njobs: {}\n' > "$w/map.yml"
+          printf 'on:\n  - schedule\n  - workflow_dispatch\njobs: {}\n' > "$w/list.yml"
+          printf 'on: workflow_call\njobs: {}\n' > "$w/reusable.yml"
+          make -C "$tmp" workflow-dispatch-check | tee "$tmp/log"
+          grep -q "4 workflow(s)" "$tmp/log" || { echo "::error::wrong count"; exit 1; }
+
+          # SABOTAGE: a workflow on push alone.
+          printf 'on:\n  push:\n    branches: [main]\njobs: {}\n' > "$w/stuck.yml"
+          if make -C "$tmp" workflow-dispatch-check > "$tmp/log" 2>&1; then
+            cat "$tmp/log"; echo "::error::a push-only workflow passed"; exit 1
+          fi
+          grep -q "stuck.yml" "$tmp/log" || { cat "$tmp/log"; echo "::error::not named"; exit 1; }
+
+          # SABOTAGE: workflows that parse no trigger at all.
+          rm "$w"/*.yml; printf 'name: x\njobs: {}\n' > "$w/none.yml"
+          if make -C "$tmp" workflow-dispatch-check > "$tmp/log" 2>&1; then
+            cat "$tmp/log"; echo "::error::an empty walk passed"; exit 1
+          fi
+
+          # And this repo is held to it too.
+          make -f standard.mk workflow-dispatch-check TEST_CMD=x TEST_FAST_CMD=x CLEAN_PATHS=x
+          echo "OK — workflow-dispatch-check: three spellings, reusable exempt, push-only and empty refused."
+
       - name: hook-stage-check catches a hook that runs nowhere
         # The gate exists because a hook can be configured, dispatch to a real
         # target, pass hook-dispatch-check, and still execute on no machine and

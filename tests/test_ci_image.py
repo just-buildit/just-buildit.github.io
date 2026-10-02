@@ -136,6 +136,47 @@ class TestTheSourceHash(_Tree):
         self.assertIn("without a repin", r.stdout)
 
 
+    # A bootstrap.toml as an adopter writes one: the release version in
+    # [project], which no image layer reads, then the groups the image does.
+    BOOT = (
+        '[project]\nname = "p"\nversion = "{v}"\n\n'
+        "[project.urls]\nhome = 'x'\n\n"
+        "[dev.apt]\npackages = [\n  'jq',\n]{extra}\n"
+    )
+
+    def _boot(self, v: str = "0.1.0", extra: str = "") -> str:
+        (self.root / "bootstrap.toml").write_text(
+            self.BOOT.format(v=v, extra=extra))
+        return self.source_hash()
+
+    def test_a_version_bump_owes_no_repin(self):
+        """doppler-dsp/doppler#1765: a release bumped the hash it never fed."""
+        h = self._boot("0.1.0")
+        self.assertEqual(self._boot("0.2.0"), h)
+        self.write_pin({**GOOD, "CI_IMAGE_SOURCE_HASH": h})
+        self.assertEqual(self.run_script("check").returncode, 0)
+
+    def test_a_table_after_project_still_moves_it(self):
+        """Leaving [project] ends at the next header, not the end of file."""
+        h = self._boot()
+        self.assertNotEqual(self._boot(extra="\n# moved"), h)
+        moved = self.BOOT.format(v="0.1.0", extra="").replace("'jq'", "'yq'")
+        (self.root / "bootstrap.toml").write_text(moved)
+        self.assertNotEqual(self.source_hash(), h)
+
+
+    def test_an_element_shaped_like_a_header_is_not_one(self):
+        """``['project']`` alone on a line, inside an array, is a value."""
+        boot = self.BOOT.format(v="0.1.0", extra="").replace(
+            "  'jq',\n", "  ['project']\n")
+        (self.root / "bootstrap.toml").write_text(boot)
+        h = self.source_hash()
+        (self.root / "bootstrap.toml").write_text(
+            boot + "retries = 3\n")
+        self.assertNotEqual(self.source_hash(), h,
+                            "the key after the array went unhashed")
+
+
 class TestKeysAndFingerprints(_Tree):
     def test_the_pin_key_is_the_tags_digits(self):
         self.assertEqual(self.run_script("key", "ubuntu:24.04").stdout.strip(),
@@ -199,6 +240,18 @@ class TestTheWorkflow(unittest.TestCase):
 
     def test_it_repins_only_when_something_moved(self):
         self.assertIn("steps.pin.outputs.changed == '1'", self.text)
+
+    def test_a_branch_push_builds_only_when_the_pin_is_owed(self):
+        """A release bump moves no source the image reads, so it builds
+        nothing; a schedule or dispatch always builds (doppler#1765)."""
+        self.assertRegex(
+            self.text,
+            r'"\$\{\{ github\.event_name \}\}" = push \] && make -s ci-image-check;'
+            r'\s+then\s+echo "owed=false"',
+        )
+        build = self.text[self.text.index("\n  build:"):]
+        build = build[:build.index("\n  publish:")]
+        self.assertIn("if: needs.resolve.outputs.owed == 'true'", build)
 
     def test_an_unlanded_branch_repin_keeps_the_run_red(self):
         """Branch landing has no PR to be the signal, and a green run

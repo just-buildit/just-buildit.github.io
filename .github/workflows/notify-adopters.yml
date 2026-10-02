@@ -159,7 +159,14 @@ jobs:
             # the files: its Makefile is the only thing that knows which files
             # IT vendors. Guessing that centrally is the written-list trap one
             # layer up.
-            if ! ( cd work && make standard-update >/dev/null 2>&1 ); then
+            # TWICE: an adopter still on a standard.mk older than #76's fix
+            # updates with the recipe it HAS, which fetches the new
+            # standard.mk but not a file that copy newly vendors, and its
+            # check fails. The second run re-parses the new copy and fetches
+            # it; when nothing is new it is a no-op. Drop the first call once
+            # every adopter carries the one-pass recipe.
+            if ! ( cd work && { make standard-update >/dev/null 2>&1 || true; } \
+                     && make standard-update >/dev/null 2>&1 ); then
               echo "::warning::standard-update failed in $slug"
               failed=$((failed+1)); echo "::endgroup::"; continue
             fi

@@ -202,6 +202,27 @@ jobs:
           make -f standard.mk workflow-dispatch-check TEST_CMD=x TEST_FAST_CMD=x CLEAN_PATHS=x
           echo "OK — workflow-dispatch-check: three spellings, reusable exempt, push-only and empty refused."
 
+      - name: standard-update fetches a newly vendored file in ONE run
+        # just-buildit.github.io#76: the vendored list is the one the running
+        # make parsed from the OLD standard.mk, so a canonical that adds a
+        # file needed two runs -- and the adopter bot does one. A file://
+        # canonical adds scripts/new.sh; a single run must fetch it and pass.
+        run: |
+          root="$PWD"
+          tmp="$(mktemp -d)"; canon="$tmp/canon"; app="$tmp/app"
+          mkdir -p "$canon/scripts" "$app"
+          # Canonical v2 = the file under test, plus a NEW vendored script.
+          cp "$root/standard.mk" "$canon/standard.mk"
+          printf '\nVENDORED_FILES += scripts/new.sh\n' >> "$canon/standard.mk"
+          printf '#!/bin/sh\necho new\n' > "$canon/scripts/new.sh"
+          # The adopter vendors v1 (the file under test, without the new entry).
+          cp "$root/standard.mk" "$app/standard.mk"
+          printf 'TEST_CMD = @echo t\nTEST_FAST_CMD = @echo t\nCLEAN_PATHS = d/\nSTANDARD_URL = file://%s/standard.mk\ninclude standard.mk\n' "$canon" > "$app/Makefile"
+          make -C "$app" --no-print-directory standard-update
+          test -f "$app/scripts/new.sh" || { echo "::error::one pass did not fetch the new vendored file"; exit 1; }
+          cmp -s "$app/standard.mk" "$canon/standard.mk" || { echo "::error::standard.mk not updated"; exit 1; }
+          echo "OK — one standard-update fetched a newly vendored file and checks green."
+
       - name: hook-stage-check catches a hook that runs nowhere
         # The gate exists because a hook can be configured, dispatch to a real
         # target, pass hook-dispatch-check, and still execute on no machine and

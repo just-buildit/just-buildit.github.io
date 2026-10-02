@@ -804,7 +804,7 @@ endif
 # two in one go. `release` is NOT part of this — it is the C build type.
 ifeq ($(HAS_RELEASE),1)
 STD_TARGETS += bump-version version-check release-branch tag-release \
-               release-watch ship ci-changes ci-tree-tested
+               release-watch ship ci-changes ci-tree-tested ci-docs
 
 BUMP_VERSION_CMD  ?=
 RELEASE_WATCH_CMD ?=
@@ -994,6 +994,27 @@ VENDORED_FILES += scripts/ci-tree-tested.sh
 
 ci-tree-tested: ## BEFORE=<sha> tested=true when HEAD's tree already passed CI as a merged PR
 	@CI_CHECK_NAME='$(CI_CHECK_NAME)' bash scripts/ci-tree-tested.sh '$(BEFORE)'
+
+# The third lighter lane: a diff that touches only the docs. `make ci-docs`
+# prints docs= (did any changed path match CI_DOCS_RE) and code= (did
+# anything else change). A `changes` job gates every job docs cannot break
+# on `code`, and its aggregator lets them skip only on an explicit
+# code=false. A deletion outside CI_DOCS_DIRS is never docs-only: a docs
+# file can be READ by something that is not docs (pyproject's `readme`),
+# and editing it cannot break that reader where removing it can. Any doubt
+# -- an unreadable BASE, an empty diff -- answers code=true.
+#
+# CI_DOCS_RE is the repo's ONE declaration of what its docs are. A repo whose
+# docs/ holds GENERATED copies of something that is not docs (just-makeit's
+# docs/examples/, built from example .steps) must exclude them here, or a
+# change to their source could read as docs-only.
+CI_DOCS_RE   ?= ^(docs/|mkdocs[^/]*\.yml$$|CHANGELOG\.md$$|changelog\.d/|README\.md$$)
+CI_DOCS_DIRS ?= docs/ changelog.d/
+VENDORED_FILES += scripts/ci-docs.py
+
+ci-docs: ## [BASE=<rev>] docs=/code= for a diff -- code=false when only docs changed
+	@python3 scripts/ci-docs.py --base '$(or $(BASE),HEAD^)' \
+	    --re '$(CI_DOCS_RE)' --dirs '$(CI_DOCS_DIRS)'
 
 # The explicit origin/main start point matters: a bare `checkout -b` forks from
 # whatever HEAD the invoker happens to be on (a feature branch, a stale main),
@@ -1352,7 +1373,7 @@ _STD_SECTION = case "$$t" in \
     bench|bench-save|bench-compare) tsec="Bench";; \
     coverage|coverage-gate) tsec="Coverage";; \
     bump-version|version-check|release-branch|tag-release|release-watch \
-        |ship|ci-changes|ci-tree-tested) tsec="Release";; \
+        |ship|ci-changes|ci-tree-tested|ci-docs) tsec="Release";; \
     changelog-check|changelog-sections-check|changelog-assemble \
         |changelog-assembled-check) tsec="Changelog";; \
     test-examples) tsec="Examples";; \

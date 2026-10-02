@@ -43,6 +43,7 @@ jobs:
   serving:
     name: Wait for Pages to serve this commit
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -68,6 +69,7 @@ jobs:
     name: Re-vendor ${{ matrix.org }}
     needs: serving
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       # One org's app installation being missing must not stop the others
       # being served. Each org reports its own outcome.

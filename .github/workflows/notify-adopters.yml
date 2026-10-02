@@ -136,6 +136,8 @@ jobs:
       - name: Open a re-vendor PR where the vendored files have moved
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
+          # Who "this bot" is, for closing only its OWN superseded PRs.
+          BOT_SLUG: ${{ steps.token.outputs.app-slug }}
           DRY_RUN: ${{ inputs.dry_run }}
           SHA: ${{ github.sha }}
           ORG: ${{ matrix.org }}
@@ -178,10 +180,21 @@ jobs:
             # Best effort: a failed close is a warning, never the fan-out's
             # failure.
             close_stale() {
+              # Cannot tell its own PRs from a human's -> closes nothing.
+              if [ -z "${BOT_SLUG:-}" ]; then
+                echo "::warning::no app slug; not closing stale PRs in $slug"
+                return 0
+              fi
+              # AUTHOR first: a human's re-vendor-with-fixes PR carries the same
+              # title and the same branch prefix (just-makeit#1800 did), and
+              # closing it would delete its branch. Title and prefix stay as a
+              # second guard.
               gh pr list --repo "$slug" --state open \
+                --author "app/$BOT_SLUG" \
                 --search "chore: re-vendor from canonical in:title" \
-                --json number,headRefName \
-                --jq ".[] | select(.headRefName | startswith(\"chore/re-vendor-\"))
+                --json number,headRefName,author \
+                --jq ".[] | select(.author.login == \"app/$BOT_SLUG\")
+                          | select(.headRefName | startswith(\"chore/re-vendor-\"))
                           | select(.headRefName != \"$branch\") | .number" |
               while read -r old; do
                 why="Superseded by #$1: a newer canonical commit."

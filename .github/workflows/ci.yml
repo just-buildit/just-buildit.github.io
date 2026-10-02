@@ -172,6 +172,68 @@ jobs:
           make -C "$tmp" hook-stage-check
           echo "OK — hook-stage-check passes wired, fails orphaned, exempts manual."
 
+      - name: hook-dispatch-check refuses a hook that does not go through make
+        # just-makeit#1801 item 4: counting only the hooks that DO dispatch
+        # reported "7 resolve" while uv-lock ran upstream's own uv, pinned
+        # apart from the repo's. A remote hook has no entry: at all, so the
+        # gate is per hook, by id, with declared exceptions that cannot go
+        # stale. Both directions, and the exception list.
+        run: |
+          tmp="$(mktemp -d)"; cp standard.mk "$tmp/"
+          mk() {
+            printf 'TEST_CMD = @echo test\nTEST_FAST_CMD = @echo test-fast\n' > "$tmp/Makefile"
+            printf 'CLEAN_PATHS = dist/\nHOOK_DISPATCH_EXEMPT = %s\n' "$1" >> "$tmp/Makefile"
+            printf 'include standard.mk\n' >> "$tmp/Makefile"
+          }
+          cat > "$tmp/.pre-commit-config.yaml" <<'EOF'
+          repos:
+            - repo: local
+              hooks:
+                - id: plain
+                  name: plain
+                  entry: make -s lint
+                  language: system
+                - id: quoted
+                  name: quoted
+                  entry: "make -s lint"
+                  language: system
+          EOF
+
+          # Every hook dispatches, quoted or not -> passes, and BOTH are
+          # resolved: the quoted entry's target used to go unchecked.
+          mk ""; make -C "$tmp" hook-dispatch-check | tee "$tmp/log"
+          grep -q "2 make dispatch(es) resolve" "$tmp/log" \
+            || { echo "::error::a quoted dispatch was not resolved"; exit 1; }
+
+          # SABOTAGE: a remote hook, no entry: -> refused, by id.
+          cat >> "$tmp/.pre-commit-config.yaml" <<'EOF'
+            - repo: https://github.com/pre-commit/pre-commit-hooks
+              rev: v6.0.0
+              hooks:
+                - id: trailing-whitespace
+          EOF
+          if make -C "$tmp" hook-dispatch-check > "$tmp/log" 2>&1; then
+            cat "$tmp/log"
+            echo "::error::hook-dispatch-check passed a hook that runs its own tool"; exit 1
+          fi
+          grep -q "trailing-whitespace" "$tmp/log" \
+            || { cat "$tmp/log"; echo "::error::it did not name the hook"; exit 1; }
+
+          # Declared as an exception -> passes, and says how many.
+          mk "trailing-whitespace"; make -C "$tmp" hook-dispatch-check | tee "$tmp/log"
+          grep -q "1 declared exception" "$tmp/log" \
+            || { echo "::error::it did not count the exception"; exit 1; }
+
+          # SABOTAGE: an exception that names no non-dispatching hook -> stale.
+          mk "trailing-whitespace plain"
+          if make -C "$tmp" hook-dispatch-check > "$tmp/log" 2>&1; then
+            cat "$tmp/log"
+            echo "::error::hook-dispatch-check kept a stale exception"; exit 1
+          fi
+          grep -q "plain" "$tmp/log" \
+            || { cat "$tmp/log"; echo "::error::it did not name the stale one"; exit 1; }
+          echo "OK — hook-dispatch-check refuses undeclared, accepts declared, refuses stale."
+
       - name: standard-check walks the whole vendored list, and cannot pass on nothing
         # The drift gate compares a LIST now, not one file. Three ways it could
         # go quietly wrong, each asserted rather than assumed:

@@ -1004,17 +1004,21 @@ ci-tree-tested: ## BEFORE=<sha> tested=true when HEAD's tree already passed CI a
 # and editing it cannot break that reader where removing it can. Any doubt
 # -- an unreadable BASE, an empty diff -- answers code=true.
 #
-# CI_DOCS_RE is the repo's ONE declaration of what its docs are. A repo whose
-# docs/ holds GENERATED copies of something that is not docs (just-makeit's
-# docs/examples/, built from example .steps) must exclude them here, or a
-# change to their source could read as docs-only.
-CI_DOCS_RE   ?= ^(docs/|mkdocs[^/]*\.yml$$|CHANGELOG\.md$$|changelog\.d/|README\.md$$)
-CI_DOCS_DIRS ?= docs/ changelog.d/
+# CI_DOCS_RE minus CI_DOCS_EXCLUDE_RE is the repo's ONE declaration of what
+# its docs are: include-minus-exclude, the C_INCLUDE_RE / C_EXCLUDE_RE shape,
+# so no pattern needs a lookahead. A repo whose docs/ holds GENERATED copies
+# of something that is not docs (just-makeit's docs/examples/, built from
+# example .steps) excludes them, or a change to their source could read as
+# docs-only.
+CI_DOCS_RE         ?= ^(docs/|mkdocs[^/]*\.yml$$|CHANGELOG\.md$$|changelog\.d/|README\.md$$)
+CI_DOCS_EXCLUDE_RE ?=
+CI_DOCS_DIRS       ?= docs/ changelog.d/
 VENDORED_FILES += scripts/ci-docs.py
 
 ci-docs: ## [BASE=<rev>] docs=/code= for a diff -- code=false when only docs changed
 	@python3 scripts/ci-docs.py --base '$(or $(BASE),HEAD^)' \
-	    --re '$(CI_DOCS_RE)' --dirs '$(CI_DOCS_DIRS)'
+	    --re '$(CI_DOCS_RE)' --exclude '$(CI_DOCS_EXCLUDE_RE)' \
+	    --dirs '$(CI_DOCS_DIRS)'
 
 # The explicit origin/main start point matters: a bare `checkout -b` forks from
 # whatever HEAD the invoker happens to be on (a feature branch, a stale main),

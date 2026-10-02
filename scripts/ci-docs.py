@@ -57,16 +57,25 @@ def classify(
     changes: list[tuple[str, str]],
     docs_re: re.Pattern[str],
     dirs: tuple[str, ...] = DOCS_DIRS,
+    exclude_re: re.Pattern[str] | None = None,
 ) -> tuple[bool, bool]:
     """``(docs, code)`` for a list of ``(git status letter, path)`` pairs.
 
-    An empty list is fail-safe: both true.
+    A path is docs when it matches ``docs_re`` and not ``exclude_re`` (the
+    include-minus-exclude shape, so no pattern needs a lookahead). An empty
+    list is fail-safe: both true.
     """
     if not changes:
         return True, True
-    docs = any(docs_re.search(p) for _, p in changes)
+
+    def is_docs(p: str) -> bool:
+        if exclude_re is not None and exclude_re.search(p):
+            return False
+        return bool(docs_re.search(p))
+
+    docs = any(is_docs(p) for _, p in changes)
     code = any(
-        not docs_re.search(p)
+        not is_docs(p)
         or (status == "D" and not p.startswith(dirs))
         for status, p in changes
     )
@@ -101,6 +110,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--base", required=True)
     ap.add_argument("--re", dest="docs_re", required=True)
     ap.add_argument(
+        "--exclude",
+        default="",
+        help="paths matching this are never docs (CI_DOCS_EXCLUDE_RE)",
+    )
+    ap.add_argument(
         "--dirs",
         default=" ".join(DOCS_DIRS),
         help="space-separated directory prefixes a deletion may come from",
@@ -112,7 +126,8 @@ def main(argv: list[str] | None = None) -> int:
         docs, code, why = True, True, f"cannot diff against {args.base}"
     else:
         dirs = tuple(args.dirs.split())
-        docs, code = classify(changes, re.compile(args.docs_re), dirs)
+        excl = re.compile(args.exclude) if args.exclude else None
+        docs, code = classify(changes, re.compile(args.docs_re), dirs, excl)
         if not changes:
             why = "an empty diff"
         elif code:

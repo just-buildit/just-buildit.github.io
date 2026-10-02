@@ -268,10 +268,20 @@ jobs:
           DEFAULT: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          git fetch -q origin "$DEFAULT"
-          if ! git fetch -q origin ci/repin-image 2>/dev/null; then
-            echo "no ci/repin-image: nothing owed"; exit 0
-          fi
+          # ls-remote, not a failed fetch: a fetch also fails on a network or
+          # auth error, and reading that as "absent" would be the quiet green
+          # this step exists to prevent. rc 2 = no such branch; 0 = present;
+          # anything else is unknown, and unknown is red.
+          rc=0
+          git ls-remote --exit-code --heads origin ci/repin-image \
+            >/dev/null || rc=$?
+          case "$rc" in
+            0) ;;
+            2) echo "no ci/repin-image: nothing owed"; exit 0 ;;
+            *) echo "::error::cannot tell whether ci/repin-image exists" \
+                    "(git ls-remote exited $rc)"; exit 1 ;;
+          esac
+          git fetch -q origin "$DEFAULT" ci/repin-image
           if git diff --quiet "origin/$DEFAULT" origin/ci/repin-image \
                -- .github/ci-images.env; then
             echo "ci/repin-image matches $DEFAULT: nothing owed"; exit 0

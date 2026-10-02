@@ -212,6 +212,40 @@ class TestTheWorkflow(unittest.TestCase):
         # It is the LAST step: nothing after it can be skipped by its red.
         self.assertNotIn("\n      - name:", step[1:])
 
+    def _run_unlanded_step(self, ls_rc: int, differs: bool) -> int:
+        """Execute the step's real run: text with a stubbed git."""
+        i = self.text.index("An unlanded repin keeps this run red")
+        body = self.text[self.text.index("run: |", i) + len("run: |"):]
+        lines = [ln[10:] if ln.startswith(" " * 10) else ln.strip()
+                 for ln in body.splitlines()[1:]]
+        script = "\n".join(lines)
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = pathlib.Path(tmp) / "git"
+            stub.write_text(
+                "#!/bin/sh\n"
+                'case "$1" in\n'
+                f"  ls-remote) exit {ls_rc} ;;\n"
+                f"  diff) exit {1 if differs else 0} ;;\n"
+                "esac\nexit 0\n"
+            )
+            stub.chmod(0o755)
+            env = {**os.environ, "PATH": f"{tmp}:{os.environ['PATH']}",
+                   "DEFAULT": "main",
+                   "GITHUB_STEP_SUMMARY": str(pathlib.Path(tmp) / "s")}
+            return subprocess.run(["bash", "-c", script], env=env,
+                                  capture_output=True).returncode
+
+    def test_the_unlanded_step_reads_every_ls_remote_answer(self):
+        cases = [
+            (2, False, 0),    # no branch: nothing owed
+            (0, False, 0),    # branch matches the default branch
+            (0, True, 1),     # an unlanded repin: red
+            (128, False, 1),  # cannot tell (network, auth): red, not green
+        ]
+        for rc, differs, want in cases:
+            with self.subTest(ls_remote=rc, differs=differs):
+                self.assertEqual(self._run_unlanded_step(rc, differs), want)
+
     def test_both_arches_build_natively(self):
         self.assertIn("ubuntu-24.04-arm", self.text)
         self.assertNotIn("setup-qemu", self.text)

@@ -1,0 +1,253 @@
+name: CI image
+
+# VENDORED from canonical (HAS_CI_IMAGE) -- change it there, not here;
+# standard-check fails on any difference. Every per-repo value comes from
+# `make ci-image-config` (the Makefile), every pin decision from
+# scripts/ci-image.py, so this file holds no second copy of either.
+#
+# Builds the CI toolchain image (docker/ci.Dockerfile), one per base in
+# CI_IMAGE_BASES, natively on amd64 AND arm64 -- no emulation, so the smoke
+# target really runs on both -- and repins .github/ci-images.env ONLY when a
+# package fingerprint or the image's sources moved. A new apt snapshot alone
+# is not a change, so a quiet week opens nothing.
+#
+# - schedule (weekly) or dispatch with refresh: pick new inputs (snapshot,
+#   base digests, the just-bashit release), build, compare, repin through
+#   CI_IMAGE_LANDING: a PR, or a pushed ci/repin-image branch where the org
+#   forbids Actions from opening PRs.
+# - a push to a non-default branch that touches the image's sources: build
+#   from the PINNED inputs and commit the new pin onto that branch, so the
+#   PR carries its own pin and `make ci-image-check` passes.
+#
+# A push or PR made with GITHUB_TOKEN starts no workflow, so a repin
+# dispatches CI_IMAGE_CI_WORKFLOW on its branch.
+
+on:
+  schedule:
+    # Monday 04:23 UTC, off the hour to avoid the scheduler's peak.
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      refresh:
+        description: Pick new inputs (snapshot, base digests, installer) first
+        type: boolean
+        default: false
+  push:
+    # Not the default branch: a merged change already carried its pin, and
+    # rebuilding it there would only re-resolve inputs nobody asked to move.
+    branches-ignore: [main, master]
+    paths:
+      - docker/ci.Dockerfile
+      - docker/ci-extra.sh
+      - bootstrap.toml
+      - .github/workflows/ci-image.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  resolve:
+    name: Resolve the inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.cfg.outputs.matrix }}
+      repo: ${{ steps.cfg.outputs.repo }}
+      groups: ${{ steps.cfg.outputs.groups }}
+      smoke: ${{ steps.cfg.outputs.smoke }}
+      landing: ${{ steps.cfg.outputs.landing }}
+      ci_workflow: ${{ steps.cfg.outputs.ci_workflow }}
+      tag: ${{ steps.cfg.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v4
+
+      - id: cfg
+        env:
+          REFRESH: ${{ github.event_name == 'schedule' || inputs.refresh == true }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          make -s ci-image-config >> "$GITHUB_OUTPUT"
+          bases=$(make -s ci-image-config | sed -n 's/^bases=//p')
+          export CI_IMAGE_BASES="$bases"
+          flag=; [ "$REFRESH" = true ] && flag=--refresh
+          python3 scripts/ci-image.py inputs $flag > inputs.env
+          cat inputs.env
+          # base x arch, each on its native runner.
+          matrix=$(for b in $bases; do
+            for a in amd64:ubuntu-latest arm64:ubuntu-24.04-arm; do
+              printf '{"base":"%s","key":"%s","arch":"%s","runs_on":"%s"}\n' \
+                "$b" "$(python3 scripts/ci-image.py key "$b")" \
+                "${a%%:*}" "${a#*:}"
+            done
+          done | jq -sc '{include: .}')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          snap=$(sed -n 's/^CI_APT_SNAPSHOT=//p' inputs.env)
+          echo "tag=${snap}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-image-inputs
+          path: inputs.env
+          if-no-files-found: error
+
+  build:
+    name: Build and smoke (${{ matrix.key }}, ${{ matrix.arch }})
+    needs: resolve
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ci-image-inputs
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build, smoke, push
+        env:
+          REPO: ${{ needs.resolve.outputs.repo }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          # Not GROUPS: bash's GROUPS is a builtin array of the user's gids,
+          # so `$GROUPS` would expand to a gid and install no group at all.
+          IMAGE_GROUPS: ${{ needs.resolve.outputs.groups }}
+          KEY: ${{ matrix.key }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          . ./inputs.env
+          base_ref=$(eval echo "\$CI_BASE_$KEY")
+          img="$REPO:$KEY-$TAG-$ARCH"
+          # --provenance/--sbom off: the index the publish job builds must
+          # name exactly the platform images, so a pinned digest resolves to
+          # a runnable image on either arch.
+          docker buildx build --load --provenance=false --sbom=false \
+            -f docker/ci.Dockerfile \
+            --build-arg BASE="$base_ref" \
+            --build-arg APT_SNAPSHOT="$CI_APT_SNAPSHOT" \
+            --build-arg JB_VERSION="$CI_JB_VERSION" \
+            --build-arg JB_SHA256="$CI_JB_SHA256" \
+            --build-arg CI_IMAGE_GROUPS="$IMAGE_GROUPS" \
+            -t "$img" .
+          # The smoke runs BEFORE anything is pushed, natively, on this arch.
+          make ci-image-smoke IMAGE="$img"
+          docker push "$img"
+          fp=$(docker run --rm "$img" cat /etc/ci-image-fingerprint)
+          mkdir -p out
+          echo "$ARCH=$fp" > "out/fp-$KEY-$ARCH"
+          echo "$KEY $ARCH fingerprint $fp"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-image-fp-${{ matrix.key }}-${{ matrix.arch }}
+          path: out/
+          if-no-files-found: error
+
+  publish:
+    name: Repin if anything moved
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      packages: write
+      pull-requests: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: art
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Join the arches and assemble the pin
+        id: pin
+        env:
+          REPO: ${{ needs.resolve.outputs.repo }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          CI_IMAGE_BASES=$(make -s ci-image-config | sed -n 's/^bases=//p')
+          export CI_IMAGE_BASES
+          {
+            cat art/inputs.env
+            for b in $CI_IMAGE_BASES; do
+              k=$(python3 scripts/ci-image.py key "$b")
+              docker buildx imagetools create -t "$REPO:$k-$TAG" \
+                "$REPO:$k-$TAG-amd64" "$REPO:$k-$TAG-arm64"
+              d=$(docker buildx imagetools inspect "$REPO:$k-$TAG" \
+                    --format '{{json .Manifest}}' | jq -r .digest)
+              echo "CI_IMAGE_$k=$REPO@$d"
+              # One `arch=fp` word per file, one file per arch.
+              mapfile -t fps < <(cat "art/fp-$k-"*)
+              echo "CI_IMAGE_FINGERPRINT_$k=$(python3 scripts/ci-image.py \
+                join-fingerprint "${fps[@]}")"
+            done
+            echo "CI_IMAGE_SOURCE_HASH=$(python3 scripts/ci-image.py source-hash)"
+          } | python3 scripts/ci-image.py write-pin --out new-pin.env
+          python3 scripts/ci-image.py changed --new new-pin.env >> "$GITHUB_OUTPUT"
+          cat new-pin.env
+          cat new-pin.env >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Land the repin
+        if: steps.pin.outputs.changed == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          LANDING: ${{ needs.resolve.outputs.landing }}
+          CI_WORKFLOW: ${{ needs.resolve.outputs.ci_workflow }}
+          DEFAULT: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          cp new-pin.env .github/ci-images.env
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ "$GITHUB_REF_NAME" = "$DEFAULT" ]; then
+            branch="ci/repin-image"
+            git switch -C "$branch"
+          else
+            branch="$GITHUB_REF_NAME"
+          fi
+          git add .github/ci-images.env
+          git commit -m "chore(ci): repin the CI toolchain image $TAG"
+          git push -f origin "HEAD:$branch"
+          if [ "$GITHUB_REF_NAME" = "$DEFAULT" ]; then
+            if [ "$LANDING" = pr ]; then
+              gh pr view "$branch" >/dev/null 2>&1 \
+                || gh pr create --base "$DEFAULT" --head "$branch" \
+                     --title "chore(ci): repin the CI toolchain image" \
+                     --body "Opened by ci-image.yml (run $GITHUB_RUN_ID): a package fingerprint or the image's sources moved. CI on this PR runs on the new image; merging adopts it."
+            else
+              echo "Repin pushed to $branch. Land it: gh pr create --head $branch --fill" \
+                >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+          gh workflow run "$CI_WORKFLOW" --ref "$branch"

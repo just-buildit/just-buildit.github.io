@@ -1,7 +1,7 @@
 #!/bin/bash
 # ############################################################################
 # LIBRARY: windows.sh                                                        #
-# PACKAGE: just-bashit version 0.7.1                                         #
+# PACKAGE: just-bashit                                                       #
 # ############################################################################
 #
 # Reaching Windows programs from WSL. Sourced by setup-system.sh and

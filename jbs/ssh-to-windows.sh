@@ -1,7 +1,7 @@
 #!/bin/bash
 # ############################################################################
 # EXECUTABLE: ssh-to-windows.sh                                              #
-# PACKAGE: just-bashit version 0.7.1                                         #
+# PACKAGE: just-bashit                                                       #
 # ############################################################################
 # Publish WSL2's ssh keys to Windows, with the NTFS ACLs Windows OpenSSH     #
 # insists on. A key that works perfectly in the WSL shell is refused by      #

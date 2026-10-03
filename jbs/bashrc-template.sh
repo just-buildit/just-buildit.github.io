@@ -1,7 +1,7 @@
 #!/bin/bash
 # ############################################################################
 # TEMPLATE: bashrc-template.sh                                               #
-# PACKAGE: just-bashit version 0.7.1                                         #
+# PACKAGE: just-bashit                                                       #
 # ############################################################################
 # Opinionated, cross-distro interactive bash configuration.                  #
 #                                                                            #

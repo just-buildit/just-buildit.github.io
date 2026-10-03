@@ -139,6 +139,30 @@ _jb_install() {
 		_jb_ok "${INSTALL_DIR} already in PATH"
 	fi
 
+	# -- the jbx shell function -----------------------------------------------
+	#
+	# This script is SOURCED, so it can do what no child process can: define
+	# `jbx` as a function in the caller's shell. A setup-system run through
+	# it is then applied to this shell, rather than ending "open a new shell"
+	# (jbx-shell.sh says how). Installed where setup-system's shell step puts
+	# it, beside bashrc.sh, which sources it in every later shell -- the
+	# directory is setup-system's PREFIX, spelled the same way; a test holds
+	# the two spellings equal. Fails soft: without it, runs ask for a new
+	# shell, as they always did.
+	local jb_conf="${JB_CONFIG_DIR:-${XDG_CONFIG_HOME:-${HOME}/.config}/just-bashit}"
+	local jbx_sh="${jb_conf}/jbx-shell.sh"
+	mkdir -p "${jb_conf}"
+	if curl -sSL --fail --proto '=https' --tlsv1.2 \
+		-o "${jbx_sh}.new" "${RAW_BASE}/jbx-shell.sh"; then
+		mv -f "${jbx_sh}.new" "${jbx_sh}"
+		# shellcheck source=/dev/null
+		. "${jbx_sh}"
+		_jb_ok "jbx runs as a shell function here: setup-system applies to this shell"
+	else
+		rm -f "${jbx_sh}.new"
+		_jb_warn "jbx-shell.sh unavailable — setup-system will ask for a new shell"
+	fi
+
 	# -- uv (enables Python PEP 723 dep resolution) ---------------------------
 
 	# uv's installer needs awk, and a minimal Debian 13 WSL image has none:

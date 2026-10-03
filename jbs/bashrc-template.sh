@@ -366,6 +366,15 @@ if [[ ${JB_COMPLETION:-1} == 1 ]] &&
 fi
 
 # ---------------------------------------------------------------------------
+# The `jbx` function: a setup-system run through it is applied to this shell
+# rather than asking for a new one (jbx-shell.sh, installed beside this file).
+# ---------------------------------------------------------------------------
+if [[ -r "${JB_DIR}/jbx-shell.sh" ]]; then
+	# shellcheck source=/dev/null
+	source "${JB_DIR}/jbx-shell.sh"
+fi
+
+# ---------------------------------------------------------------------------
 # Local extensions — yours, loaded last, never overwritten by setup-system.
 # ---------------------------------------------------------------------------
 for _jb_rc in "${JB_DIR}/bashrc.d/"*.sh; do

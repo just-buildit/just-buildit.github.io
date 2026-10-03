@@ -397,23 +397,32 @@ read -r -d '' _BASELINE_TOML <<-'EOF' || true
 	[baseline.brew]
 	packages = ["cmake", "pkg-config"]
 
-	# Git Bash with no pacman (install-deps' winget section, #60). The
-	# compiler is clang-cl, the toolchain just-makeit builds Windows with; it
+	# Native Windows: clang-cl, the toolchain just-makeit and doppler build
+	# Windows with, plus CMake, Git (Git Bash, the bash host) and PowerShell 7
+	# (pwsh: the .ps1 gates, and the shell a Windows user works in). clang-cl
 	# also needs the MSVC Build Tools' C++ workload, which winget installs
 	# only with an --override this manifest has no way to pass yet -- see
-	# #67. Windows 10+ ships tar.exe and curl.exe itself.
+	# #67. Windows 10+ ships tar.exe and curl.exe itself. Installed from Git
+	# Bash directly, and from MSYS2 too: step_deps runs this section there as
+	# well, since msys2's own section no longer carries a compiler.
 	[baseline.winget]
-	packages = ["Kitware.CMake", "Git.Git", "LLVM.LLVM"]
+	packages = ["Kitware.CMake", "Git.Git", "LLVM.LLVM", "Microsoft.PowerShell"]
 
+	# MSYS2 as the BASH HOST only. Its MinGW gcc toolchain is gone
+	# (2026-10-03): just-makeit and doppler build native Windows with
+	# clang-cl, and a second compiler that nothing builds with is one more
+	# thing to keep working. These are the tools the scripts themselves use.
 	[baseline.msys2]
-	packages = ["mingw-w64-ucrt-x86_64-gcc", "mingw-w64-ucrt-x86_64-cmake", "make", "pkg-config", "git", "curl", "openssh"]
+	packages = ["make", "pkg-config", "git", "curl", "openssh"]
 EOF
 
-# _install_manifest INSTALLER FILE LABEL — one install-deps run over FILE,
-# reported under LABEL. Returns install-deps' own status.
+# _install_manifest INSTALLER FILE LABEL [ARGS...] — one install-deps run
+# over FILE, reported under LABEL; ARGS go to install-deps (e.g. -s winget).
+# Returns install-deps' own status.
 _install_manifest() {
 	local installer="$1" file="$2" label="$3"
-	local args=()
+	shift 3
+	local args=("$@")
 	[[ ${DRY_RUN} -eq 1 ]] && args+=("--dry-run")
 	[[ ${VERBOSE} -eq 1 ]] && args+=("--verbose")
 	_info "installing packages from ${label}"
@@ -439,6 +448,20 @@ step_deps() {
 	printf '%s\n' "${_BASELINE_TOML}" >"${baseline}"
 	_install_manifest "${installer}" "${baseline}" "the baseline toolchain" ||
 		ok=0
+	# MSYS2 (Windows uname, pacman present) gets the msys2 section above --
+	# bash-host tools, no compiler -- so the native toolchain comes from the
+	# winget section as well, when winget is there to install it.
+	_pwsh_uname_init
+	case "${_UNAME_S}" in
+	MINGW* | MSYS* | CYGWIN*)
+		if _have pacman && { _have winget || _have winget.exe; }; then
+			_install_manifest "${installer}" "${baseline}" \
+				"the native Windows toolchain (winget)" -s winget || ok=0
+			done_list="${done_list} + native Windows toolchain"
+		fi
+		;;
+	*) ;;
+	esac
 	rm -f "${baseline}"
 
 	local deps_file=""

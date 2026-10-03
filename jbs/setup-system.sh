@@ -259,7 +259,7 @@ _asset() {
 # to co-fetch and nothing updates it, so one older than a library -- windows.sh
 # against a 0.4.1 jbx, measured on zen-ai445 -- would otherwise die here on a
 # missing file (#75).
-for _lib in toml.sh file.sh windows.sh; do
+for _lib in toml.sh file.sh windows.sh jbx-shell.sh; do
 	_lib_path="$(_asset "${_lib}")" || exit 1
 	# shellcheck source=/dev/null
 	source "${_lib_path}"
@@ -478,6 +478,15 @@ step_shell() {
 
 	_install_file "${src_bashrc}" "${bashrc}"
 	_install_file "${src_profile}" "${profile}"
+
+	# The `jbx` function that applies a run's changes to the calling shell;
+	# bashrc.sh sources it from beside itself (jbx-shell.sh says why).
+	local src_jbxsh
+	if src_jbxsh="$(_asset jbx-shell.sh)"; then
+		_install_file "${src_jbxsh}" "${PREFIX}/jbx-shell.sh"
+	else
+		_warn "jbx-shell.sh unavailable — runs will ask for a new shell"
+	fi
 
 	# Written with $HOME unexpanded when the prefix is the default, so the
 	# same line works in a home directory that later moves or is mounted
@@ -1565,7 +1574,23 @@ case ":${PATH}:" in
 	;;
 esac
 if [[ ${#_RELOAD[@]} -gt 0 ]]; then
-	_say "open a new shell, or run: exec bash -l"
+	# Run through the `jbx` shell function (jbx-shell.sh), which exported
+	# JB_CALLER_APPLIES: tell it what to apply, in its marker, and it sources
+	# that into the very shell that ran us. Only just-bashit's own files,
+	# which are written to be sourced again. Anything else -- a direct run, a
+	# script, a dry run -- gets the hint.
+	if [[ ${JB_CALLER_APPLIES:-0} == 1 && ${DRY_RUN} -eq 0 ]]; then
+		_mark="$(jb_reload_marker)"
+		mkdir -p "${_mark%/*}"
+		{
+			[[ -r "${PREFIX}/profile.sh" ]] && printf 'profile %s\n' "${PREFIX}/profile.sh"
+			[[ -r "${PREFIX}/bashrc.sh" ]] && printf 'bashrc %s\n' "${PREFIX}/bashrc.sh"
+			printf 'path %s\n' "${HOME}/.local/bin"
+		} >"${_mark}"
+		_say "jbx applies this to your shell when setup-system exits:"
+	else
+		_say "open a new shell, or run: exec bash -l"
+	fi
 	for _r in "${_RELOAD[@]}"; do
 		_say "    (${_r})"
 	done

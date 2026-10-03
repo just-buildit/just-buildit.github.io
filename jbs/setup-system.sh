@@ -549,6 +549,82 @@ _ssh_harden() {
 	done
 }
 
+# ---------------------------------------------------------------------------
+# The installed report -- every tool this script is responsible for (plus
+# gh, which it does not install but every next step needs), with the version
+# and path it answers with once the steps have run. "ok" in the
+# summary says a step finished; this says what is actually on the machine,
+# which is what a person comparing two boxes, or reading a bug report, needs.
+#
+# Asked of each tool itself (`--version`), not of the package manager: the
+# copy on PATH is the one that runs, and uv, claude and pwsh do not come from
+# the package manager at all. ~/.local/bin is searched too, because the run
+# that installed uv and claude into it has not got it on PATH yet.
+# ---------------------------------------------------------------------------
+_REPORT_TOOLS=(git make cc cmake pkg-config curl awk ssh gh uv pwsh claude)
+
+# _tool_path NAME -- where NAME runs from, or nothing.
+_tool_path() {
+	command -v "$1" 2>/dev/null && return 0
+	if [[ -x "${HOME}/.local/bin/$1" ]]; then
+		printf '%s\n' "${HOME}/.local/bin/$1"
+	fi
+}
+
+# _tool_version NAME PATH -- the first dotted version in what the tool says
+# about itself: `cc (Debian 14.2.0-19) 14.2.0` -> 14.2.0, `OpenSSH_10.0p2`
+# -> 10.0p2. A tool that runs but names no version prints "?"; one that dies
+# trying (pwsh without ICU) prints "does not run".
+_tool_version() {
+	local name="$1" path="$2" out
+	local -a to=()
+	_have timeout && to=(timeout 20)
+	case "${name}" in
+	ssh) out="$("${to[@]}" "${path}" -V 2>&1)" || out="" ;;
+	awk) out="$("${to[@]}" "${path}" -W version 2>&1 ||
+		"${to[@]}" "${path}" --version 2>&1)" || out="" ;;
+	*) out="$("${to[@]}" "${path}" --version 2>&1)" || out="" ;;
+	esac
+	out="${out%%$'\n'*}"
+	local re='[0-9]+(\.[0-9]+)+[a-z0-9]*'
+	if [[ ${out} =~ ${re} ]]; then
+		printf '%s\n' "${BASH_REMATCH[0]}"
+	elif [[ -n ${out} ]]; then
+		printf '?\n'
+	else
+		printf 'does not run\n'
+	fi
+}
+
+_installed_report() {
+	local name path ver
+	# Off in the test suite: it runs every tool's --version, and a test whose
+	# stub ssh records its calls would record `-V` instead.
+	[[ ${JB_INSTALLED_REPORT:-1} == 0 ]] && return 0
+	if [[ ${DRY_RUN} -eq 1 ]]; then
+		_say "installed (as of now: this dry run changed nothing)"
+	else
+		_say "installed"
+	fi
+	for name in "${_REPORT_TOOLS[@]}"; do
+		path="$(_tool_path "${name}")"
+		if [[ -z ${path} ]]; then
+			printf '    %-18s %s\n' "${name}" "missing"
+			continue
+		fi
+		ver="$(_tool_version "${name}" "${path}")"
+		printf '    %-18s %-12s %s\n' "${name}" "${ver}" "${path}"
+		# The lint gate's module, which the pwsh step installs with it.
+		if [[ ${name} == pwsh && ${ver} != "does not run" ]]; then
+			# shellcheck disable=SC2016  # $m is PowerShell's, not bash's
+			ver="$("${path}" -NoProfile -NonInteractive -Command \
+				'$m = Get-Module -ListAvailable PSScriptAnalyzer | Select-Object -First 1; if ($m) { $m.Version.ToString() }' \
+				2>/dev/null || true)"
+			printf '    %-18s %s\n' "  PSScriptAnalyzer" "${ver:-missing}"
+		fi
+	done
+}
+
 # _ssh_github_check KEY -- ask GitHub whether it accepts KEY, and put the
 # answer in the summary. A key that exists is not a key that works: until it
 # is on the account every clone over ssh fails, and that failure used to be
@@ -1454,5 +1530,7 @@ _say "summary"
 for _r in "${_RESULTS[@]+"${_RESULTS[@]}"}"; do
 	_say "    ${_r}"
 done
+_say ""
+_installed_report
 _say ""
 _say "open a new shell, or run: exec bash -l"

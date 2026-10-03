@@ -267,6 +267,23 @@ done
 unset _lib _lib_path
 
 # ---------------------------------------------------------------------------
+# _RELOAD — why the shell that ran this is out of date, if it is. The closing
+# "open a new shell" hint is printed only with a reason: it used to be
+# printed after every run, `-s ssh` included, which changes nothing a running
+# shell reads. Set by the two helpers below when they change (or, dry run,
+# would change) a file the shell sources at startup, and at the end when a
+# tool landed in ~/.local/bin while that is not on the caller's PATH.
+# ---------------------------------------------------------------------------
+_RELOAD=()
+_reload_because() {
+	local why="$1" r
+	for r in "${_RELOAD[@]+"${_RELOAD[@]}"}"; do
+		[[ ${r} == "${why}" ]] && return 0
+	done
+	_RELOAD+=("${why}")
+}
+
+# ---------------------------------------------------------------------------
 # _install_file SRC DEST — copy when the content differs, keeping a .bak of
 # anything it replaces. Reports which of the three happened.
 # ---------------------------------------------------------------------------
@@ -282,6 +299,7 @@ _install_file() {
 	else
 		_info "creating:   ${dest}"
 	fi
+	_reload_because "${dest##*/} changed"
 	_run cp "${src}" "${dest}"
 	_run chmod 0644 "${dest}"
 }
@@ -298,6 +316,7 @@ _source_line() {
 		_info "already sourced from ${file}"
 		return 0
 	fi
+	_reload_because "${file##*/} now sources just-bashit"
 	if [[ ${DRY_RUN} -eq 1 ]]; then
 		_info "would append to ${file}: ${line}"
 		return 0
@@ -486,7 +505,6 @@ step_shell() {
 	fi
 
 	_info "customise by adding *.sh to ${PREFIX}/bashrc.d/"
-	_info "apply now with: exec bash -l"
 	_result "shell:   ok (${PREFIX})"
 }
 
@@ -1533,4 +1551,22 @@ done
 _say ""
 _installed_report
 _say ""
-_say "open a new shell, or run: exec bash -l"
+# A tool in ~/.local/bin that the calling shell cannot find yet: uv and
+# claude install there, and on a fresh box the PATH line that names it is
+# exactly what this run just wrote.
+case ":${PATH}:" in
+*":${HOME}/.local/bin:"*) ;;
+*)
+	for _t in uv claude; do
+		if [[ -x "${HOME}/.local/bin/${_t}" ]]; then
+			_reload_because "${HOME}/.local/bin is not on this shell's PATH"
+		fi
+	done
+	;;
+esac
+if [[ ${#_RELOAD[@]} -gt 0 ]]; then
+	_say "open a new shell, or run: exec bash -l"
+	for _r in "${_RELOAD[@]}"; do
+		_say "    (${_r})"
+	done
+fi

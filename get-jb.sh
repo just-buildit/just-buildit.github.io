@@ -141,15 +141,24 @@ _jb_install() {
 
 	# -- uv (enables Python PEP 723 dep resolution) ---------------------------
 
+	# uv's installer needs awk, and a minimal Debian 13 WSL image has none:
+	# it ran anyway, failed its checksum ("got:" empty), and this block still
+	# said "uv installed" (2026-10-03). So: skip with the reason when awk is
+	# missing, and claim success only when the binary exists.
+	# `jbx setup-system` installs awk (baseline) and then uv (tools step).
 	if command -v uv >/dev/null 2>&1; then
 		_jb_ok "uv found — Python PEP 723 support ready"
+	elif ! command -v awk >/dev/null 2>&1; then
+		_jb_warn "uv skipped — its installer needs awk; jbx setup-system installs both"
 	else
 		_jb_say "installing uv (Python PEP 723 support)"
-		"${INSTALL_DIR}/just-runit" https://astral.sh/uv/install.sh
+		"${INSTALL_DIR}/just-runit" https://astral.sh/uv/install.sh || true
 		if command -v uv >/dev/null 2>&1; then
 			_jb_ok "uv installed"
-		else
+		elif [[ -x "${HOME}/.local/bin/uv" ]]; then
 			_jb_warn "uv installed — open a new shell if 'uv' isn't found"
+		else
+			_jb_warn "uv was NOT installed — jbx setup-system installs it"
 		fi
 	fi
 

@@ -32,6 +32,32 @@ _JBS_LIBS=(
 	pkg toml windows
 )
 
+# ---- bootstrap.toml ------------------------------------------------------------
+
+# _tool_sources FILE -- every `source = "..."` value inside a [tools.*]
+# section, one per line. Pure bash for the reason _lookup_alias is: jbx must
+# run on a machine with no awk, since installing one is setup-system's job.
+_tool_sources() {
+	local line in_t=0
+	local source_re='^[[:space:]]*source[[:space:]]*=[[:space:]]*"([^"]*)"'
+	while IFS= read -r line || [[ -n ${line} ]]; do
+		case "${line}" in
+		'[tools.'*)
+			in_t=1
+			continue
+			;;
+		'['*)
+			in_t=0
+			continue
+			;;
+		*) ;;
+		esac
+		if [[ ${in_t} -eq 1 && ${line} =~ ${source_re} ]]; then
+			printf '%s\n' "${BASH_REMATCH[1]}"
+		fi
+	done <"${1}"
+}
+
 # ---- portable checksums -----------------------------------------------------
 # GNU coreutils' sha256sum/md5sum are absent on macOS/BSD, where the tools are
 # shasum/md5 — a fetch there died with "sha256sum: command not found". Prefer
@@ -165,13 +191,7 @@ if [[ ${_ME} == "just-runit" ]]; then
 		fi
 		printf '  reading %s\n' "${_toml}"
 		# Extract all source = "..." values from [tools.*] sections.
-		mapfile -t _sources < <(awk '
-			/^\[tools\./ { in_t=1; next }
-			/^\[/        { in_t=0 }
-			in_t && /^[[:space:]]*source[[:space:]]*=/ {
-				gsub(/.*=[[:space:]]*"|".*/, ""); print
-			}
-		' "${_toml}")
+		mapfile -t _sources < <(_tool_sources "${_toml}")
 		if [[ ${#_sources[@]} -eq 0 ]]; then
 			echo "${_ME}: no [tools.*] entries with source in ${_toml}"
 			exit 0
@@ -362,17 +382,39 @@ _lookup_alias() {
 			>"$(_meta_path "${aliases_cache}")"
 	fi
 
-	# Parse: find key under [aliases] section.
-	awk -v target="${name}" '
-		/^\[aliases\]/ { in_sec=1; next }
-		/^\[/          { in_sec=0 }
-		in_sec && /^[[:space:]]*[^#=[:space:]]/ {
-			split($0, a, /[[:space:]]*=[[:space:]]*/)
-			key = a[1]; gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
-			val = a[2]; gsub(/^[[:space:]"]+|["[:space:]]+$/, "", val)
-			if (key == target) { print val; exit }
-		}
-	' "${aliases_cache}"
+	# Parse: find key under [aliases] section. Pure bash, not awk: this is
+	# the first thing `jbx setup-system` does on a new machine, and a minimal
+	# Debian 13 WSL image ships no awk at all -- setup-system, which installs
+	# one, could not even be resolved (2026-10-03).
+	local line in_sec=0 key val
+	local entry_re='^[[:space:]]*([^#=[:space:]][^=]*)=(.*)$'
+	local value_re='^[[:space:]"]*(.*[^[:space:]"])[[:space:]"]*$'
+	while IFS= read -r line || [[ -n ${line} ]]; do
+		case "${line}" in
+		'[aliases]'*)
+			in_sec=1
+			continue
+			;;
+		'['*)
+			in_sec=0
+			continue
+			;;
+		*) ;;
+		esac
+		[[ ${in_sec} -eq 1 && ${line} =~ ${entry_re} ]] || continue
+		key="${BASH_REMATCH[1]}"
+		key="${key%"${key##*[![:space:]]}"}"
+		val="${BASH_REMATCH[2]}"
+		if [[ ${val} =~ ${value_re} ]]; then
+			val="${BASH_REMATCH[1]}"
+		else
+			val=""
+		fi
+		if [[ ${key} == "${name}" ]]; then
+			printf '%s\n' "${val}"
+			return 0
+		fi
+	done <"${aliases_cache}"
 }
 
 # Probe whether a URL exists (HEAD, no download).  Returns 0 if 2xx/3xx.
@@ -664,10 +706,10 @@ PYEOF
 		return
 	fi
 	bash -c "
-        _b=\$(declare -F | awk '{print \$3}')
+        _b=\$(compgen -A function)
         # shellcheck source=/dev/null
         source '${script}' 2>/dev/null || true
-        _a=\$(declare -F | awk '{print \$3}')
+        _a=\$(compgen -A function)
         comm -13 <(printf '%s\n' \${_b} | sort) \
                  <(printf '%s\n' \${_a} | sort)
     "

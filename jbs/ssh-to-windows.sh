@@ -118,7 +118,8 @@ command -v wslpath >/dev/null 2>&1 ||
 # reached over ssh (windows.sh says why).
 ICACLS="$(win-exe icacls.exe)" ||
 	_die "icacls.exe not found; WSL interop with Windows must be enabled"
-CMD="$(win-exe cmd.exe)" ||
+# Checked here, not only inside win-home, so its absence gets this message.
+win-exe cmd.exe >/dev/null ||
 	_die "cmd.exe not found; WSL interop with Windows must be enabled"
 WHOAMI="$(win-exe whoami.exe)" ||
 	_die "whoami.exe not found; WSL interop with Windows must be enabled"
@@ -127,19 +128,11 @@ SRC_DIR="${HOME}/.ssh"
 [[ -d ${SRC_DIR} ]] || _die "${SRC_DIR} does not exist — no keys to publish"
 
 # ── Where Windows keeps the profile ─────────────────────────────────────────
-# Asked of Windows rather than assembled from a guess: the profile is not
-# always C:\Users\<linux username>, and on a domain-joined machine it is
-# frequently neither. cmd.exe is run from /mnt/c because it warns (loudly, on
-# stderr, every call) when its working directory is a Linux path.
+# win-home (windows.sh) asks Windows, the same lookup setup-system's ssh step
+# uses to adopt the box key from here.
 
-_win_home_raw="$( (
-	cd /mnt/c 2>/dev/null || true
-	"${CMD}" /c 'echo %USERPROFILE%' 2>/dev/null
-) | tr -d '\r\n')" || _win_home_raw=""
-[[ -n ${_win_home_raw} ]] || _die "could not resolve %USERPROFILE% through cmd.exe"
-
-WIN_HOME="$(wslpath -u "${_win_home_raw}")"
-[[ -d ${WIN_HOME} ]] || _die "%USERPROFILE% resolved to ${WIN_HOME}, which is not a directory"
+WIN_HOME="$(win-home)" ||
+	_die "could not resolve %USERPROFILE% to a directory through cmd.exe"
 
 DEST_DIR="${WIN_HOME}/.ssh"
 
@@ -192,7 +185,8 @@ if [[ ! -d ${DEST_DIR} ]]; then
 	_run mkdir -p "${DEST_DIR}"
 fi
 
-DEST_DIR_WIN="$(wslpath -w "${DEST_DIR}" 2>/dev/null || printf '%s\\.ssh' "${_win_home_raw}")"
+DEST_DIR_WIN="$(wslpath -w "${DEST_DIR}" 2>/dev/null ||
+	printf '%s\\.ssh' "$(wslpath -w "${WIN_HOME}")")"
 _note "acl ${DEST_DIR_WIN}"
 _run "${ICACLS}" "${DEST_DIR_WIN}" /inheritance:r /grant:r "${WIN_USER}:(OI)(CI)F"
 

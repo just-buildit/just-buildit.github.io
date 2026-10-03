@@ -260,10 +260,18 @@ jobs:
               runs-on: ubuntu-latest
             mirror:
               needs: ci-passed
+              if: always() && needs.ci-passed.result == 'success'
               runs-on: ubuntu-latest
           EOF
           gate || { cat "$tmp/log"; echo "::error::a wired ci.yml was refused"; exit 1; }
           grep -q "7 job(s)" "$tmp/log" || { cat "$tmp/log"; echo "::error::wrong job count"; exit 1; }
+
+          # SABOTAGE: a job after the aggregator with no always(): GitHub's
+          # implicit success() skips it whenever the matrix was skipped.
+          sed -i "s/if: always() \&\& needs.ci-passed.result == 'success'/if: github.event_name == 'push'/" "$w"
+          refuse "a post-CI job without always()" "  mirror"
+          sed -i "s/if: github.event_name == 'push'/if: always() \&\& needs.ci-passed.result == 'success'/" "$w"
+          gate || { cat "$tmp/log"; echo "::error::restoring always() did not pass"; exit 1; }
 
           # SABOTAGE: a job that needs changes but never reads its outputs.
           sed -i "/^  lint:/,/^  test:/{/if: needs.changes/d}" "$w"

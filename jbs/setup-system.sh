@@ -348,21 +348,27 @@ _find_bootstrap_toml() {
 # in this file rather than beside it because the jbs Pages mirror copies
 # only *.sh: a sibling .toml would never reach a standalone jbx run.
 #
+# awk is in it because a minimal Debian 13 WSL image ships none
+# (2026-10-03), and the steps after this one need it: uv's installer, the
+# bashrc template, windows.sh. jbx and install-deps themselves are awk-free,
+# so this list installs on a box without one. mawk on apt (Debian's own
+# default awk), gawk elsewhere; apk's busybox and macOS already have one.
+#
 # Deliberately a toolchain and nothing more. Language runtimes and project
 # libraries (python3-dev, numpy, rust) are a project's to declare, in its
 # own bootstrap.toml, which this step still installs afterwards.
 read -r -d '' _BASELINE_TOML <<-'EOF' || true
 	[baseline.apt]
-	packages = ["build-essential", "cmake", "pkg-config", "git", "curl", "ca-certificates", "openssh-client", "tar"]
+	packages = ["build-essential", "cmake", "pkg-config", "git", "curl", "ca-certificates", "openssh-client", "tar", "mawk"]
 
 	[baseline.pacman]
-	packages = ["base-devel", "cmake", "pkgconf", "git", "curl", "openssh", "tar"]
+	packages = ["base-devel", "cmake", "pkgconf", "git", "curl", "openssh", "tar", "gawk"]
 
 	[baseline.dnf]
-	packages = ["gcc", "make", "cmake", "pkgconf-pkg-config", "diffutils", "git", "curl", "openssh-clients", "tar"]
+	packages = ["gcc", "make", "cmake", "pkgconf-pkg-config", "diffutils", "git", "curl", "openssh-clients", "tar", "gawk"]
 
 	[baseline.zypper]
-	packages = ["gcc", "make", "cmake", "pkg-config", "diffutils", "git", "curl", "openssh", "tar"]
+	packages = ["gcc", "make", "cmake", "pkg-config", "diffutils", "git", "curl", "openssh", "tar", "gawk"]
 
 	[baseline.apk]
 	packages = ["build-base", "cmake", "pkgconf", "bash", "git", "curl", "openssh-keygen", "tar"]

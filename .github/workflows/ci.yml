@@ -203,6 +203,103 @@ jobs:
           make -f standard.mk workflow-dispatch-check TEST_CMD=x TEST_FAST_CMD=x CLEAN_PATHS=x
           echo "OK — workflow-dispatch-check: three spellings, reusable exempt, push-only and empty refused."
 
+      - name: ci-changes-wiring-check refuses a ci.yml job that ignores changes
+        # Each tree that lands on main is tested once (just-makeit#1801) only
+        # if ci.yml asks the vendored changes job and every job listens.
+        # just-bashit and just-buildit vendored ci-tree-tested and never
+        # asked, so every merge re-ran the matrix (2026-10-03). The passing
+        # shapes, every `needs:` spelling, each sabotage, the empty walk.
+        run: |
+          tmp="$(mktemp -d)"; cp standard.mk "$tmp/"
+          printf '%s\n' 'HAS_RELEASE = 1' 'BUMP_VERSION_CMD = true' \
+            'RELEASE_WATCH_CMD = true' 'VERSION_PROBES = v|echo 1' \
+            'TEST_CMD = @echo t' 'TEST_FAST_CMD = @echo t' 'CLEAN_PATHS = d/' \
+            'include standard.mk' > "$tmp/Makefile"
+          mkdir -p "$tmp/.github/workflows"; w="$tmp/.github/workflows/ci.yml"
+          gate() { make -s -C "$tmp" ci-changes-wiring-check > "$tmp/log" 2>&1; }
+          refuse() {
+            if gate; then cat "$tmp/log"; echo "::error::$1 passed"; exit 1; fi
+            grep -q -- "$2" "$tmp/log" \
+              || { cat "$tmp/log"; echo "::error::$1: no '$2' in the refusal"; exit 1; }
+          }
+
+          # No ci.yml is inert.
+          gate || { cat "$tmp/log"; exit 1; }
+
+          # Passing: inline, flow and block `needs:`, a folded `if:`, the
+          # aggregator, and a job that runs after it.
+          cat > "$w" <<'EOF'
+          on: [push, pull_request]
+          jobs:
+            changes:
+              uses: ./.github/workflows/changes.yml
+            lint:
+              needs: changes
+              if: needs.changes.outputs.src == 'true'
+              runs-on: ubuntu-latest
+            test:
+              needs: [changes, lint]
+              if: >-
+                needs.changes.outputs.src == 'true' &&
+                needs.changes.outputs.code != 'false'
+              runs-on: ubuntu-latest
+            docs:
+              needs:
+                - changes
+              if: needs.changes.outputs.docs == 'true'
+              runs-on: ubuntu-latest
+            ci-passed:
+              name: CI passed
+              needs: [changes, lint, test, docs]
+              if: always()
+              runs-on: ubuntu-latest
+            mirror:
+              needs: ci-passed
+              runs-on: ubuntu-latest
+          EOF
+          gate || { cat "$tmp/log"; echo "::error::a wired ci.yml was refused"; exit 1; }
+          grep -q "6 job(s)" "$tmp/log" || { cat "$tmp/log"; echo "::error::wrong job count"; exit 1; }
+
+          # SABOTAGE: a job that needs changes but never reads its outputs.
+          sed -i "/^  lint:/,/^  test:/{/if: needs.changes/d}" "$w"
+          refuse "a job with no if:" "  lint"
+
+          # SABOTAGE: a job that reads the outputs but never needs the job.
+          cat > "$w" <<'EOF'
+          jobs:
+            changes:
+              uses: ./.github/workflows/changes.yml
+            stray:
+              if: needs.changes.outputs.src == 'true'
+              runs-on: ubuntu-latest
+            ci-passed:
+              name: CI passed
+              needs: [changes, stray]
+              if: always()
+          EOF
+          refuse "a job not waiting on changes" "  stray"
+
+          # SABOTAGE: no call, then no aggregator.
+          sed -i 's|uses: ./.github/workflows/changes.yml|runs-on: ubuntu-latest|' "$w"
+          refuse "a ci.yml with no changes call" "no job calling"
+          printf 'jobs:\n  changes:\n    uses: ./.github/workflows/changes.yml\n' > "$w"
+          refuse "a ci.yml with no aggregator" "no job named 'CI passed'"
+
+          # SABOTAGE: nothing parses as a job.
+          printf 'on: push\njobs: {}\n' > "$w"
+          refuse "an empty walk" "no job was parsed"
+
+          # The vendored workflow asks the Makefile for the aggregator's
+          # name -- it must hold no literal copy of it.
+          [ "$(make -s -C "$tmp" ci-check-name)" = "CI passed" ] \
+            || { echo "::error::ci-check-name"; exit 1; }
+          grep -q 'make -s ci-check-name' github/workflows/changes.yml \
+            || { echo "::error::changes.yml does not read ci-check-name"; exit 1; }
+          if grep -nE '^[^#]*CI_CHECK(_NAME)?=.?"?CI passed' github/workflows/changes.yml; then
+            echo "::error::changes.yml carries a literal check name"; exit 1
+          fi
+          echo "OK — ci-changes-wiring-check passes the wired shapes and names each stray."
+
       - name: standard-update fetches a newly vendored file in ONE run
         # just-buildit.github.io#76: the vendored list is the one the running
         # make parsed from the OLD standard.mk, so a canonical that adds a

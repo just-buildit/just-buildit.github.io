@@ -284,6 +284,16 @@ jobs:
           EOF
           refuse "a job not waiting on changes" "  stray"
 
+          # Always-run by declaration: excused, and named in the summary.
+          # A declared name with no such job is refused.
+          make -s -C "$tmp" ci-changes-wiring-check CI_ALWAYS_RUN_JOBS=stray > "$tmp/log" 2>&1 \
+            || { cat "$tmp/log"; echo "::error::a declared always-run job was refused"; exit 1; }
+          grep -q "1 declared always-run" "$tmp/log" || { cat "$tmp/log"; echo "::error::count"; exit 1; }
+          if make -s -C "$tmp" ci-changes-wiring-check CI_ALWAYS_RUN_JOBS="stray gone" > "$tmp/log" 2>&1; then
+            cat "$tmp/log"; echo "::error::a stale always-run name passed"; exit 1
+          fi
+          grep -q "  gone" "$tmp/log" || { cat "$tmp/log"; echo "::error::stale name not named"; exit 1; }
+
           # SABOTAGE: no call, then no aggregator.
           sed -i 's|uses: ./.github/workflows/changes.yml|runs-on: ubuntu-latest|' "$w"
           refuse "a ci.yml with no changes call" "no job calling"

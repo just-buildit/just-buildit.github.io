@@ -1087,6 +1087,70 @@ _pwsh_install_linux() {
 }
 
 # ---------------------------------------------------------------------------
+# _pwsh_icu_apt — the ICU runtime's apt name, which Debian and Ubuntu version
+# by soname (libicu76 on Debian 13, libicu74 on Ubuntu 24.04), so it is
+# derived from apt's own lists rather than typed: a hardcoded name is right
+# on exactly one release. The newest is taken; ICU sonames install side by
+# side, so an older one already present is left alone.
+#
+# Prints nothing where there is no apt-cache, or where apt's lists are
+# empty (a container that never ran `apt-get update`).
+# ---------------------------------------------------------------------------
+_pwsh_icu_apt() {
+	_have apt-cache || return 0
+	apt-cache pkgnames libicu 2>/dev/null |
+		grep -E '^libicu[0-9]+$' | sort -V | tail -n 1 || true
+}
+
+# ---------------------------------------------------------------------------
+# _pwsh_icu — the ICU runtime the Linux tarball needs and does not carry.
+#
+# .NET aborts at startup without it ("Couldn't find a valid ICU package
+# installed on the system"), before PowerShell parses a single argument, so
+# a pwsh unpacked onto a minimal Debian answered nothing: not --version, not
+# the PSScriptAnalyzer probe, not the lint gate. Measured on a Debian 13
+# WSL2 box, 2026-10-03.
+#
+# Runs on every Linux pass, not only after a fresh unpack: a pwsh installed
+# by an earlier run that lacked this step is the box this fixes. It goes
+# through install-deps like the baseline does, so the install, the dry run
+# and sudo behave the same way. Names checked 2026-10-03: pacman `icu`,
+# dnf `libicu`, apk `icu-libs` (Microsoft's per-distro dependency lists).
+# zypper is absent deliberately: openSUSE versions the name too, with a
+# suffix scheme not verified here, so install-deps says it has nothing for
+# zypper rather than this step guessing.
+# ---------------------------------------------------------------------------
+_pwsh_icu() {
+	local installer manifest apt_name rc=0
+	installer="$(_asset install-deps.sh)" || {
+		_warn "install-deps.sh unavailable — cannot install ICU"
+		return 1
+	}
+	apt_name="$(_pwsh_icu_apt)"
+	manifest="$(mktemp "${TMPDIR:-/tmp}/jb-icu.XXXXXX")"
+	{
+		if [[ -n ${apt_name} ]]; then
+			printf '[icu.apt]\npackages = ["%s"]\n\n' "${apt_name}"
+		fi
+		printf '[icu.pacman]\npackages = ["icu"]\n\n'
+		printf '[icu.dnf]\npackages = ["libicu"]\n\n'
+		printf '[icu.apk]\npackages = ["icu-libs"]\n'
+	} >"${manifest}"
+	_install_manifest "${installer}" "${manifest}" \
+		"the PowerShell runtime (ICU)" || rc=1
+	rm -f "${manifest}"
+	return "${rc}"
+}
+
+# _pwsh_starts — true when the interpreter actually runs. Being on PATH is
+# not that: the tarball's pwsh resolves and then aborts without ICU, and an
+# "already installed" that only checked PATH reported it as fine.
+_pwsh_starts() {
+	"${_PWSH_BIN}" -NoProfile -NonInteractive -Command 'exit 0' \
+		>/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------------------
 # _pwsh_install_darwin — Homebrew, because the tarball above is a LINUX
 # build. Downloading it on a Mac would install something that cannot run,
 # and the first sign of it would be an exec format error from the lint gate.
@@ -1126,9 +1190,21 @@ step_pwsh() {
 	_head "pwsh — PowerShell and PSScriptAnalyzer"
 	_pwsh_uname_init
 
+	# Before the PATH check, so a pwsh an earlier run left unable to start
+	# gets its runtime too. A failure here is reported by _pwsh_starts below,
+	# which is the check that matters.
+	if [[ ${_UNAME_S} == Linux ]]; then
+		_pwsh_icu || _warn "the ICU install failed — pwsh may not start"
+	fi
+
 	local rc=0
 	if _have "${_PWSH_BIN}"; then
-		_info "pwsh already installed ($("${_PWSH_BIN}" --version 2>/dev/null || echo ok))"
+		if ! _pwsh_starts; then
+			_warn "pwsh is installed but does not start — run it to see why"
+			_result "pwsh:    failed (does not start)"
+			return 0
+		fi
+		_info "pwsh already installed ($("${_PWSH_BIN}" --version))"
 	else
 		case "${_UNAME_S}" in
 		Linux) _pwsh_install_linux || rc=$? ;;

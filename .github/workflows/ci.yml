@@ -248,9 +248,14 @@ jobs:
                 - changes
               if: needs.changes.outputs.docs == 'true'
               runs-on: ubuntu-latest
+            wheel:
+              needs:
+                [changes, lint]
+              if: needs.changes.outputs.src == 'true'
+              runs-on: ubuntu-latest
             ci-passed:
               name: CI passed
-              needs: [changes, lint, test, docs]
+              needs: [changes, lint, test, docs, wheel]
               if: always()
               runs-on: ubuntu-latest
             mirror:
@@ -258,7 +263,7 @@ jobs:
               runs-on: ubuntu-latest
           EOF
           gate || { cat "$tmp/log"; echo "::error::a wired ci.yml was refused"; exit 1; }
-          grep -q "6 job(s)" "$tmp/log" || { cat "$tmp/log"; echo "::error::wrong job count"; exit 1; }
+          grep -q "7 job(s)" "$tmp/log" || { cat "$tmp/log"; echo "::error::wrong job count"; exit 1; }
 
           # SABOTAGE: a job that needs changes but never reads its outputs.
           sed -i "/^  lint:/,/^  test:/{/if: needs.changes/d}" "$w"

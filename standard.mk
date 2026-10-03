@@ -1080,7 +1080,8 @@ ci-check-name: ## Print CI_CHECK_NAME, the aggregate check's name
 # exists to stop, and is named. No call, no aggregator, or a file that parses
 # no job at all is refused: a gate that matched nothing is indistinguishable
 # from one that passed. POSIX awk with learned indentation, like
-# workflow-timeout-check; `needs:` is read inline, as a flow list, or as a
+# workflow-timeout-check; `needs:` is read inline, as a flow list (on its
+# line or the next -- just-buildit's aggregator writes it that way), or as a
 # block list.
 lint: ci-changes-wiring-check
 
@@ -1115,7 +1116,7 @@ ci-changes-wiring-check: ## Verify GATES_CI_FILE gates every job on the vendored
 	       else if ($$0 ~ /^ *needs:/) { v = val($$0); if (v == "") inneeds = 1; else addneeds(job, v) } \
 	       next \
 	     } \
-	     if (inneeds && $$0 ~ /^ *- /) { v = $$0; sub(/^ *- */, "", v); addneeds(job, v) } \
+	     if (inneeds) { v = $$0; sub(/^ *(- *)?/, "", v); addneeds(job, v) } \
 	   } \
 	   END { \
 	     print "TOTAL " total + 0; \

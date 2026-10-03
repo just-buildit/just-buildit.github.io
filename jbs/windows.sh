@@ -55,6 +55,33 @@ win-exe() {
 	return 1
 }
 
+# win-home -- this Windows user's profile directory (%USERPROFILE%) as a path
+# this shell can open, or return 1 when there is no Windows to ask.
+#
+# Asked of Windows rather than assembled from a guess: the profile is not
+# always C:\Users\<linux username>, and on a domain-joined machine it is
+# frequently neither. cmd.exe runs from /mnt/c because it warns (loudly, on
+# stderr, every call) when its working directory is a Linux path.
+#
+# The one lookup: ssh-to-windows publishes keys INTO this profile, and
+# setup-system's ssh step adopts the box key FROM it.
+#
+# Example:
+#   . windows.sh
+#   home="$(win-home)" && ls "${home}/.ssh"
+win-home() {
+	local cmd raw home
+	cmd="$(win-exe cmd.exe)" || return 1
+	raw="$( (
+		cd /mnt/c 2>/dev/null || true
+		"${cmd}" /c 'echo %USERPROFILE%' 2>/dev/null
+	) | tr -d '\r\n')" || raw=""
+	[[ -n ${raw} && ${raw} != '%USERPROFILE%' ]] || return 1
+	home="$(wslpath -u "${raw}" 2>/dev/null)" || return 1
+	[[ -d ${home} ]] || return 1
+	printf '%s\n' "${home}"
+}
+
 # win-admin-channel -- print the ssh destination (user@host) of this
 # machine's OWN Windows sshd when WSL can reach it as an elevated admin, or
 # return 1. With it, every elevated step after a box's first runs over ssh:
@@ -75,11 +102,30 @@ win-exe() {
 # Built here, at source time, not inside win-admin-channel: callers run that
 # in $(...), a subshell, so an option it added would never reach them.
 WIN_SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new)
-# The same name setup-system's ssh step gives the key. Derived once, with a
-# fallback, and required to be a FILE: a box with no hostname command (a
-# minimal Fedora image) made the path ~/.ssh/ -- a readable directory -- and
-# the second, failing $(hostname) then killed any `set -e` caller with 127.
-_win_key="$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)"
+# ssh-key-name -- the default ssh key filename: this machine's short name.
+#
+# The ONE derivation: setup-system's ssh step names the key with it, and the
+# admin channel below finds the key with it, so the two cannot disagree. It
+# lives here because windows.sh is the library both of them load.
+#
+# Bash's own $HOSTNAME, not hostname(1): Fedora's WSL image has no hostname
+# command, so `hostname -s || hostname || echo id_ed25519` named every key
+# there `id_ed25519`, commented `matt@id_ed25519` (FedoraLinux-44 on
+# swiftgo-ultra7, 2026-10-03). Bash sets HOSTNAME from gethostname() at
+# startup; an inherited value wins, which is what lets a test pin it.
+#
+# Example:
+#   $ HOSTNAME=box.example.org bash -c '. windows.sh; ssh-key-name'
+#   box
+ssh-key-name() {
+	local name="${HOSTNAME:-}"
+	name="${name%%.*}"
+	printf '%s\n' "${name:-id_ed25519}"
+}
+
+# Required to be a FILE: a name that came out empty made the path ~/.ssh/ --
+# a readable directory -- and ssh rejected it.
+_win_key="$(ssh-key-name)"
 if [[ -n ${_win_key} && -f "${HOME}/.ssh/${_win_key}" ]]; then
 	WIN_SSH_OPTS+=(-i "${HOME}/.ssh/${_win_key}")
 fi

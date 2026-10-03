@@ -549,6 +549,53 @@ _ssh_harden() {
 	done
 }
 
+# _ssh_github_check KEY -- ask GitHub whether it accepts KEY, and put the
+# answer in the summary. A key that exists is not a key that works: until it
+# is on the account every clone over ssh fails, and that failure used to be
+# the first sign. `ssh -T git@github.com` answers "Hi <user>! You've
+# successfully authenticated" for a registered key (exit 1: no shell) and
+# "Permission denied (publickey)" for one that is not.
+#
+# -i with IdentitiesOnly, so the answer is about THIS key and not whatever
+# the agent holds; BatchMode, so a passphrase prompt cannot hang the run. A
+# passphrase-protected key that is not in the agent cannot be tested that
+# way, and is reported as exactly that, never as "not registered".
+# JB_SSH_GITHUB_CHECK=0 turns the check off (the test suite, offline boxes).
+_ssh_github_check() {
+	local key="$1" out user
+	[[ ${JB_SSH_GITHUB_CHECK:-1} == 0 ]] && return 0
+	if [[ ${DRY_RUN} -eq 1 ]]; then
+		_info "would test ${key} against git@github.com"
+		return 0
+	fi
+	if ! _have ssh; then
+		_result "github:  not tested (no ssh client)"
+		return 0
+	fi
+	out="$(ssh -T -i "${key}" -o IdentitiesOnly=yes -o BatchMode=yes \
+		-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+		git@github.com 2>&1 || true)"
+	local hi_re="Hi ([^!]+)! You.ve successfully authenticated"
+	if [[ ${out} =~ ${hi_re} ]]; then
+		user="${BASH_REMATCH[1]}"
+		_info "GitHub accepts ${key} (account ${user})"
+		_result "github:  ok (${key##*/} authenticates as ${user})"
+	elif [[ ${out} == *"Permission denied"* ]]; then
+		if _have ssh-keygen && ! ssh-keygen -y -P '' -f "${key}" >/dev/null 2>&1 &&
+			! { ssh-add -L 2>/dev/null | grep -qF -- "$(cut -d' ' -f2 "${key}.pub")"; }; then
+			_info "${key} has a passphrase and is not in ssh-agent, so it cannot be tested unattended"
+			_info "test it by hand: ssh -T -i ${key} git@github.com"
+			_result "github:  not tested (passphrase: ssh-add ${key}, then ssh -T git@github.com)"
+		else
+			_warn "GitHub does not accept ${key} — add it: gh ssh-key add ${key}.pub --title '${key##*/}'"
+			_result "github:  NOT registered (gh ssh-key add ${key}.pub --title '${key##*/}')"
+		fi
+	else
+		_warn "could not ask GitHub about ${key}: ${out##*$'\n'}"
+		_result "github:  not tested (github.com unreachable over ssh)"
+	fi
+}
+
 # ssh — directory permissions, then a key if the user has none.
 step_ssh() {
 	_head "ssh — agent keys"
@@ -561,19 +608,48 @@ step_ssh() {
 	_run mkdir -p "${dir}"
 	_ssh_harden "${dir}"
 
+	local name="${KEY_NAME}"
+	if [[ -z ${name} ]]; then
+		name="$(ssh-key-name)"
+	fi
+	local key="${dir}/${name}"
+
 	# Any private key with a matching .pub counts; a machine that already
-	# has an identity does not need another one.
-	local pub existing=0
+	# has an identity does not need another one. The one GitHub is asked
+	# about is the box key when it is among them, else the last one found.
+	local pub found=""
 	for pub in "${dir}"/*.pub; do
 		[[ -r ${pub} ]] || continue
 		[[ -r ${pub%.pub} ]] || continue
-		existing=1
-		_log "found key ${pub%.pub}"
+		found="${pub%.pub}"
+		_log "found key ${found}"
 	done
 
-	if [[ ${existing} -eq 1 ]]; then
+	if [[ -n ${found} ]]; then
+		[[ -r ${key} && -r ${key}.pub ]] && found="${key}"
 		_info "existing key(s) found in ${dir} — not generating another"
 		_result "ssh:     ok (existing key)"
+		_ssh_github_check "${found}"
+		return 0
+	fi
+
+	# On WSL, one key per BOX, not per distro. Distros do not share a
+	# filesystem, so each one used to generate its own key under the same
+	# name and comment -- three different `matt@swiftgo-ultra7` keys on one
+	# machine, indistinguishable on GitHub (2026-10-03). The Windows profile
+	# is the one place every distro on the box can read, and where the box
+	# key already lives once ssh-to-windows has published it, so it is
+	# adopted from there before anything is generated. Needs no ssh-keygen.
+	local win_home=""
+	if _on_wsl && win_home="$(win-home)" &&
+		[[ -r "${win_home}/.ssh/${name}" && -r "${win_home}/.ssh/${name}.pub" ]]; then
+		_info "adopting this box's key from ${win_home}/.ssh/${name}"
+		_run cp -- "${win_home}/.ssh/${name}" "${key}"
+		_run cp -- "${win_home}/.ssh/${name}.pub" "${key}.pub"
+		_run chmod 0600 "${key}"
+		_run chmod 0644 "${key}.pub"
+		_result "ssh:     ok (box key from Windows: ${key})"
+		_ssh_github_check "${key}"
 		return 0
 	fi
 
@@ -582,12 +658,6 @@ step_ssh() {
 		_result "ssh:     skipped (no ssh-keygen)"
 		return 0
 	fi
-
-	local name="${KEY_NAME}"
-	if [[ -z ${name} ]]; then
-		name="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo id_ed25519)"
-	fi
-	local key="${dir}/${name}"
 
 	_info "generating ed25519 key ${key}"
 	if [[ ${ASSUME_YES} -eq 1 ]]; then
@@ -609,7 +679,24 @@ step_ssh() {
 		_say ""
 		_info "gh ssh-key add ${key}.pub --title '${name}'"
 	fi
+
+	# A new box key on WSL goes to the Windows profile at once, so the next
+	# distro adopts it (above) instead of minting another. ssh-to-windows
+	# owns the copy and the NTFS ACL Windows OpenSSH insists on.
+	if [[ -n ${win_home} ]]; then
+		local publisher
+		if publisher="$(_asset ssh-to-windows.sh)"; then
+			local pub_args=(--key "${name}")
+			[[ ${DRY_RUN} -eq 1 ]] && pub_args+=(--dry-run)
+			_info "publishing ${name} to ${win_home}/.ssh for this box's other distros"
+			bash "${publisher}" "${pub_args[@]}" ||
+				_warn "could not publish ${name} to Windows — run ssh-to-windows.sh --key ${name}"
+		else
+			_warn "ssh-to-windows.sh unavailable — ${name} stays in this distro only"
+		fi
+	fi
 	_result "ssh:     ok (created ${key})"
+	_ssh_github_check "${key}"
 }
 
 # ---------------------------------------------------------------------------
@@ -645,6 +732,12 @@ step_ssh() {
 # does): a WSL-only step tested only by hand is eventually not tested.
 _PROC_VERSION="${JB_PROC_VERSION:-/proc/version}"
 
+# _on_wsl -- true inside a WSL distro. The ssh step (box key adoption) and
+# the sshd step (path translator) both ask it.
+_on_wsl() {
+	[[ -r ${_PROC_VERSION} ]] && grep -qi microsoft "${_PROC_VERSION}"
+}
+
 # _sshd_github_user — whose keys to authorize: --github-user, else the
 # account gh is signed in to. Printed, or return 1 when neither is known.
 _sshd_github_user() {
@@ -663,7 +756,7 @@ step_sshd() {
 	# service either way, reached through a different path translator.
 	local topath
 	_pwsh_uname_init
-	if [[ -r ${_PROC_VERSION} ]] && grep -qi microsoft "${_PROC_VERSION}"; then
+	if _on_wsl; then
 		topath=wslpath
 	else
 		case "${_UNAME_S}" in

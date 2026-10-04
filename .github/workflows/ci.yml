@@ -203,6 +203,68 @@ jobs:
           make -f standard.mk workflow-dispatch-check TEST_CMD=x TEST_FAST_CMD=x CLEAN_PATHS=x
           echo "OK — workflow-dispatch-check: three spellings, reusable exempt, push-only and empty refused."
 
+      - name: test and test-fast refuse a run that changes the working tree
+        # just-bashit's `make test` deleted files its bats submodules track,
+        # every run, unnoticed (just-bashit#111). The guard diffs `git status`
+        # before and after, survives a red suite, and reads a checkout git
+        # calls foreign (root in a container). Each refusal is a sabotage.
+        run: |
+          tmp="$(mktemp -d)"; cp standard.mk "$tmp/"
+          mk() { printf 'TEST_CMD = %s\nTEST_FAST_CMD = %s\nCLEAN_PATHS = d/\ninclude standard.mk\n' "$1" "${2:-@true}" > "$tmp/Makefile"; }
+          git -C "$tmp" init -q; git -C "$tmp" config user.email t@t; git -C "$tmp" config user.name t
+          echo keep > "$tmp/tracked"; echo scratch/ > "$tmp/.gitignore"; mk '@true'
+          git -C "$tmp" add -A; git -C "$tmp" commit -qm init
+
+          mk '@true'; make -C "$tmp" test                           # clean run
+          mk '@mkdir -p scratch && touch scratch/x'; make -C "$tmp" test   # ignored path
+          echo edit >> "$tmp/tracked"; mk '@true'; make -C "$tmp" test     # dirty before, clean run
+          git -C "$tmp" checkout -q -- tracked
+
+          # SABOTAGE: the run deletes a tracked file.
+          mk '@rm tracked'
+          if make -C "$tmp" test > "$tmp/log" 2>&1; then
+            cat "$tmp/log"; echo "::error::a run that deleted a tracked file passed"; exit 1
+          fi
+          grep -q "changed the working tree" "$tmp/log" && grep -q "after:  *D tracked" "$tmp/log" \
+            || { cat "$tmp/log"; echo "::error::the deletion was not named"; exit 1; }
+          git -C "$tmp" checkout -q -- tracked
+
+          # SABOTAGE: test-fast is guarded too, and an untracked litter file counts.
+          mk '@true' '@touch litter'
+          if make -C "$tmp" test-fast > "$tmp/log" 2>&1; then
+            cat "$tmp/log"; echo "::error::test-fast litter passed"; exit 1
+          fi
+          grep -q "?? litter" "$tmp/log" || { cat "$tmp/log"; echo "::error::litter not named"; exit 1; }
+          rm -f "$tmp/litter"
+
+          # SABOTAGE: a FAILING run that also dirties -- both reported, still red.
+          mk '@rm tracked; false'
+          if make -C "$tmp" test > "$tmp/log" 2>&1; then
+            cat "$tmp/log"; echo "::error::a failing run passed"; exit 1
+          fi
+          grep -q "changed the working tree" "$tmp/log" || { cat "$tmp/log"; echo "::error::a red run skipped the tree check"; exit 1; }
+          git -C "$tmp" checkout -q -- tracked
+
+          # A failing run that leaves the tree alone: red, and no tree error.
+          mk '@false'
+          if make -C "$tmp" test > "$tmp/log" 2>&1; then cat "$tmp/log"; echo "::error::false passed"; exit 1; fi
+          if grep -q "changed the working tree" "$tmp/log"; then cat "$tmp/log"; echo "::error::false alarm"; exit 1; fi
+
+          # A checkout git calls foreign (root in a container): still checked.
+          mk '@rm tracked'
+          if GIT_TEST_ASSUME_DIFFERENT_OWNER=1 make -C "$tmp" test > "$tmp/log" 2>&1; then
+            cat "$tmp/log"; echo "::error::a foreign-owned checkout went unchecked"; exit 1
+          fi
+          grep -q "after:  *D tracked" "$tmp/log" || { cat "$tmp/log"; echo "::error::foreign-owned: not named"; exit 1; }
+          git -C "$tmp" checkout -q -- tracked
+
+          # Not a git checkout: said so, and the suite still runs.
+          rm -rf "$tmp/.git"; mk '@echo ran-the-suite'
+          make -C "$tmp" test > "$tmp/log" 2>&1 || { cat "$tmp/log"; echo "::error::no-git run failed"; exit 1; }
+          grep -q "tree check is OFF" "$tmp/log" && grep -q ran-the-suite "$tmp/log" \
+            || { cat "$tmp/log"; echo "::error::no-git run not reported"; exit 1; }
+          echo "OK — tree check: clean, ignored and pre-dirty pass; deletion, litter, red+dirty and foreign-owned refused; no-git said."
+
       - name: ci-changes-wiring-check refuses a ci.yml job that ignores changes
         # Each tree that lands on main is tested once (just-makeit#1801) only
         # if ci.yml asks the vendored changes job and every job listens.

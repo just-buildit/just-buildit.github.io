@@ -1,4 +1,5 @@
-"""Behaviour of scripts/pr-watch.sh's stuck-run detector (just-makeit#1812).
+"""Behaviour of scripts/pr-watch.sh: its stuck-run detector (just-makeit#1812),
+and what it does when gh cannot answer (just-buildit.github.io#113).
 
 The shape: a PR gets a new head while its previous run is still QUEUED.
 The new head's run, in the same concurrency group, sits ``pending`` with
@@ -18,6 +19,11 @@ so ``status``/``conclusion`` are set back to what the issue observed at the
 time (superseded: queued; blocked: pending, 0 jobs). ``pull_requests`` is
 kept as GitHub returned it -- EMPTY in all four, which is why the detector
 matches on branch and workflow instead.
+
+The gh failures are recorded too: what gh printed on stderr, and its exit
+code, measured 2026-10-05 against this repo's PRs. gh 2.46.0 is Debian 13's
+package; 2.49.2 rejects ``--json`` with the same words, and 2.50.0 is the
+first release that takes it (cli/cli#9079, measured with both binaries).
 """
 
 from __future__ import annotations
@@ -102,14 +108,23 @@ NEW_1809 = _run(
 
 # gh api PATH --jq EXPR, gh pr view/checks ... --jq EXPR; all answered from
 # $FAKE_GH_DB, keyed by the api path, or by "pr" / "checks".
+#
+# A read is "<key>:<--json fields>" ("pr:state", "<api path>:"), and each one
+# made is appended to $FAKE_GH_LOG. A db entry "fail:<read>", or "fail:<key>"
+# for every read of that key, makes it fail as gh did: {"stderr", "rc"}.
+# `gh --version` prints the db's "version".
 FAKE_GH = textwrap.dedent(
     """\
     #!/usr/bin/env bash
+    if [ "$1" = --version ]; then
+        jq -er '.version // empty' "$FAKE_GH_DB"; exit
+    fi
     cmd="$1 $2"; shift 2
-    path= expr=
+    path= expr= fields=
     while [ $# -gt 0 ]; do
         case "$1" in
-            -X|-R|--json) shift 2 ;;
+            -X|-R) shift 2 ;;
+            --json) fields="$2"; shift 2 ;;
             --jq) expr="$2"; shift 2 ;;
             *) path="$1"; shift ;;
         esac
@@ -120,6 +135,13 @@ FAKE_GH = textwrap.dedent(
         api*) key="${cmd#api }" ;;
         *) exit 1 ;;
     esac
+    [ -n "${FAKE_GH_LOG:-}" ] && echo "$key:$fields" >>"$FAKE_GH_LOG"
+    for f in "fail:$key:$fields" "fail:$key"; do
+        if jq -e --arg k "$f" 'has($k)' "$FAKE_GH_DB" >/dev/null; then
+            jq -r --arg k "$f" '.[$k].stderr' "$FAKE_GH_DB" >&2
+            exit "$(jq -r --arg k "$f" '.[$k].rc' "$FAKE_GH_DB")"
+        fi
+    done
     jq -e --arg k "$key" 'has($k)' "$FAKE_GH_DB" >/dev/null || exit 1
     jq --arg k "$key" '.[$k]' "$FAKE_GH_DB" | jq -r "$expr"
     """
@@ -127,10 +149,11 @@ FAKE_GH = textwrap.dedent(
 
 # The watch loop's only sleep. Reaching it means the loop chose to WAIT
 # rather than exit; stopping there makes that choice observable at once.
+WAITING = "<fake sleep: the watcher is waiting>"
 FAKE_SLEEP = textwrap.dedent(
-    """\
+    f"""\
     #!/usr/bin/env bash
-    echo "<fake sleep: the watcher is waiting>"
+    echo "{WAITING}"
     kill -TERM "$PPID"
     """
 )
@@ -143,8 +166,43 @@ def _runs_key(branch: str) -> str:
     )
 
 
+# What gh said, as {"stderr", "rc"}: see the module docstring.
+OLD_GH = (
+    "gh version 2.46.0 (2025-01-13 Debian 2.46.0-3)\n"
+    "https://github.com/cli/cli/releases/tag/v2.46.0"
+)
+NO_JSON = {  # cut after the usage line; the flag list follows it
+    "rc": 1,
+    "stderr": "unknown flag: --json\n\n"
+    "Usage:  gh pr checks [<number> | <url> | <branch>] [flags]\n",
+}
+NO_AUTH = {
+    "rc": 4,
+    "stderr": "To get started with GitHub CLI, please run:  gh auth login\n"
+    "Alternatively, populate the GH_TOKEN environment variable with a "
+    "GitHub API authentication token.",
+}
+BAD_TOKEN = {
+    "rc": 1,
+    "stderr": "HTTP 401: Bad credentials (https://api.github.com/graphql)\n"
+    "Try authenticating with:  gh auth login",
+}
+OFFLINE = {
+    "rc": 1,
+    "stderr": 'Post "https://api.github.com/graphql": proxyconnect tcp: '
+    "dial tcp 127.0.0.1:9: connect: connection refused",
+}
+# gh >= 2.50's answer for a PR with no checks yet: an ERROR, not `[]`.
+NO_CHECKS = {
+    "rc": 1,
+    "stderr": f"no checks reported on the '{B1809}' branch",
+}
+
+
 @unittest.skipUnless(shutil.which("jq"), "the fake gh needs jq")
-class StuckRuns(unittest.TestCase):
+class FakeGh(unittest.TestCase):
+    """A fake gh and sleep on PATH, and the real watch loop over them."""
+
     def setUp(self) -> None:
         self.tmp = pathlib.Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp)
@@ -172,6 +230,44 @@ class StuckRuns(unittest.TestCase):
             d[f"repos/{REPO}/actions/runs/{run_id}/jobs"] = {"total_count": n}
         return d
 
+    def watch(
+        self, stuck: bool = False, **extra: object
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the real loop: PR open, every OTHER workflow's check green.
+
+        ``extra`` adds db entries -- a ``version``, or a ``fail:<read>``.
+        """
+        new = copy.deepcopy(NEW_1809)
+        db = self.db(B1809, [new, OLD_1809], {new["id"]: 0 if stuck else 9})
+        db["pr"] = {
+            "state": "OPEN",
+            "headRefOid": new["head_sha"],
+            "headRefName": B1809,
+        }
+        db["checks"] = [{"name": "Docker image", "bucket": "pass"}]
+        db.update(extra)
+        env = self.env(db)
+        env.update(
+            REPO=REPO,
+            PATH=f"{self.bindir}{os.pathsep}{env['PATH']}",
+            INTERVAL="0",
+            QUIET="0",
+            FAKE_GH_LOG=str(self.tmp / "reads.log"),
+        )
+        return subprocess.run(
+            ["bash", str(SCRIPT), "1809"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+    def reads(self) -> list[str]:
+        """Every read the last watch() made, in order."""
+        return (self.tmp / "reads.log").read_text().splitlines()
+
+
+class StuckRuns(FakeGh):
     def stuck(
         self, branch: str, head: str, runs: list[dict], jobs: dict[int, int]
     ) -> list[str]:
@@ -295,35 +391,10 @@ class StuckRuns(unittest.TestCase):
             r.stdout,
         )
 
-    def watch(self, stuck: bool) -> subprocess.CompletedProcess[str]:
-        """Run the real loop: PR open, every OTHER workflow's check green."""
-        new = copy.deepcopy(NEW_1809)
-        db = self.db(B1809, [new, OLD_1809], {new["id"]: 0 if stuck else 9})
-        db["pr"] = {
-            "state": "OPEN",
-            "headRefOid": new["head_sha"],
-            "headRefName": B1809,
-        }
-        db["checks"] = [{"name": "Docker image", "bucket": "pass"}]
-        env = self.env(db)
-        env.update(
-            REPO=REPO,
-            PATH=f"{self.bindir}{os.pathsep}{env['PATH']}",
-            INTERVAL="0",
-            QUIET="0",
-        )
-        return subprocess.run(
-            ["bash", str(SCRIPT), "1809"],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-
     def test_a_stuck_pr_is_reported_and_never_green(self) -> None:
         r = self.watch(stuck=True)
         self.assertIn("force-cancel", r.stdout)
-        self.assertIn("<fake sleep: the watcher is waiting>", r.stdout)
+        self.assertIn(WAITING, r.stdout)
         self.assertNotIn("settled green", r.stdout)
 
     def test_an_unstuck_pr_with_green_checks_is_green(self) -> None:
@@ -331,6 +402,92 @@ class StuckRuns(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("all 1 checks settled green", r.stdout)
         self.assertNotIn("force-cancel", r.stdout)
+
+
+# Every read the loop makes before a verdict, in a green run's order. A read
+# the verdict depends on, failing alone, must never be read as an answer.
+READS = [
+    "pr:state",
+    "pr:headRefOid",
+    "pr:headRefName",
+    f"{_runs_key(B1809)}:",
+    f"repos/{REPO}/actions/runs/{NEW_1809['id']}/jobs:",
+    "checks:name",
+    "checks:bucket",
+    "checks:name,bucket",
+]
+
+
+class GhCannotAnswer(FakeGh):
+    """just-buildit.github.io#113: a failed gh call is not an empty answer."""
+
+    def test_the_reads_are_every_read(self) -> None:
+        """READS is what the loop asks, so no read below goes untested."""
+        r = self.watch()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.reads(), READS)
+
+    def test_a_gh_without_pr_checks_json_stops_at_once(self) -> None:
+        """The issue: Debian's gh 2.46.0 waited out the whole timeout."""
+        r = self.watch(version=OLD_GH, **{"fail:checks": NO_JSON})
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertNotIn(WAITING, r.stdout)  # within the first poll
+        self.assertNotIn("no checks reported yet", r.stdout)
+        self.assertIn("unknown flag: --json", r.stdout)
+        self.assertIn("gh version 2.46.0", r.stdout)  # what is installed
+        self.assertIn("gh >= 2.50.0", r.stdout)  # and what it needs
+
+    def test_a_gh_that_cannot_authenticate_stops_at_once(self) -> None:
+        for read in READS:
+            for said in (NO_AUTH, BAD_TOKEN):
+                with self.subTest(read=read, rc=said["rc"]):
+                    r = self.watch(**{f"fail:{read}": said})
+                    self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                    self.assertNotIn(WAITING, r.stdout)
+                    self.assertIn("gh cannot authenticate", r.stdout)
+                    self.assertIn(said["stderr"].splitlines()[0], r.stdout)
+
+    def test_any_other_gh_error_is_named_and_never_a_verdict(self) -> None:
+        """Offline: wait, saying why. Read as empty, five of these failing
+        reads let the loop call the PR green without them."""
+        for read in READS:
+            with self.subTest(read=read):
+                r = self.watch(**{f"fail:{read}": OFFLINE})
+                self.assertIn(WAITING, r.stdout)
+                self.assertNotIn("settled green", r.stdout)
+                self.assertNotIn("no checks reported yet", r.stdout)
+                self.assertIn(
+                    f"gh exited 1: {OFFLINE['stderr']} — retrying (not green)",
+                    r.stdout,
+                )
+
+    def test_a_failed_read_never_calls_an_unsettled_pr_green(self) -> None:
+        """Where the green above was also WRONG: a check pending or red."""
+        for read, bucket in (
+            ("checks:bucket", "pending"),
+            ("checks:name,bucket", "fail"),
+        ):
+            with self.subTest(read=read, bucket=bucket):
+                r = self.watch(
+                    checks=[
+                        {"name": "Docker image", "bucket": "pass"},
+                        {"name": "test", "bucket": bucket},
+                    ],
+                    **{f"fail:{read}": OFFLINE},
+                )
+                self.assertNotIn("settled green", r.stdout)
+                self.assertIn(WAITING, r.stdout)
+
+    def test_gh_answering_no_checks_with_an_error_still_waits(self) -> None:
+        """gh >= 2.50 fails a PR with no checks yet: that is failure mode 2."""
+        r = self.watch(**{"fail:checks": NO_CHECKS})
+        self.assertIn(
+            f"no checks reported yet for {NEW_1809['head_sha'][:9]}"
+            " — waiting (not green)",
+            r.stdout,
+        )
+        self.assertIn(WAITING, r.stdout)
+        self.assertNotIn("gh exited", r.stdout)
 
 
 if __name__ == "__main__":

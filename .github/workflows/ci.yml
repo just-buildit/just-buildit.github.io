@@ -778,47 +778,6 @@ jobs:
           fi
           echo "OK — gates terminate regardless of the default goal."
 
-      - name: Serving matches the repo
-        # Only meaningful on main (a PR's copy is not published yet), and it is
-        # the question the drift gate asks from the other side: does what Pages
-        # actually serves equal what is committed here?
-        #
-        # It has to WAIT rather than ask once. On a push to main the Pages
-        # deploy has only just started and runs concurrently with this job, so
-        # asking immediately puts the question at the one moment the answer is
-        # definitionally no. The old form was therefore green for every push
-        # that left standard.mk alone and red for every push that changed it —
-        # red on exactly the changes it exists to verify, and indistinguishable
-        # from a genuine drift failure. Measured on the gates-home-check merge:
-        # this job failed at 14:18 against the pre-deploy copy, and the same
-        # file compared identical minutes later with nothing changed but time.
-        #
-        # What is being checked is unchanged: what an adopter FETCHES must
-        # equal what is committed. An adopter fetches through this CDN, so the
-        # CDN is what is polled — with a cache-buster, or a stale edge copy
-        # could satisfy the check without Pages having published anything.
-        #
-        # The budget is generous because the cost of overrunning it is a red
-        # main, and the predicate is known reachable (it is what every steady
-        # state looks like). On timeout the diff is printed: a wait that fails
-        # without saying what it saw sends the reader to the wrong question.
-        if: github.ref == 'refs/heads/main'
-        run: |
-          : > served.mk
-          for i in $(seq 1 40); do
-            curl -fsSL -H 'Cache-Control: no-cache' -o served.mk \
-              "https://just-buildit.github.io/standard.mk?cb=$(date +%s)-$i" \
-              || echo "fetch $i failed — retrying"
-            if diff -q served.mk standard.mk >/dev/null 2>&1; then
-              echo "OK — Pages serves the committed file (after $i check(s))."
-              exit 0
-            fi
-            sleep 15
-          done
-          echo "::error::Pages is still serving a different standard.mk after 10 minutes"
-          diff -u served.mk standard.mk || true
-          exit 1
-
       - name: tag-release refuses a red commit, and fails open otherwise
         # just-makeit#1327 follow-on. `tag-release` checked everything about
         # the TAG and nothing about the tree it points at -- and a release tag
@@ -895,6 +854,43 @@ jobs:
       # ci-changes, which lets a bump-only commit skip an adopter's matrix,
       # is tested in tests/test_ci_changes.py: the changelog job below runs
       # every test there.
+
+  # ------------------------------------------------------------------
+  # Does what Pages serves equal what is committed here? The question the
+  # drift gate asks from the other side, and only meaningful on main (a
+  # PR's copy is not published yet), so the STEP is main-only while the
+  # job always runs: a skipped job would read as a failure to CI passed.
+  #
+  # It waits on the Pages build for this commit, not on a clock. Asked at
+  # once, the answer on a push that changes a served file is
+  # definitionally no (the deploy has only just started); asked for a
+  # fixed ten minutes inside the standard.mk job, a 13.6-minute deploy
+  # outlasted it, and main went red on a file Pages served 2.5 minutes
+  # later (#118). scripts/pages-wait.py holds the logic and the reasons,
+  # and Re-vendor adopters runs the same script, so the two cannot answer
+  # differently. A build a newer push cancelled is followed to that
+  # push's build; a file a newer commit changed is that commit's run to
+  # check. The plain URL is compared, as an adopter fetches it: the build
+  # having succeeded is what says Pages published, so a cache-buster has
+  # nothing left to prove.
+  # ------------------------------------------------------------------
+  serving:
+    name: Pages serves this commit
+    runs-on: ubuntu-latest
+    # Above pages-wait.py's budget plus its grace, so the script, not the
+    # runner, reports a slow Pages (tests/test_pages_wait.py holds this).
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read  # the Pages build's run, by commit
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Serving matches the repo
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/pages-wait.py
 
   # ------------------------------------------------------------------
   # scripts/ is CANONICAL too: every repo vendors these and compares against
@@ -1050,6 +1046,7 @@ jobs:
     name: CI passed
     needs:
       - standard-mk
+      - serving
       - scripts
       - changelog
       - msvc-env

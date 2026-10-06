@@ -199,9 +199,14 @@ if [[ ${_ME} == "just-runit" ]]; then
 		_runner="$(readlink -f "${BASH_SOURCE[0]}")"
 		_ok=0
 		_fail=0
+		# -f: resolve and fetch into the cache, run nothing. This used -l,
+		# and -l lists functions by SOURCING the script, so every tool
+		# without a main guard RAN, its output discarded -- setup-system.sh
+		# among them, which this repo's own bootstrap.toml names
+		# (just-bashit#117).
 		for _src in "${_sources[@]}"; do
 			printf '  -> %s ' "${_src}"
-			if "${_runner}" -l "${_src}" >/dev/null 2>&1; then
+			if "${_runner}" -f "${_src}" >/dev/null 2>&1; then
 				printf 'ok\n'
 				((_ok++)) || true
 			else
@@ -248,6 +253,7 @@ OPT_NO_CACHE=0
 OPT_CLEAN=0
 OPT_VERBOSE=0
 OPT_LIST=0
+OPT_FETCH=0
 OPT_TTL="${_DEFAULT_TTL}"
 OPT_CHECKSUM=""
 OPT_PASS=()
@@ -281,6 +287,7 @@ read -r -d '' HELP <<-EOF || true
 	Options:
 	  -h        Show this message and exit.
 	  -l        List functions defined by SPEC then exit.
+	  -f        Fetch only — cache SPEC, print its path, run nothing.
 	  -r        Refresh — ignore and overwrite cached copy.
 	  -n        No-cache — fetch fresh and discard (nothing written).
 	  -c        Clean environment (minimal, like sudo without -E).
@@ -309,13 +316,14 @@ EOF
 
 # ---- parse options ----------------------------------------------------------
 
-while getopts ":hlrncvp:t:k:" option; do
+while getopts ":hlfrncvp:t:k:" option; do
 	case $option in
 	h)
 		echo "${HELP}"
 		exit 0
 		;;
 	l) OPT_LIST=1 ;;
+	f) OPT_FETCH=1 ;;
 	r) OPT_REFRESH=1 ;;
 	n) OPT_NO_CACHE=1 ;;
 	c) OPT_CLEAN=1 ;;
@@ -627,12 +635,13 @@ _acquire() {
 		return
 	fi
 
+	# -n: into the directory main made, which main's EXIT trap removes. A
+	# trap set HERE belongs to the $(...) subshell every caller runs this
+	# in, and fired as the substitution returned: the script was deleted
+	# before it ran (just-bashit#118).
 	if [[ ${OPT_NO_CACHE} -eq 1 ]]; then
-		local ext tmp
-		ext=$(_cache_ext "${url}")
-		tmp=$(mktemp "/tmp/just-runit.XXXXXX${ext}")
-		# shellcheck disable=SC2064
-		trap "rm -f '${tmp}' '$(_meta_path "${tmp}")'" EXIT
+		local tmp
+		tmp="${_NO_CACHE_DIR}/script$(_cache_ext "${url}")"
 		_fetch_to "${url}" "${tmp}"
 		echo "${tmp}"
 		return
@@ -798,10 +807,24 @@ _run() {
 URL=$(_resolve "${RAW_SPEC}")
 _log "resolved: ${URL}"
 
+# -n fetches into a directory this shell owns, so it is THIS shell's EXIT
+# trap that removes it, after the script has run -- not the trap of the
+# $(...) subshell _acquire runs in.
+if [[ ${OPT_NO_CACHE} -eq 1 ]]; then
+	_NO_CACHE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/just-runit.XXXXXX")
+	trap 'rm -rf "${_NO_CACHE_DIR}"' EXIT
+fi
+
 SCRIPT=$(_acquire "${URL}")
 _log "script: ${SCRIPT}"
 
 [[ -n ${OPT_CHECKSUM} ]] && _verify "${SCRIPT}" "${OPT_CHECKSUM}"
+
+# Before anything reads the script as code: -l below sources it.
+if [[ ${OPT_FETCH} -eq 1 ]]; then
+	echo "${SCRIPT}"
+	exit 0
+fi
 
 SCRIPT_LANG=$(_detect_lang "${SCRIPT}" "${RAW_SPEC}")
 _log "language: ${SCRIPT_LANG}"

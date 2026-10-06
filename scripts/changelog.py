@@ -458,7 +458,17 @@ def check(
     """The branch gate. Returns the exit code; prints why."""
     root = pathlib.Path(".")
     base = merge_base(base_ref)
-    status = git("diff", "--name-status", "--no-renames", base, "HEAD")
+    # Submodules never ignored: `ignore = all` in .gitmodules otherwise hides
+    # a moved pointer, and the branch reads as no change at all
+    # (just-buildit.github.io#117).
+    status = git(
+        "diff",
+        "--name-status",
+        "--no-renames",
+        "--ignore-submodules=none",
+        base,
+        "HEAD",
+    )
     changed: List[Tuple[str, str]] = [
         (ln.split("\t", 1)[0], ln.split("\t", 1)[1])
         for ln in status.stdout.splitlines()

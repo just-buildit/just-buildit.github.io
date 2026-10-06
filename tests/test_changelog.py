@@ -111,6 +111,28 @@ class Check(Base):
         self.r.commit()
         self.bad(self.check(), "no fragment added", "src/a.py")
 
+    def test_a_submodule_moved_while_ignored_needs_a_fragment(self) -> None:
+        # just-buildit.github.io#117: `ignore = all` in .gitmodules hid the
+        # moved pointer from the diff, so no code had changed.
+        def point(sha: str) -> None:
+            (self.r.root / "src/sub").mkdir(exist_ok=True)
+            entry = f"160000,{sha},src/sub"
+            self.r.git("update-index", "--add", "--cacheinfo", entry)
+
+        self.r.git("checkout", "-q", "main")
+        self.r.write(
+            ".gitmodules",
+            '[submodule "sub"]\n\tpath = src/sub\n\turl = ./sub\n'
+            "\tignore = all\n",
+        )
+        point("1" * 40)
+        self.r.commit("a submodule")
+        self.r.git("checkout", "-q", "feature")
+        self.r.git("merge", "-q", "--ff-only", "main")
+        point("2" * 40)
+        self.r.commit("move it")
+        self.bad(self.check(), "no fragment added", "src/sub")
+
     def test_docs_only_branch_needs_no_fragment(self) -> None:
         self.r.write("README.md", "docs\n")
         self.r.commit()

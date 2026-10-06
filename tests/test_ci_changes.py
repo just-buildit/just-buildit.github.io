@@ -12,6 +12,11 @@ old version was rewritten in the expected copy and not in HEAD, and a pure
 bump ran the full matrix. Now only the lines HEAD changed are compared as
 a bump.
 
+just-buildit.github.io#117: the rule read a list of NAMES and compared
+contents, so a change contents cannot show -- a mode, a symlink's type, a
+submodule the default diff hides -- beside a bump read as a bump alone.
+Now each path is read from its ``git diff --raw`` record.
+
 These cases moved here from an inline step in ci.yml, so the target has one
 home for its behaviour; the unittest job runs them.
 
@@ -121,6 +126,16 @@ class CiChanges(unittest.TestCase):
         self.assertEqual(text.count(old), 1, f"{old!r} in {path}")
         self.write(path, text.replace(old, new))
 
+    def gitlink(self, path: str, sha: str) -> None:
+        """Point a submodule entry at ``sha``, with no clone behind it.
+
+        The empty directory is how git sees a submodule that is not
+        checked out, so the ``add -A`` in ``commit`` leaves the entry be.
+        """
+        (self.repo / path).mkdir(exist_ok=True)
+        entry = f"160000,{sha},{path}"
+        self.git("update-index", "--add", "--cacheinfo", entry)
+
     def bump(self) -> None:
         """1.2.3 -> 1.3.0 in the project's own version lines only."""
         self.edit("pyproject.toml", 'version = "1.2.3"', 'version = "1.3.0"')
@@ -176,6 +191,16 @@ class CiChanges(unittest.TestCase):
         self.commit("a version file with no final newline")
         self.bump()
         self.write("VERSION", "1.3.0")
+        self.assertSrc("false")
+
+    def test_an_executable_manifest_can_skip(self) -> None:
+        # A mode is compared, not required to be 644: a script that holds
+        # the version and stays executable is still a bumped manifest.
+        self.write("configure", "#!/bin/sh\necho 1.2.3\n")
+        os.chmod(self.repo / "configure", 0o755)
+        self.commit("an executable that prints the version")
+        self.bump()
+        self.edit("configure", "1.2.3", "1.3.0")
         self.assertSrc("false")
 
     # -- must run -------------------------------------------------------
@@ -240,6 +265,59 @@ class CiChanges(unittest.TestCase):
     def test_a_base_not_in_the_clone_runs(self) -> None:
         self.bump()
         self.assertSrc("true", BASE="deadbeef")
+
+    # -- must run: what a comparison of contents cannot see (#117) -------
+    #
+    # A path can change while its text does not, or its text can read as a
+    # bump while what it IS changes. Each case below was a version bump
+    # alone (src=false) while ci-changes compared contents only.
+
+    def test_a_mode_change_beside_a_bump_runs(self) -> None:
+        # The #117 trigger: a script becomes executable.
+        self.bump()
+        os.chmod(self.repo / "src.c", 0o755)
+        self.assertSrc("true")
+
+    def test_a_symlink_retargeted_by_the_version_runs(self) -> None:
+        # Its blob is the target path, which reads as a bumped line; what
+        # the link reaches is a different file.
+        os.symlink("pkg-1.2.3.tar.gz", self.repo / "dist")
+        self.commit("a link to the release tarball")
+        self.bump()
+        (self.repo / "dist").unlink()
+        os.symlink("pkg-1.3.0.tar.gz", self.repo / "dist")
+        self.assertSrc("true")
+
+    def test_a_file_turned_into_a_symlink_runs(self) -> None:
+        self.write("VERSION", "1.2.3")
+        self.commit("a version file with no final newline")
+        self.bump()
+        (self.repo / "VERSION").unlink()
+        os.symlink("1.3.0", self.repo / "VERSION")
+        self.assertSrc("true")
+
+    def test_a_submodule_moved_while_ignored_runs(self) -> None:
+        # `ignore = all` hides the pointer from a default `git diff`, so
+        # the path was never compared at all.
+        self.write(
+            ".gitmodules",
+            '[submodule "sub"]\n\tpath = sub\n\turl = ./sub\n'
+            "\tignore = all\n",
+        )
+        self.gitlink("sub", "1" * 40)
+        self.commit("a submodule")
+        self.bump()
+        self.gitlink("sub", "2" * 40)
+        self.assertSrc("true")
+
+    def test_a_path_holding_a_space_is_one_path(self) -> None:
+        # Split on the space, this is src.c (unchanged, so it compares
+        # equal) and CHANGELOG.md (prose): nothing left to run.
+        self.write("src.c CHANGELOG.md", "a\n")
+        self.commit("a path with a space")
+        self.bump()
+        self.write("src.c CHANGELOG.md", "b\n")
+        self.assertSrc("true")
 
     # -- the output contract ---------------------------------------------
 

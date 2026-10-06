@@ -40,34 +40,37 @@ jobs:
   # adopter to fetch a stale copy — worse than not fanning out at all.
   #
   # Its own job so the fan-out waits on it ONCE rather than per-org.
+  #
+  # It waits on the Pages build for this commit, not on a clock: a fixed
+  # ten-minute poll gave up 2.5 minutes before a 13.6-minute deploy served
+  # the file, and every adopter's drift gate went red with no re-vendor PR
+  # (#118). scripts/pages-wait.py holds the logic and the reasons; its
+  # budget sits under this job's timeout, so the script reports a slow
+  # Pages rather than the runner killing it. served=false is a build a
+  # newer commit superseded AND changed the vendored files in: that
+  # commit's own run fans out, so this one skips.
   serving:
     name: Wait for Pages to serve this commit
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read  # the Pages build's run, by commit
+    outputs:
+      served: ${{ steps.wait.outputs.served }}
     steps:
       - uses: actions/checkout@v7.0.1
 
-      - name: Compare what is served against what is committed
-        run: |
-          set -euo pipefail
-          for f in standard.mk $(git ls-files 'scripts/*' 'github/*'); do
-            want=$(sha256sum "$f" | cut -d' ' -f1)
-            echo "waiting for $f ($want)"
-            for i in $(seq 1 60); do
-              got=$(curl -fsSL "https://just-buildit.github.io/$f" 2>/dev/null \
-                    | sha256sum | cut -d' ' -f1 || true)
-              [ "$got" = "$want" ] && { echo "  served after $((i*10))s"; break; }
-              if [ "$i" = 60 ]; then
-                echo "::error::Pages never served the current $f — not fanning out"
-                exit 1
-              fi
-              sleep 10
-            done
-          done
+      - name: Wait for the Pages build, then compare what is served
+        id: wait
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/pages-wait.py
 
   fan-out:
     name: Re-vendor ${{ matrix.org }}
     needs: serving
+    if: needs.serving.outputs.served == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:

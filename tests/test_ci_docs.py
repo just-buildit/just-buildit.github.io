@@ -9,6 +9,7 @@ script: ``python3 -m unittest discover -s tests``.
 
 from __future__ import annotations
 
+import os
 import pathlib
 import re
 import shutil
@@ -45,6 +46,12 @@ class CiDocs(unittest.TestCase):
         subprocess.run(
             ["git", *args], cwd=self.repo, check=True, capture_output=True
         )
+
+    def gitlink(self, path: str, sha: str) -> None:
+        """Point a submodule entry at ``sha``, with no clone behind it."""
+        (self.repo / path).mkdir(exist_ok=True)
+        entry = f"160000,{sha},{path}"
+        self.git("update-index", "--add", "--cacheinfo", entry)
 
     def write(self, path: str, text: str = "2\n") -> None:
         (self.repo / path).parent.mkdir(parents=True, exist_ok=True)
@@ -113,6 +120,41 @@ class CiDocs(unittest.TestCase):
     def test_deleting_the_readme_is_not_docs_only(self) -> None:
         """pyproject's `readme` reads it: removal can break the wheel."""
         (self.repo / "README.md").unlink()
+        self.assertDocsOnly(False)
+
+    # #117: what a list of names cannot say. A symlink or a submodule
+    # reaches contents that live somewhere else, so outside a docs
+    # directory it is read like a deletion; and `ignore = all` in
+    # .gitmodules hid a moved submodule from the diff altogether.
+    def test_the_readme_turned_into_a_symlink_is_not_docs_only(self) -> None:
+        (self.repo / "README.md").unlink()
+        os.symlink("docs/gone.md", self.repo / "README.md")
+        self.assertDocsOnly(False)
+
+    def test_retargeting_a_readme_symlink_is_not_docs_only(self) -> None:
+        (self.repo / "README.md").unlink()
+        os.symlink("docs/a.md", self.repo / "README.md")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "the readme is a page")
+        (self.repo / "README.md").unlink()
+        os.symlink("docs/gone.md", self.repo / "README.md")
+        self.assertDocsOnly(False)
+
+    def test_a_symlink_inside_docs_is_docs(self) -> None:
+        os.symlink("a.md", self.repo / "docs/index.md")
+        self.assertDocsOnly(True)
+
+    def test_a_submodule_moved_while_ignored_is_code(self) -> None:
+        self.write(
+            ".gitmodules",
+            '[submodule "sub"]\n\tpath = sub\n\turl = ./sub\n'
+            "\tignore = all\n",
+        )
+        self.gitlink("sub", "1" * 40)
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "a submodule")
+        self.gitlink("sub", "2" * 40)
+        self.write("docs/a.md")
         self.assertDocsOnly(False)
 
     def test_a_repo_can_exclude_generated_docs(self) -> None:

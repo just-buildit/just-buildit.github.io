@@ -203,6 +203,83 @@ jobs:
           make -f standard.mk workflow-dispatch-check TEST_CMD=x TEST_FAST_CMD=x CLEAN_PATHS=x
           echo "OK — workflow-dispatch-check: three spellings, reusable exempt, push-only and empty refused."
 
+      - name: close-keywords-check refuses a closing keyword the PR does not declare
+        # #124: just-makeit#1962's squash said an issue was filed and not
+        # fixed, with the reference straight after the colon, and GitHub
+        # closed just-makeit#1960. Fixture branches through `make`, each with
+        # the event file Actions hands the step: the refusal names the commit,
+        # line and phrase; a branch whose only closing reference is its own
+        # (gh-N) passes; every keyword in every spelling, each reference form
+        # and a line break between them are refused; `lint` runs the gate; a
+        # push is inert. The grammar in full, a shallow checkout and a stale
+        # base are tests/test_close_keywords.py, run by the changelog job.
+        run: |
+          tmp="$(mktemp -d)"; cp standard.mk "$tmp/"
+          mkdir "$tmp/scripts"; cp scripts/close-keywords.py "$tmp/scripts/"
+          printf 'TEST_CMD = @echo t\nTEST_FAST_CMD = @echo t\nCLEAN_PATHS = d/\ninclude standard.mk\n' > "$tmp/Makefile"
+          g() { git -C "$tmp" -c user.name=t -c user.email=t@t "$@"; }
+          g init -q -b main; g add -A; g commit -qm base
+          base=$(g rev-parse HEAD)
+          # pr <title> <message>: a one-commit branch off base, the event
+          # Actions would write for it, and the gate's output in $tmp/log.
+          pr() {
+            g checkout -q --detach "$base"
+            g commit -q --allow-empty -m "$2"
+            TITLE="$1" HEAD_SHA=$(g rev-parse HEAD) BASE_SHA="$base" python3 -c '
+          import json, os
+          e = os.environ
+          print(json.dumps({"repository": {"full_name": "acme/widget"},
+              "pull_request": {"title": e["TITLE"], "body": "", "commits": 1,
+                  "head": {"sha": e["HEAD_SHA"]}, "base": {"sha": e["BASE_SHA"]}}}))
+          ' > "$tmp/event.json"
+            GITHUB_EVENT_NAME=pull_request GITHUB_EVENT_PATH="$tmp/event.json" \
+              make -s -C "$tmp" close-keywords-check > "$tmp/log" 2>&1
+          }
+          refuse() {  # refuse <message> <phrase>: refused, naming both
+            if pr "fix: a (gh-7)" "$1"; then
+              cat "$tmp/log"; echo "::error::'$2' passed"; exit 1
+            fi
+            grep -qF "commit $(g rev-parse --short=8 HEAD), line 3: \"$2\"" "$tmp/log" \
+              || { cat "$tmp/log"; echo "::error::no commit, line and '$2' named"; exit 1; }
+          }
+
+          # The incident's shape, and the branch that only closes its own.
+          refuse $'fix: a (gh-7)\n\nFound and filed, not fixed: gh-123.' "fixed: gh-123"
+          grep -q '"filed gh-N"' "$tmp/log" || { cat "$tmp/log"; echo "::error::no rewording offered"; exit 1; }
+          pr "fix: a (gh-7)" $'fix: a (gh-7)\n\nThis fixes gh-7 at last.' \
+            || { cat "$tmp/log"; echo "::error::its own (gh-N) was refused"; exit 1; }
+          grep -q "each one declared" "$tmp/log" || { cat "$tmp/log"; exit 1; }
+
+          # Every keyword GitHub documents, in each case, with and without
+          # the colon; every reference form; and across a line break.
+          n=0
+          for kw in close closes closed fix fixes fixed resolve resolves resolved; do
+            for spelt in "$kw" "${kw^}" "${kw^^}"; do
+              for sep in " " ": "; do
+                refuse "x"$'\n\n'"Left open: $spelt${sep}gh-123 later." "$spelt${sep}gh-123"
+                n=$((n + 1))
+              done
+            done
+          done
+          [ "$n" -eq 54 ] || { echo "::error::$n keyword forms, expected 54"; exit 1; }
+          for ref in '#123' GH-123 acme/widget#123 other/repo#123 \
+                     https://github.com/acme/widget/issues/123; do
+            refuse "x"$'\n\n'"Left open: fixes $ref later." "fixes $ref"
+          done
+          refuse $'x\n\nFiled, not fixed:\ngh-123 (it reads on).' "fixed: gh-123"
+
+          # `lint` runs it -- the one target every adopter's CI runs.
+          make -s -C "$tmp" -pn lint 2>/dev/null | grep -qE '^lint:.* close-keywords-check( |$)' \
+            || { echo "::error::lint does not run close-keywords-check"; exit 1; }
+          # Any other event is inert: on a push the issue is already closed.
+          GITHUB_EVENT_NAME=push make -s -C "$tmp" close-keywords-check | grep -q "inert" \
+            || { echo "::error::a push run was not inert"; exit 1; }
+
+          # And this repo's own pull requests are held to it, from the
+          # default shallow checkout, which the script must deepen.
+          make -f standard.mk close-keywords-check TEST_CMD=x TEST_FAST_CMD=x CLEAN_PATHS=x
+          echo "OK — close-keywords-check: refuses $n keyword forms and every reference form, passes a declared one."
+
       - name: ci-changes-wiring-check refuses a ci.yml job that ignores changes
         # Each tree that lands on main is tested once (just-makeit#1801) only
         # if ci.yml asks the vendored changes job and every job listens.
@@ -332,8 +409,10 @@ jobs:
           root="$PWD"
           tmp="$(mktemp -d)"; canon="$tmp/canon"; app="$tmp/app"
           mkdir -p "$canon/scripts" "$app"
-          # Canonical v2 = the file under test, plus a NEW vendored script.
+          # Canonical v2 = the file under test and the scripts it serves (one,
+          # close-keywords.py, every repo vendors), plus a NEW vendored script.
           cp "$root/standard.mk" "$canon/standard.mk"
+          cp -R "$root/scripts/." "$canon/scripts/"
           printf '\nVENDORED_FILES += scripts/new.sh\n' >> "$canon/standard.mk"
           printf '#!/bin/sh\necho new\n' > "$canon/scripts/new.sh"
           # The adopter vendors v1 (the file under test, without the new entry).
@@ -479,6 +558,10 @@ jobs:
           tmp="$(mktemp -d)"; cp standard.mk "$tmp/"
           # Canonical for the test is served Pages content, which is stable and
           # real: standard.mk itself plus get-jb.sh, both published at the root.
+          # `override` makes the list exactly this one: standard.mk adds a file
+          # every repo vendors (scripts/close-keywords.py), which Pages serves
+          # only once the change adding it merges -- and the walk is under test
+          # here, not what is on it.
           curl -fsSL https://just-buildit.github.io/standard.mk -o "$tmp/canonical.mk"
           curl -fsSL https://just-buildit.github.io/get-jb.sh   -o "$tmp/get-jb.sh"
           cat > "$tmp/Makefile" <<'EOF'
@@ -486,7 +569,7 @@ jobs:
           TEST_FAST_CMD = @echo test-fast
           CLEAN_PATHS = dist/
           STANDARD_FILE = canonical.mk
-          VENDORED_FILES = get-jb.sh
+          override VENDORED_FILES = get-jb.sh
           include standard.mk
           EOF
 
@@ -507,7 +590,7 @@ jobs:
           mv "$tmp/elsewhere" "$tmp/get-jb.sh"
 
           # (2) nothing to compare at all
-          sed -i 's/^STANDARD_FILE = .*/STANDARD_FILE =/; s/^VENDORED_FILES = .*/VENDORED_FILES =/' \
+          sed -i 's/^STANDARD_FILE = .*/STANDARD_FILE =/; s/^override VENDORED_FILES = .*/override VENDORED_FILES =/' \
             "$tmp/Makefile"
           if make -C "$tmp" standard-check > "$tmp/log" 2>&1; then
             cat "$tmp/log"
@@ -517,7 +600,7 @@ jobs:
             || { cat "$tmp/log"; echo "::error::expected the compared-0-files guard"; exit 1; }
 
           # (3) present but drifted
-          sed -i 's/^STANDARD_FILE =$/STANDARD_FILE = canonical.mk/; s/^VENDORED_FILES =$/VENDORED_FILES = get-jb.sh/' \
+          sed -i 's/^STANDARD_FILE =$/STANDARD_FILE = canonical.mk/; s/^override VENDORED_FILES =$/override VENDORED_FILES = get-jb.sh/' \
             "$tmp/Makefile"
           echo "# drift" >> "$tmp/get-jb.sh"
           if make -C "$tmp" standard-check > "$tmp/log" 2>&1; then
@@ -533,7 +616,9 @@ jobs:
         # published as `github/dependabot.yml`; _std_vendor_src maps one to
         # the other for BOTH standard-update and standard-check. Hermetic: a
         # file:// canonical that has only `github/`, so the fetch can only
-        # succeed through the mapping, and without it the update fails.
+        # succeed through the mapping, and without it the update fails. The
+        # list is `override`, so it is exactly this one file: a script every
+        # repo vendors would otherwise join it, and this canonical has none.
         run: |
           tmp="$(mktemp -d)"; canon="$tmp/canon"
           mkdir -p "$canon/github" "$tmp/a"
@@ -544,7 +629,7 @@ jobs:
           TEST_FAST_CMD = @echo test-fast
           CLEAN_PATHS = dist/
           STANDARD_URL = file://$canon/standard.mk
-          VENDORED_FILES = .github/dependabot.yml
+          override VENDORED_FILES = .github/dependabot.yml
           include standard.mk
           EOF
           make -C "$tmp/a" standard-update

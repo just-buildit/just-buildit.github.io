@@ -1753,7 +1753,7 @@ _STD_SECTION = case "$$t" in \
     test-examples) tsec="Examples";; \
     ci-image-config|ci-image-check|ci-image-build|ci-image-smoke|ci-shell) \
         tsec="CI-image";; \
-    standard-check|standard-update|standard-files|help-check|ghost-check|hook-dispatch-check|hook-stage-check|tracked-paths-check|workflow-timeout-check|workflow-dispatch-check) \
+    standard-check|standard-update|standard-files|help-check|ghost-check|hook-dispatch-check|hook-stage-check|tracked-paths-check|workflow-timeout-check|workflow-dispatch-check|close-keywords-check) \
         tsec="Gates";; \
     *) tsec="Local";; \
 esac
@@ -2370,6 +2370,37 @@ hook-stage-check: ## Verify every pre-commit hook stage is actually installed
 	     exit 1; \
 	 fi; \
 	 echo "hook-stage-check: $$n non-default stage(s) have an execution home"
+
+# ── close-keywords-check ────────────────────────────────────────────────────
+#
+# A pull request closes only the issues it says it closes
+# (just-buildit.github.io#124). GitHub reads a closing keyword followed by an
+# issue reference as "close it" wherever the pair reaches the default branch
+# -- the PR text, or a commit message, which a COMMIT_MESSAGES squash copies
+# onto main -- and it reads nothing else: "filed, not fixed" before gh-1960
+# closed just-makeit#1960, and scanning history found the same shape closing
+# other issues in just-makeit and doppler. The rule, the evidence and what
+# counts as declaring an issue are in the vendored script's docstring.
+#
+# In `lint`, and on in every repo, because CI runs `make lint` on every pull
+# request and that is all it needs: the PR's title, body, head and base come
+# from the event file Actions gives every step (GITHUB_EVENT_PATH), so no
+# workflow passes anything, and a shallow checkout is deepened by the script
+# rather than by a `fetch-depth` each repo must remember. On any other event
+# it is inert -- a closing keyword acts when it merges, so only the PR run can
+# stop one. Outside CI it prints notes and never fails: without the PR's
+# title and body it cannot know what the PR declares.
+#
+#   CLOSE_KEYWORDS_BASE   outside CI only: what the branch's commits are
+#                         read against for those notes.
+CLOSE_KEYWORDS_BASE ?= origin/main
+STD_TARGETS    += close-keywords-check
+VENDORED_FILES += scripts/close-keywords.py
+
+lint: close-keywords-check
+
+close-keywords-check: ## A PR's commits, title and body close only the issues it declares
+	@python3 scripts/close-keywords.py --base '$(CLOSE_KEYWORDS_BASE)'
 
 # ── Help ─────────────────────────────────────────────────────────────────────
 # Generated from the `## description` on each active target's rule line. Never

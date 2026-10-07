@@ -268,9 +268,12 @@ jobs:
           done
           refuse $'x\n\nFiled, not fixed:\ngh-123 (it reads on).' "fixed: gh-123"
 
-          # `lint` runs it -- the one target every adopter's CI runs.
+          # `lint` runs it -- the one target every adopter's CI runs -- and
+          # every repo vendors the script it runs, flag or no flag.
           make -s -C "$tmp" -pn lint 2>/dev/null | grep -qE '^lint:.* close-keywords-check( |$)' \
             || { echo "::error::lint does not run close-keywords-check"; exit 1; }
+          make -s -C "$tmp" standard-files | grep -qx scripts/close-keywords.py \
+            || { echo "::error::scripts/close-keywords.py is not vendored"; exit 1; }
           # Any other event is inert: on a push the issue is already closed.
           GITHUB_EVENT_NAME=push make -s -C "$tmp" close-keywords-check | grep -q "inert" \
             || { echo "::error::a push run was not inert"; exit 1; }

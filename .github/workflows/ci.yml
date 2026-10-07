@@ -682,6 +682,116 @@ jobs:
           red "the matrix arm's make line commented out" nightly-check
           echo "OK — a GATES_CI_EXTRA name counts only with a real workflow line."
 
+      - name: A target name is looked up as a string, never as a pattern
+        # gates-check, gates-home-check, help and hook-dispatch-check each
+        # find a target's rule by its name. Pasted into a sed pattern, a name
+        # holding `/` ended the expression ("unknown option to `s'"), so that
+        # prerequisite was never walked; and `.` matched any character, so
+        # v1.2-check also read v1x2-check's rule and gates-check passed a CI
+        # target `gates` never ran (#122). Every lookup is exercised through
+        # both kinds of name. A pass must leave stderr EMPTY: a gate that
+        # prints an error above its OK line teaches readers to ignore stderr.
+        run: |
+          tmp="$(mktemp -d)"; cp standard.mk "$tmp/"
+          mkdir -p "$tmp/.github/workflows"
+          ci="$tmp/.github/workflows/ci.yml"
+          # v1x2-check comes FIRST: it is what `v1.2-check` matches as a
+          # pattern, and a first match is what a lookup by pattern returns.
+          cat > "$tmp/Makefile" <<'EOF'
+          TEST_CMD = @echo test
+          TEST_FAST_CMD = @echo test-fast
+          CLEAN_PATHS = dist/
+          GATES_DEPS = lint covered deep dotdeep ci/all agg.x
+          LOCAL_TARGETS = v1x2-check v1.2-check covered deep dotdeep decoy \
+              ci/all agg.x aggxx orphan
+          include standard.mk
+          v1x2-check: decoy ## what v1.2-check matches as a pattern
+          v1.2-check: dotdeep ## a dotted name
+          covered: dir/stamp v1.2-check ## on a path and on a dotted name
+          dir/stamp: deep
+          deep: ## reached only through dir/stamp
+          dotdeep: ## reached only through v1.2-check
+          decoy: ## reached only through v1x2-check
+          ci/all: deep dotdeep ## an aggregate named as a path
+          agg.x: deep ## a dotted aggregate with no recipe
+          orphan: ## run by nothing
+          EOF
+          # The one recipe: agg.x's pattern also matches aggxx's block.
+          printf 'aggxx: orphan ## what agg.x matches, with a recipe\n\t@:\n' \
+            >> "$tmp/Makefile"
+          pass() {  # pass <label> <make args...>: exit 0, nothing on stderr
+            label="$1"; shift
+            if ! make -s -C "$tmp" "$@" > "$tmp/out" 2> "$tmp/err"; then
+              cat "$tmp/out" "$tmp/err"; echo "::error::$label failed"; exit 1
+            fi
+            if [ -s "$tmp/err" ]; then
+              cat "$tmp/err"; echo "::error::$label wrote to stderr"; exit 1
+            fi
+            echo "ok   pass: $label"
+          }
+          refuse() {  # refuse <label> <text> <make args...>: fails, naming it
+            label="$1"; text="$2"; shift 2
+            if make -s -C "$tmp" "$@" > "$tmp/out" 2>&1; then
+              cat "$tmp/out"; echo "::error::$label passed"; exit 1
+            fi
+            if ! grep -qF -- "$text" "$tmp/out"; then
+              cat "$tmp/out"; echo "::error::$label: no '$text'"; exit 1
+            fi
+            echo "ok   refused: $label"
+          }
+
+          # gates-check: CI's deep and dotdeep are reachable from gates only
+          # through dir/stamp and v1.2-check; decoy only through v1x2-check.
+          printf 'jobs:\n  x:\n    steps:\n' > "$ci"
+          for t in lint covered deep dotdeep; do
+            printf '      - run: make %s\n' "$t" >> "$ci"
+          done
+          pass "gates-check walks a path and a dotted name" \
+            gates-check GATES_DEPS="lint covered"
+          printf '      - run: make decoy\n' >> "$ci"
+          refuse "gates-check, a CI target only a look-alike reaches" \
+            "'make decoy'" gates-check GATES_DEPS="lint covered"
+
+          # gates-home-check: deep and dotdeep are homed by walking down from
+          # covered; ci/all and agg.x are recipe-less aggregates of homed
+          # parts. aggxx's recipe is not agg.x's.
+          printf 'jobs:\n  x:\n    steps:\n' > "$ci"
+          printf '      - run: make %s\n' lint covered >> "$ci"
+          pass "gates-home-check, down a path and up an aggregate" \
+            gates-home-check
+          refuse "gates-home-check, a gate only a look-alike reaches" \
+            "'make decoy'" gates-home-check \
+            GATES_DEPS="lint covered deep dotdeep ci/all agg.x decoy"
+
+          # help and help-check: each name finds its own description.
+          pass "help-check" help-check
+          make -s -C "$tmp" help > "$tmp/help"
+          for want in "v1[.]2-check  *a dotted name" \
+                      "ci/all  *an aggregate named as a path"; do
+            grep -qE "^  $want\$" "$tmp/help" \
+              || { cat "$tmp/help"; echo "::error::help lost: $want"; exit 1; }
+          done
+          echo "ok   pass: help names each target's own description"
+
+          # hook-dispatch-check: v1.2.check is no target, though as a pattern
+          # it matches v1x2-check.
+          hooks() {
+            { printf 'repos:\n  - repo: local\n    hooks:\n'
+              for t in "$@"; do
+                printf '      - id: %s\n        name: %s\n' "$t" "$t"
+                printf '        entry: make -s %s\n' "$t"
+                printf '        language: system\n'
+              done
+            } > "$tmp/.pre-commit-config.yaml"
+          }
+          hooks v1.2-check agg.x
+          pass "hook-dispatch-check, dotted targets that exist" \
+            hook-dispatch-check
+          hooks v1.2-check v1.2.check
+          refuse "hook-dispatch-check, a dotted target that does not exist" \
+            "  v1.2.check" hook-dispatch-check
+          echo "OK — a target name is a string: paths and dots, no stderr."
+
       - name: One red gate does not hide the gates behind it
         # `gates` re-invokes its list with -k instead of declaring it as
         # prerequisites, because make stops at the first failing prerequisite

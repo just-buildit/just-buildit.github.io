@@ -367,7 +367,7 @@ gates-check: ## Verify `gates` runs every make target CI invokes
 	 while [ -n "$$frontier" ]; do \
 	     next=""; \
 	     for t in $$frontier; do \
-	         for p in $$(sed -n "s/^$$t:[ ]*//p" "$$db" | sed 's/|.*//'); do \
+	         for p in $$($(_STD_DB_PREREQS)); do \
 	             case "$$closure" in *" $$p "*) ;; \
 	                 *) closure="$$closure$$p "; next="$$next $$p";; esac; \
 	         done; \
@@ -432,7 +432,7 @@ gates-home-check: ## Verify every gate in GATES_DEPS runs in some CI job
 	 while [ -n "$$frontier" ]; do \
 	     next=""; \
 	     for t in $$frontier; do \
-	         for p in $$(sed -n "s/^$$t:[ ]*//p" "$$db" | sed 's/|.*//'); do \
+	         for p in $$($(_STD_DB_PREREQS)); do \
 	             case "$$covered" in *" $$p "*) ;; \
 	                 *) covered="$$covered$$p "; next="$$next $$p";; esac; \
 	         done; \
@@ -447,9 +447,9 @@ gates-home-check: ## Verify every gate in GATES_DEPS runs in some CI job
 	     added=0; \
 	     for t in $(GATES_DEPS); do \
 	         case "$$covered" in *" $$t "*) continue;; esac; \
-	         line=$$(sed -n "s/^$$t:[ ]*//p" "$$db" | sed 's/|.*//' | head -n1); \
+	         line=$$($(_STD_DB_PREREQS) | head -n1); \
 	         [ -n "$$line" ] || continue; \
-	         sed -n "/^$$t:/,/^$$/p" "$$db" | grep -q 'recipe to execute' && continue; \
+	         $(_STD_RULE_BLOCK) "$$db" | grep -q 'recipe to execute' && continue; \
 	         all=1; \
 	         for p in $$line; do \
 	             case "$$covered" in *" $$p "*) ;; *) all=0;; esac; \
@@ -1589,6 +1589,25 @@ STD_TARGETS += hook-stage-check tracked-paths-check workflow-timeout-check \
 # is far too big to hold in a shell variable comfortably.
 _STD_TMP = mktemp "$${TMPDIR:-/tmp}/std.XXXXXX"
 
+# The rule for the target named in the calling recipe's `t`, read from the
+# files named after the macro, with the name matched as a LITERAL string:
+#   _STD_RULE_LINES  the text after `<t>:` on each line that starts with it
+#   _STD_RULE_BLOCK  each such line and the lines after it, up to a blank
+#                    one: that rule's entry in make's `-p` database
+#   _STD_DB_PREREQS  the prerequisites of `t` in the database `$$db`, the
+#                    order-only ones (after `|`) dropped
+# Every lookup of a target by name goes through these. A name is not a
+# pattern: pasted into `sed "s/^$$t:..."`, a prerequisite that is a path
+# ended the expression (sed: unknown option to `s'), so it was never walked,
+# and a `.` matched any character, so `v1.2-check` also read the rule of a
+# `v1x2-check` and gates-check passed a CI target `gates` never ran (#122).
+# ENVIRON rather than `awk -v`, which expands backslash escapes in a value.
+_STD_RULE_LINES = T="$$t" awk 'index($$0, ENVIRON["T"] ":") == 1 \
+	{ print substr($$0, length(ENVIRON["T"]) + 2) }'
+_STD_RULE_BLOCK = T="$$t" awk 'index($$0, ENVIRON["T"] ":") == 1 { on = 1 } \
+	on { print; if ($$0 == "") on = 0 }'
+_STD_DB_PREREQS = $(_STD_RULE_LINES) "$$db" | sed 's/^ *//; s/|.*//'
+
 # The `make <target>` invocations in the workflow file $$ci, one per line,
 # unsorted. ONE extractor because `gates-check` and `gates-home-check` are the
 # two directions of a single claim, and two copies of a scan is how the
@@ -1667,7 +1686,8 @@ _STD_CI_TARGETS = { $(_STD_MAKE_RUNS); \
 # the one exception: they are stamped out by `$(eval)`, so their source text
 # reads `lint-$(1):` and no scrape can find them by name — their description
 # comes from the macro that generated them.
-_STD_DESC = d=$$(sed -n "s/^$$t:.*\#\# *//p" $(MAKEFILE_LIST) | head -1); \
+_STD_DESC = d=$$($(_STD_RULE_LINES) $(MAKEFILE_LIST) \
+                | sed -n 's/.*\#\# *//p' | head -1); \
             case "$$t" in \
                 lint-*) [ -n "$$d" ] \
                     || d="Run $${t\#lint-} (pre-commit dispatch target)";; \
@@ -1983,7 +2003,7 @@ hook-dispatch-check: ## Verify every pre-commit hook dispatches to a real `make`
 	 n=0; missing=""; \
 	 for t in $$(sed -n "s/^[[:space:]]*entry:[[:space:]]*[\"']\{0,1\}make[[:space:]]\{1,\}\(-s[[:space:]]\{1,\}\)\{0,1\}\([a-zA-Z0-9_.-]\{1,\}\).*/\2/p" "$$cfg"); do \
 	     n=$$((n + 1)); \
-	     grep -q "^$$t:" "$$db" || missing="$$missing $$t"; \
+	     $(_STD_RULE_BLOCK) "$$db" | grep -q . || missing="$$missing $$t"; \
 	 done; \
 	 if [ -n "$$missing" ]; then \
 	     echo "ERROR: pre-commit dispatches to make targets that do not exist:"; \

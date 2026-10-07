@@ -4,7 +4,10 @@ The script asks GitHub three questions through ``gh api``. ``GH`` points it
 at a fake that answers from a JSON fixture and applies the script's OWN
 ``--jq`` filter with ``jq``, so the filters are exercised as written: which
 PRs count as merged, which app's check-run counts, and which run is newest.
-Stdlib only, like the other tests here; ``jq`` is on every Actions runner.
+Stdlib only, like the other tests here, plus ``jq``, which is on every
+Actions runner. Without it the class FAILS, naming jq: it used to skip, and
+unittest reports a skip as OK, so a box without jq passed having tested
+ci-tree-tested not at all (#121). tests/test_no_silent_skip.py holds this.
 
 Each case starts from the one shape that should skip -- a branch based on
 the tip, merged with the same tree, green as a PR -- and breaks exactly one
@@ -50,8 +53,17 @@ FAKE_GH = textwrap.dedent(
 )
 
 
-@unittest.skipUnless(shutil.which("jq"), "the fake gh needs jq")
 class CiTreeTested(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        # Fail, never skip: see the module docstring.
+        if shutil.which("jq") is None:
+            raise RuntimeError(
+                "jq is not on PATH: the fake gh applies ci-tree-tested.sh's "
+                "own --jq filters with it, so these tests cannot run "
+                "without it. Install jq."
+            )
+
     def setUp(self) -> None:
         self.tmp = pathlib.Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp)

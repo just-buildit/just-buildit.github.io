@@ -355,7 +355,7 @@ def check_pull_request(path: str) -> int:
         print(f"\n{_HOW}")
         return 1
     n = sum(len(CLOSING.findall(_lines(text))) for _, text in sources)
-    carry = f"{n} closing reference(s), each one declared" if n else "none"
+    carry = f"{n}, each one declared" if n else "none"
     print(
         f"close-keywords-check: {len(commits)} commit(s), the PR title and "
         f"its body; closing references: {carry}"

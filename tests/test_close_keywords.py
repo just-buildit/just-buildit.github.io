@@ -271,7 +271,7 @@ class PullRequest(unittest.TestCase):
         r = self.run_pr(head, "fix: a (gh-7)", None)
         self.assertEqual(r.returncode, 0, r.stdout)
         self.assertIn("1 commit(s)", r.stdout)
-        self.assertIn("1 closing reference(s), each one declared", r.stdout)
+        self.assertIn("closing references: 1, each one declared", r.stdout)
 
     def test_the_title_and_body_are_read_too(self) -> None:
         head = self.branch("fix: a")

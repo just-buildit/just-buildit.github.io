@@ -82,6 +82,8 @@ def path_without(tool: str, farm: pathlib.Path) -> str:
 
 
 class NoSilentSkip(unittest.TestCase):
+    maxDiff = None  # a refusal names every test it found, not the first
+
     def test_the_suite_without_jq_skips_nothing_and_names_jq(self) -> None:
         tmp = pathlib.Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp)

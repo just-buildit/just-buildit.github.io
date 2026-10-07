@@ -30,14 +30,20 @@ Subcommands
 ``sections BASE``
     ``make changelog-sections-check``. A section that shipped is history:
     no branch may change or delete one, or duplicate its heading.
-``assemble [--version X.Y.Z] [--check]``
+``assemble [--version X.Y.Z [--major]] [--check]``
     ``make changelog-assemble``. Promote every fragment into
     ``[Unreleased]`` and delete it; with ``--version``, also rename
-    ``[Unreleased]`` to the release. ``--check`` (``make
-    changelog-assembled-check``) mutates nothing and exits 1 while any
-    fragment is outstanding.
+    ``[Unreleased]`` to the release, once the version rule (``judge``)
+    accepts the number. ``--check`` (``make changelog-assembled-check``)
+    mutates nothing and exits 1 while any fragment is outstanding.
+``version X.Y.Z [--rev REV] [--major]``
+    ``make changelog-version-check``, which ``release-branch`` runs
+    before it branches or bumps. The version rule alone, mutating nothing:
+    is X.Y.Z the one number the fragments call for, over the highest
+    ``vX.Y.Z`` tag? ``--rev`` reads the fragments and the CHANGELOG at that
+    commit instead of the working tree.
 
-One parser serves all three. doppler's first version parsed
+One parser serves all four. doppler's first version parsed
 ``[Unreleased]`` in awk for the guard and in Python for the assembler, and
 just-makeit's section gate was a third; three readings of one file are three
 chances to disagree about where a section ends.
@@ -57,9 +63,20 @@ import argparse
 import datetime
 import os
 import pathlib
+import posixpath
 import re
 import subprocess
-from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
+from typing import (
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 #: Keep a Changelog's order, ``breaking`` first because a reader scanning a
 #: release wants that news before anything else, and ``docs``, which three of
@@ -293,21 +310,51 @@ def fragment_errors(
     return errs
 
 
-def fragments(
-    root: pathlib.Path, frag_dir: str, section_names: List[str]
-) -> Dict[str, List[pathlib.Path]]:
-    """Every fragment, by section in *section_names* order, sorted by name.
+def by_section(
+    paths: Iterable[str], frag_dir: str, section_names: List[str]
+) -> Dict[str, List[str]]:
+    """The fragments among *paths*, by section in *section_names* order.
 
-    Sorted so the assembled order is a property of the tree, not of the
-    order the filesystem returned.
+    The one reading of which file is a fragment of which section --
+    ``<frag_dir>/<section>/<slug>.md``, ``README.md`` aside -- for the
+    working tree (``fragments``) and for a commit (``version_check`` at a
+    rev). *paths* are POSIX and relative to the repo root, as ``git
+    ls-tree`` prints them. Each list is sorted, so the assembled order is
+    a property of the tree, not of the order a listing returned.
+
+    >>> by_section(["d/fixed/b.md", "d/added/a.md", "d/fixed/README.md",
+    ...             "d/x.md", "d/fixed/n/c.md", "d/fixed/a.md"],
+    ...            "d/", ["added", "fixed"])
+    {'added': ['d/added/a.md'], 'fixed': ['d/fixed/a.md', 'd/fixed/b.md']}
     """
-    found: Dict[str, List[pathlib.Path]] = {}
+    paths = list(paths)
+    base = posixpath.normpath(frag_dir)
+    found: Dict[str, List[str]] = {}
     for name in section_names:
-        d = root / frag_dir / name
-        files = sorted(p for p in d.glob("*.md") if p.name != "README.md")
+        files = sorted(
+            p
+            for p in paths
+            if posixpath.dirname(p) == f"{base}/{name}"
+            and p.endswith(".md")
+            and posixpath.basename(p) != "README.md"
+        )
         if files:
             found[name] = files
     return found
+
+
+def fragments(
+    root: pathlib.Path, frag_dir: str, section_names: List[str]
+) -> Dict[str, List[pathlib.Path]]:
+    """Every fragment in the working tree, as ``by_section`` reads them."""
+    listed = [
+        p.relative_to(root).as_posix()
+        for p in (root / frag_dir).glob("*/*.md")
+    ]
+    return {
+        name: [root / f for f in files]
+        for name, files in by_section(listed, frag_dir, section_names).items()
+    }
 
 
 def title(name: str) -> str:
@@ -317,6 +364,28 @@ def title(name: str) -> str:
     'Fixed'
     """
     return name.capitalize()
+
+
+def _subheading(name: str) -> re.Pattern[str]:
+    """The ``### <Name>`` line section *name* is published under."""
+    return re.compile(rf"^### {re.escape(title(name))}\s*$", re.M)
+
+
+def subsection(body: str, name: str) -> str:
+    """The text under ``### <Name>`` in *body*, to the next ``### ``.
+
+    ``""`` when *body* has no such heading.
+
+    >>> subsection("\\n### Added\\n\\n- a\\n\\n### Fixed\\n\\n- f\\n", "added")
+    '\\n- a\\n\\n'
+    >>> subsection("\\n### Fixed\\n\\n- f\\n", "added")
+    ''
+    """
+    m = _subheading(name).search(body)
+    if not m:
+        return ""
+    nxt = re.compile(r"^### ", re.M).search(body, m.end())
+    return body[m.end() : nxt.start() if nxt else len(body)]
 
 
 def insert(body: str, name: str, entries: str, order: List[str]) -> str:
@@ -331,8 +400,7 @@ def insert(body: str, name: str, entries: str, order: List[str]) -> str:
     >>> insert("\\n### Fixed\\n\\n- f\\n", "fixed", "- g", ["fixed"])
     '\\n### Fixed\\n\\n- f\\n\\n- g\\n'
     """
-    head = re.compile(rf"^### {re.escape(title(name))}\s*$", re.M)
-    m = head.search(body)
+    m = _subheading(name).search(body)
     if m:
         nxt = re.compile(r"^### ", re.M).search(body, m.end())
         cut = nxt.start() if nxt else len(body)
@@ -346,9 +414,7 @@ def insert(body: str, name: str, entries: str, order: List[str]) -> str:
         )
     later = order[order.index(name) + 1 :] if name in order else []
     for other in later:
-        m2 = re.compile(rf"^### {re.escape(title(other))}\s*$", re.M).search(
-            body
-        )
+        m2 = _subheading(other).search(body)
         if m2:
             return (
                 body[: m2.start()].rstrip("\n")
@@ -648,6 +714,271 @@ def sections_check(base_ref: str, changelog: str) -> int:
     return 1
 
 
+# ── version ──────────────────────────────────────────────────────────────────
+#
+# Which number a release may take. skills://release-process settles it, and
+# until this nothing enforced it: just-makeit proposed the wrong kind three
+# times in ten days -- 0.93.0 over twelve fixes, 0.97.0 over fixes, 0.98.4
+# over two additions -- each caught by hand before the tag. Its v* tags are
+# immutable, so the one that slips through is permanent
+# (just-buildit.github.io#125).
+#
+# Measured against the highest vX.Y.Z TAG, never the highest CHANGELOG
+# section: a version tagged and never published burned its number
+# (just-makeit 0.90.0), and the next release is the one after it.
+#
+#   * a fragment under added/, or an entry [Unreleased] already holds under
+#     ### Added (a plain `changelog-assemble` promotes without a version),
+#     makes the next MINOR: 0.y.z -> 0.(y+1).0;
+#   * anything else makes the next PATCH, breaking/ included: pre-1.0 a
+#     breaking change is said under ### Breaking and does not move the
+#     number;
+#   * a MAJOR is never read from fragments. It is a decision, passed as
+#     --major (`MAJOR=1` to make), and 1.0.0 is one;
+#   * exactly one number passes: one that skips (0.98.3 -> 0.98.5), or that
+#     is not above the tag, is refused.
+#
+# With no vX.Y.Z tag at all the repo is cutting its first release and there
+# is nothing to measure against, so only the MAJOR rule applies.
+
+#: The section whose fragments make a release a MINOR.
+MINOR_SECTION = "added"
+
+Version = Tuple[int, int, int]
+
+
+def parse_version(text: str) -> Optional[Version]:
+    """*text* as ``(X, Y, Z)`` when it is ``X.Y.Z``, else None.
+
+    >>> parse_version("0.100.0"), parse_version("1.0.0rc1")
+    ((0, 100, 0), None)
+    """
+    if not VERSION_RE.match(text):
+        return None
+    x, y, z = (int(n) for n in text.split("."))
+    return (x, y, z)
+
+
+def show_version(v: Version) -> str:
+    """``(0, 99, 0)`` as ``0.99.0``."""
+    return ".".join(str(n) for n in v)
+
+
+def last_release(tags: Iterable[str]) -> Optional[str]:
+    """The highest ``vX.Y.Z`` among *tags*, compared as numbers, or None.
+
+    Nothing else is a release: a build tag (just-bashit's
+    ``v0.1.9-100190b``), a pre-release, a tag without the ``v``
+    (just-makeit's ``0.9.0``).
+
+    >>> last_release(["v0.9.0", "v0.10.0", "v0.1.9-100190b", "0.11.0",
+    ...               "v1.0.0rc1"])
+    'v0.10.0'
+    >>> last_release(["0.9.0"]) is None
+    True
+    """
+    found = [(parse_version(t[1:]), t) for t in tags if t.startswith("v")]
+    released = [(v, t) for v, t in found if v is not None]
+    return max(released)[1] if released else None
+
+
+def next_version(v: Version, kind: str) -> Version:
+    """The release after *v* of *kind*: ``MAJOR``, ``MINOR`` or ``PATCH``.
+
+    >>> [next_version((0, 98, 3), k) for k in ("MAJOR", "MINOR", "PATCH")]
+    [(1, 0, 0), (0, 99, 0), (0, 98, 4)]
+    """
+    x, y, z = v
+    if kind == "MAJOR":
+        return (x + 1, 0, 0)
+    if kind == "MINOR":
+        return (x, y + 1, 0)
+    return (x, y, z + 1)
+
+
+def bump_kind(old: Version, new: Version) -> Optional[str]:
+    """The component *new* raises over *old* first; None if not above it.
+
+    >>> bump_kind((0, 98, 3), (0, 98, 5)), bump_kind((0, 98, 3), (0, 99, 1))
+    ('PATCH', 'MINOR')
+    >>> bump_kind((0, 98, 3), (1, 0, 0)), bump_kind((0, 98, 3), (0, 98, 3))
+    ('MAJOR', None)
+    """
+    if new <= old:
+        return None
+    if new[0] != old[0]:
+        return "MAJOR"
+    return "MINOR" if new[1] != old[1] else "PATCH"
+
+
+def _count(n: int, one: str, many: str) -> str:
+    return f"{n} {one if n == 1 else many}"
+
+
+class Evidence(NamedTuple):
+    """What decides a release's kind, kept as the refusal names it."""
+
+    frag_dir: str
+    #: Fragment file names, by section, in ``by_section`` order.
+    found: Dict[str, List[str]]
+    #: Entries ``[Unreleased]`` already holds under ``### Added``.
+    unreleased_added: int
+
+    def kind(self) -> str:
+        """``MINOR`` when anything is added, else ``PATCH``."""
+        added = self.found.get(MINOR_SECTION) or self.unreleased_added
+        return "MINOR" if added else "PATCH"
+
+    def why(self) -> str:
+        """The fragments that decide ``kind``, as one clause.
+
+        >>> Evidence("d", {"added": ["a.md", "b.md"]}, 0).why()
+        'd/added/ holds 2 fragments (a.md, b.md)'
+        >>> Evidence("d/", {"fixed": ["x.md"], "docs": ["y.md"]}, 0).why()
+        'd/added/ holds none (fixed/: 1, docs/: 1)'
+        >>> Evidence("d", {}, 1).why()
+        '[Unreleased] already holds 1 ### Added entry'
+        """
+        d = f"{posixpath.normpath(self.frag_dir)}/{MINOR_SECTION}/"
+        added = self.found.get(MINOR_SECTION, [])
+        clauses: List[str] = []
+        if added:
+            names = ", ".join(added[:3])
+            if len(added) > 3:
+                names += f", +{len(added) - 3} more"
+            n = _count(len(added), "fragment", "fragments")
+            clauses.append(f"{d} holds {n} ({names})")
+        if self.unreleased_added:
+            n = _count(
+                self.unreleased_added, "### Added entry", "### Added entries"
+            )
+            clauses.append(f"[Unreleased] already holds {n}")
+        if clauses:
+            return " and ".join(clauses)
+        rest = ", ".join(f"{s}/: {len(f)}" for s, f in self.found.items())
+        return f"{d} holds none ({rest or 'no fragment is outstanding'})"
+
+
+def evidence(
+    frag_dir: str,
+    found: Dict[str, Sequence[Union[str, pathlib.Path]]],
+    changelog_text: str,
+) -> Evidence:
+    """The ``Evidence`` in *found* (``by_section``) and the CHANGELOG."""
+    return Evidence(
+        frag_dir,
+        {s: [pathlib.PurePath(f).name for f in fs] for s, fs in found.items()},
+        count_entries(
+            subsection(unreleased_body(changelog_text), MINOR_SECTION)
+        ),
+    )
+
+
+def judge(
+    version: str, tags: Iterable[str], ev: Evidence, major: bool = False
+) -> Tuple[bool, str]:
+    """Is *version* the one number *ev* calls for after the last release?
+
+    Returns ``(ok, line)``. The line says why either way; a refusal names
+    the number that would pass and the fragments that decide it.
+
+    >>> ev = Evidence("changelog.d", {"added": ["a.md", "b.md"]}, 0)
+    >>> ok, line = judge("0.99.0", ["v0.98.3"], ev)
+    >>> ok, line  # doctest: +NORMALIZE_WHITESPACE
+    (True, '0.99.0 is the next MINOR over v0.98.3:
+            changelog.d/added/ holds 2 fragments (a.md, b.md)')
+    >>> print(judge("0.98.4", ["v0.98.3"], ev)[1])
+    ... # doctest: +NORMALIZE_WHITESPACE
+    0.98.4 is a PATCH over v0.98.3, but changelog.d/added/ holds 2 fragments
+    (a.md, b.md), so this is a MINOR: 0.99.0
+    >>> print(judge("0.100.0", ["v0.98.3"], ev)[1])
+    ... # doctest: +NORMALIZE_WHITESPACE
+    0.100.0 skips a number over v0.98.3: changelog.d/added/ holds 2
+    fragments (a.md, b.md), so this is a MINOR: 0.99.0
+    """
+    new = parse_version(version)
+    if new is None:
+        raise SystemExit(f"changelog: {version!r} is not X.Y.Z")
+    tag = last_release(tags)
+    if tag is None:
+        if new[0] >= 1 and not major:
+            return False, (
+                f"{version} is a MAJOR, which fragments never call for: "
+                "cutting one is a decision -- pass MAJOR=1 (--major)"
+            )
+        return True, (
+            f"{version}: no vX.Y.Z tag yet, so a first release, with nothing "
+            "to measure it against"
+        )
+    old = parse_version(tag[1:])
+    assert old is not None  # last_release returns only vX.Y.Z
+    kind = ev.kind()
+    want = next_version(old, kind)
+    decided = f"{ev.why()}, so this is a {kind}: {show_version(want)}"
+    got = bump_kind(old, new)
+    if got is None:
+        return False, (
+            f"{version} is not above {tag}, the last release: {decided}"
+        )
+    if got == "MAJOR":
+        if not major:
+            return False, (
+                f"{version} is a MAJOR over {tag}, which fragments never call "
+                f"for: {decided}. Cutting a MAJOR is a decision -- pass "
+                "MAJOR=1 (--major)"
+            )
+        if new != next_version(old, "MAJOR"):
+            return False, (
+                f"{version} skips a number over {tag}: the next MAJOR is "
+                f"{show_version(next_version(old, 'MAJOR'))}"
+            )
+        return True, f"{version} is the next MAJOR over {tag}, by --major"
+    if got != kind:
+        return False, f"{version} is a {got} over {tag}, but {decided}"
+    if new != want:
+        return False, f"{version} skips a number over {tag}: {decided}"
+    return True, f"{version} is the next {kind} over {tag}: {ev.why()}"
+
+
+def release_tags() -> List[str]:
+    """Every local ``v*`` tag; ``make changelog-version-check`` fetches."""
+    return git("tag", "--list", "v*").stdout.split()
+
+
+def version_check(
+    version: str,
+    changelog: str,
+    frag_dir: str,
+    section_names: List[str],
+    rev: str = "",
+    major: bool = False,
+) -> int:
+    """``make changelog-version-check``: the version rule, writing nothing.
+
+    With *rev*, the fragments and the CHANGELOG are read from that commit,
+    so ``release-branch`` can ask about the tree it is about to branch from
+    before it has branched, bumped or assembled anything -- a refusal after
+    the bump would leave a half-made branch.
+    """
+    if rev:
+        r = git("ls-tree", "-r", "-z", "--name-only", rev, "--", frag_dir)
+        if r.returncode != 0:
+            raise SystemExit(f"changelog: cannot read {rev} -- fetch it first")
+        found: Dict[str, Sequence[Union[str, pathlib.Path]]] = dict(
+            by_section(r.stdout.split("\0"), frag_dir, section_names)
+        )
+        text = show(rev, changelog)
+    else:
+        found = dict(fragments(pathlib.Path("."), frag_dir, section_names))
+        path = pathlib.Path(changelog)
+        text = path.read_text(encoding="utf-8") if path.is_file() else ""
+    ok, line = judge(
+        version, release_tags(), evidence(frag_dir, found, text), major
+    )
+    print(f"changelog-version-check: {line}")
+    return 0 if ok else 1
+
+
 # ── assemble ─────────────────────────────────────────────────────────────────
 
 
@@ -658,6 +989,7 @@ def assemble(
     version: str = "",
     check_only: bool = False,
     today: Optional[str] = None,
+    major: bool = False,
 ) -> int:
     root = pathlib.Path(".")
     errs = fragment_errors(root, frag_dir, section_names)
@@ -684,6 +1016,14 @@ def assemble(
 
     path = root / changelog
     text = path.read_text(encoding="utf-8")
+    if version:
+        # Before anything is written: the fragments still hold the answer.
+        ok, line = judge(
+            version, release_tags(), evidence(frag_dir, found, text), major
+        )
+        if not ok:
+            print(f"changelog-assemble: {line}")
+            return 1
     if total:
         m = re.search(r"^## \[Unreleased\][^\n]*\n?", text, re.M)
         if not m:
@@ -738,9 +1078,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     c.add_argument("code_paths", nargs="+")
     s = sub.add_parser("sections", help="no released section is edited")
     s.add_argument("base")
-    a = sub.add_parser("assemble", help="promote fragments")
+    major = argparse.ArgumentParser(add_help=False)
+    major.add_argument(
+        "--major",
+        action="store_true",
+        help="allow a MAJOR (1.0.0 is one): a decision, never a fragment's",
+    )
+    a = sub.add_parser("assemble", help="promote fragments", parents=[major])
     a.add_argument("--version", default="", metavar="X.Y.Z")
     a.add_argument("--check", action="store_true")
+    v = sub.add_parser(
+        "version",
+        help="is X.Y.Z the number the fragments call for?",
+        parents=[major],
+    )
+    v.add_argument("version", metavar="X.Y.Z")
+    v.add_argument(
+        "--rev", default="", help="read this commit, not the working tree"
+    )
     args = ap.parse_args(argv)
     names = args.sections.split()
 
@@ -752,17 +1107,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         return check(args.base, args.code_paths, args.file, args.dir, names)
     if args.cmd == "sections":
         return sections_check(args.base, args.file)
-    if args.check and args.version:
-        raise SystemExit(
-            "changelog: --check and --version are opposites; --check mutates "
-            "nothing."
-        )
     if args.version and not VERSION_RE.match(args.version):
         raise SystemExit(
             f"changelog: --version {args.version!r} is not X.Y.Z (a "
             "pre-release suffix is refused, as bump-version refuses it)"
         )
-    return assemble(args.file, args.dir, names, args.version, args.check)
+    if args.cmd == "version":
+        return version_check(
+            args.version, args.file, args.dir, names, args.rev, args.major
+        )
+    if args.check and args.version:
+        raise SystemExit(
+            "changelog: --check and --version are opposites; --check mutates "
+            "nothing."
+        )
+    return assemble(
+        args.file, args.dir, names, args.version, args.check, major=args.major
+    )
 
 
 if __name__ == "__main__":

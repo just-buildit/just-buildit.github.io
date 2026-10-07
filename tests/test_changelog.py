@@ -10,13 +10,15 @@ from __future__ import annotations
 
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
 
-SCRIPT = pathlib.Path(__file__).resolve().parent.parent / "scripts" / "changelog.py"
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+SCRIPT = ROOT / "scripts" / "changelog.py"
 
 BASE_CHANGELOG = textwrap.dedent(
     """\
@@ -206,8 +208,8 @@ class Check(Base):
         self.r.write("changelog.d/fixed/x.md", "- **x.**\n")
         self.r.commit()
         self.r.git("checkout", "-q", "-B", "feature")
-        self.ok(self.r.run("assemble", "--version", "1.1.0"))
-        self.r.write("src/a.py", "__version__ = '1.1.0'\n")
+        self.ok(self.r.run("assemble", "--version", "1.0.1"))
+        self.r.write("src/a.py", "__version__ = '1.0.1'\n")
         self.r.commit("release")
         self.ok(self.check())
         self.ok(self.sections())
@@ -247,17 +249,23 @@ class Assemble(Base):
 
     def test_version_renames_with_the_files_own_separator(self) -> None:
         self.r.write("changelog.d/fixed/x.md", "- **x.**\n")
-        self.ok(self.r.run("assemble", "--version", "1.1.0"))
+        self.ok(self.r.run("assemble", "--version", "1.0.1"))
         text = self.r.read("CHANGELOG.md")
         self.assertRegex(
             text,
-            r"## \[Unreleased\]\n\n## \[1\.1\.0\] — \d{4}-\d{2}-\d{2}\n\n"
+            r"## \[Unreleased\]\n\n## \[1\.0\.1\] — \d{4}-\d{2}-\d{2}\n\n"
             r"### Fixed\n\n- \*\*x\.\*\*\n\n## \[1\.0\.0\]",
         )
 
     def test_version_refuses_an_existing_section(self) -> None:
-        self.bad(self.r.run("assemble", "--version", "1.0.0"), "already has")
-        self.assertEqual(self.r.read("CHANGELOG.md"), BASE_CHANGELOG)
+        # A release merged and not yet tagged: the number is still the next
+        # one by the tags, and the section already there is what refuses it.
+        merged = BASE_CHANGELOG.replace(
+            "## [1.0.0]", "## [1.0.1] — 2026-01-02\n\n- **y.**\n\n## [1.0.0]"
+        )
+        self.r.write("CHANGELOG.md", merged)
+        self.bad(self.r.run("assemble", "--version", "1.0.1"), "already has")
+        self.assertEqual(self.r.read("CHANGELOG.md"), merged)
 
     def test_version_refuses_a_prerelease(self) -> None:
         self.bad(self.r.run("assemble", "--version", "1.1.0rc1"), "not X.Y.Z")
@@ -438,6 +446,305 @@ class SpanPairing(unittest.TestCase):
 
     def test_line_is_where_the_span_opens(self) -> None:
         self.assertEqual(self.runs("x\n`a\n    b`"), [(2, "a\n    b")])
+
+
+
+class VersionKind(Base):
+    """The version rule (just-buildit.github.io#125), over the tag v1.0.0.
+
+    ``version`` is the check-only entry ``release-branch`` calls before it
+    branches or bumps; ``assemble --version`` asks the same question before
+    it writes. Both are driven, so neither can pass what the other refuses.
+    """
+
+    def frag(self, section: str, slug: str = "x") -> None:
+        self.r.write(f"changelog.d/{section}/{slug}.md", f"- **{slug}.**\n")
+
+    def version(self, v: str, *extra: str) -> subprocess.CompletedProcess:
+        return self.r.run("version", v, *extra)
+
+    def test_an_addition_makes_the_next_minor(self) -> None:
+        self.frag("added", "new")
+        self.frag("fixed", "bug")
+        p = self.version("1.1.0")
+        self.ok(p)
+        self.assertIn("1.1.0 is the next MINOR over v1.0.0", p.stdout)
+        self.ok(self.r.run("assemble", "--version", "1.1.0"))
+
+    def test_a_patch_over_an_addition_is_refused(self) -> None:
+        # just-makeit 0.98.4, 2026-10-06: two added/ fragments, and a PATCH
+        # proposed and approved.
+        self.frag("added", "new")
+        line = (
+            "1.0.1 is a PATCH over v1.0.0, but changelog.d/added/ holds 1 "
+            "fragment (new.md), so this is a MINOR: 1.1.0"
+        )
+        self.bad(self.version("1.0.1"), line)
+        self.bad(self.r.run("assemble", "--version", "1.0.1"), line)
+        self.assertEqual(self.r.read("CHANGELOG.md"), BASE_CHANGELOG)
+        self.assertTrue((self.r.root / "changelog.d/added/new.md").exists())
+
+    def test_no_addition_makes_the_next_patch(self) -> None:
+        # Pre-1.0 a breaking change is said, not counted (release-process).
+        self.frag("breaking", "b")
+        self.frag("fixed")
+        self.frag("docs", "d")
+        self.ok(self.version("1.0.1"))
+        self.bad(
+            self.version("1.1.0"),
+            "1.1.0 is a MINOR over v1.0.0, but changelog.d/added/ holds none "
+            "(breaking/: 1, fixed/: 1, docs/: 1), so this is a PATCH: 1.0.1",
+        )
+        self.bad(self.r.run("assemble", "--version", "1.1.0"), "PATCH: 1.0.1")
+
+    def test_with_no_fragment_at_all_it_is_a_patch(self) -> None:
+        self.ok(self.version("1.0.1"))
+        self.bad(self.version("1.1.0"), "no fragment is outstanding")
+
+    def test_a_skipped_number_is_refused(self) -> None:
+        self.frag("fixed")
+        self.bad(
+            self.version("1.0.2"),
+            "1.0.2 skips a number over v1.0.0",
+            "so this is a PATCH: 1.0.1",
+        )
+        self.frag("added", "new")
+        for v in ("1.2.0", "1.1.1"):
+            with self.subTest(v=v):
+                self.bad(
+                    self.version(v),
+                    f"{v} skips a number over v1.0.0",
+                    "so this is a MINOR: 1.1.0",
+                )
+        self.bad(self.r.run("assemble", "--version", "1.2.0"), "skips")
+
+    def test_a_number_not_above_the_tag_is_refused(self) -> None:
+        for v in ("1.0.0", "0.9.9"):
+            with self.subTest(v=v):
+                self.bad(
+                    self.version(v),
+                    f"{v} is not above v1.0.0, the last release",
+                    "PATCH: 1.0.1",
+                )
+
+    def test_a_major_is_a_decision_not_a_fragment(self) -> None:
+        self.frag("breaking", "b")
+        self.bad(self.version("2.0.0"), "2.0.0 is a MAJOR over v1.0.0")
+        self.bad(self.version("2.0.0"), "pass MAJOR=1 (--major)")
+        self.bad(self.r.run("assemble", "--version", "2.0.0"), "MAJOR=1")
+        self.ok(self.version("2.0.0", "--major"))
+        self.bad(self.version("3.0.0", "--major"), "the next MAJOR is 2.0.0")
+        # The decision allows a MAJOR and nothing else.
+        self.bad(self.version("1.1.0", "--major"), "so this is a PATCH: 1.0.1")
+        self.ok(self.r.run("assemble", "--version", "2.0.0", "--major"))
+
+    def test_the_highest_tag_decides_not_the_highest_section(self) -> None:
+        # Tagged and never published, so CHANGELOG has no [1.0.1]: its number
+        # is burned all the same (just-makeit 0.90.0).
+        self.r.git("tag", "v1.0.1")
+        self.frag("fixed")
+        self.bad(self.version("1.0.1"), "not above v1.0.1", "PATCH: 1.0.2")
+        self.ok(self.version("1.0.2"))
+
+    def test_tags_compare_as_numbers_and_only_releases_count(self) -> None:
+        # A build tag (just-bashit's v0.1.9-100190b), a pre-release and a tag
+        # without the v (just-makeit's 0.9.0) are not releases.
+        for t in ("v1.9.0", "v1.10.0", "v9.9.9-abc1234", "v9.0.0rc1", "9.9.9"):
+            self.r.git("tag", t)
+        self.frag("fixed")
+        self.ok(self.version("1.10.1"))
+
+    def test_a_first_release_has_nothing_to_measure_against(self) -> None:
+        self.r.git("tag", "-d", "v1.0.0")
+        self.frag("fixed")
+        p = self.version("0.1.0")
+        self.ok(p)
+        self.assertIn("first release", p.stdout)
+        self.bad(self.version("1.0.0"), "1.0.0 is a MAJOR", "MAJOR=1")
+        self.ok(self.version("1.0.0", "--major"))
+
+    def test_an_addition_already_promoted_still_makes_a_minor(self) -> None:
+        # A plain `changelog-assemble` promoted it before the release, so no
+        # fragment is left to say so.
+        self.frag("added", "new")
+        self.ok(self.r.run("assemble"))
+        self.assertFalse((self.r.root / "changelog.d/added/new.md").exists())
+        self.bad(
+            self.version("1.0.1"),
+            "[Unreleased] already holds 1 ### Added entry",
+            "so this is a MINOR: 1.1.0",
+        )
+        self.ok(self.r.run("assemble", "--version", "1.1.0"))
+
+    def test_rev_reads_that_commit_not_the_working_tree(self) -> None:
+        # release-branch asks about origin/main before it has branched: what
+        # the checkout holds is not what will be released.
+        self.r.git("checkout", "-q", "main")
+        self.frag("added", "new")
+        self.r.commit()
+        self.r.git("checkout", "-q", "feature")
+        self.frag("fixed", "local")  # uncommitted, and not on main
+        self.ok(self.version("1.0.1"))
+        self.bad(
+            self.version("1.0.1", "--rev", "main"),
+            "changelog.d/added/ holds 1 fragment (new.md)",
+            "so this is a MINOR: 1.1.0",
+        )
+        self.ok(self.version("1.1.0", "--rev", "main"))
+
+    def test_a_rev_that_is_not_there_is_refused(self) -> None:
+        self.bad(self.version("1.0.1", "--rev", "origin/main"), "cannot read")
+
+    def test_the_three_near_misses(self) -> None:
+        # just-makeit, 2026-09-26 to 10-06: each wrong number was proposed,
+        # approved, and caught by hand before its tag.
+        self.r.git("tag", "-d", "v1.0.0")
+        cases = [
+            ("v0.92.0", "fixed", 12, "0.93.0", "0.92.1"),
+            ("v0.96.0", "fixed", 3, "0.97.0", "0.96.1"),
+            ("v0.98.3", "added", 2, "0.98.4", "0.99.0"),
+        ]
+        for tag, section, n, wrong, right in cases:
+            with self.subTest(tag=tag):
+                self.r.git("tag", tag)
+                for i in range(n):
+                    self.frag(section, f"f{i}")
+                self.bad(self.version(wrong), "so this is a ", right)
+                self.ok(self.version(right))
+                shutil.rmtree(self.r.root / "changelog.d" / section)
+
+
+#: An adopter's Makefile, with both groups on and a bump that leaves a mark.
+RELEASE_MAKEFILE = textwrap.dedent(
+    """\
+    TEST_CMD = @echo test
+    TEST_FAST_CMD = @echo test-fast
+    CLEAN_PATHS = dist/
+    HAS_RELEASE = 1
+    HAS_CHANGELOG = 1
+    CHANGELOG_CODE_PATHS = src
+    BUMP_VERSION_CMD = printf 'version = "$(VERSION)"\\n' > pyproject.toml
+    RELEASE_WATCH_CMD = @echo watch
+    VERSION_PROBES = pyproject.toml|cat pyproject.toml
+    include standard.mk
+    """
+)
+
+
+class ReleaseBranch(unittest.TestCase):
+    """``make release-branch`` asks the version rule before it makes anything.
+
+    The adopter's clone is stale on purpose, the way a releaser's is: its
+    main is behind origin's, which has since gained an added/ fragment, and
+    it holds none of origin's tags (``git fetch origin main`` brings none).
+    So the check must read origin/main and fetch the tags itself; reading the
+    checkout, or the local tags, accepts the wrong number. And it must run
+    before the bump, or its refusal leaves a half-made branch.
+    """
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        top = pathlib.Path(tmp.name)
+        subprocess.run(
+            ["git", "init", "-q", "--bare", "-b", "main", str(top / "o.git")],
+            check=True,
+        )
+        seed = self.clone(top, "seed")
+        seed.write("standard.mk", (ROOT / "standard.mk").read_text("utf-8"))
+        seed.write("scripts/changelog.py", SCRIPT.read_text("utf-8"))
+        seed.write("Makefile", RELEASE_MAKEFILE)
+        seed.write(
+            "CHANGELOG.md",
+            "# Changelog\n\n## [Unreleased]\n\n## [0.98.3] - 2026-10-01\n\n"
+            "- **x.**\n",
+        )
+        seed.write("pyproject.toml", 'version = "0.98.3"\n')
+        seed.write("changelog.d/fixed/bug.md", "- **bug.**\n")
+        seed.commit("base")
+        seed.git("tag", "v0.98.3")
+        seed.git("push", "-q", "origin", "HEAD:main", "v0.98.3")
+        self.r = self.clone(top, "work")
+        self.r.git("tag", "-d", "v0.98.3")
+        seed.write("changelog.d/added/new.md", "- **new.**\n")
+        seed.commit("an addition")
+        seed.git("push", "-q", "origin", "HEAD:main")
+
+    def clone(self, top: pathlib.Path, name: str) -> Repo:
+        subprocess.run(
+            ["git", "clone", "-q", str(top / "o.git"), str(top / name)],
+            check=True,
+            capture_output=True,
+        )
+        r = Repo(top / name)
+        r.git("config", "user.email", "t@example.com")
+        r.git("config", "user.name", "t")
+        r.git("config", "commit.gpgsign", "false")
+        r.git("config", "tag.gpgsign", "false")
+        return r
+
+    def make(self, *args: str, **env: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["make", "--no-print-directory", *args],
+            cwd=self.r.root,
+            capture_output=True,
+            text=True,
+            env={**os.environ, **env},
+        )
+
+    def assert_untouched(self, version: str) -> None:
+        branches = self.r.git("branch", "--list", f"chore/release-{version}")
+        self.assertEqual(branches, "", "a refused release left its branch")
+        head = self.r.git("rev-parse", "--abbrev-ref", "HEAD")
+        self.assertEqual(head, "main\n")
+        self.assertEqual(self.r.git("status", "--porcelain"), "")
+        self.assertEqual(self.r.read("pyproject.toml"), 'version = "0.98.3"\n')
+
+    def test_a_wrong_kind_is_refused_before_anything_is_made(self) -> None:
+        p = self.make("release-branch", "VERSION=0.98.4")
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn(
+            "0.98.4 is a PATCH over v0.98.3, but changelog.d/added/ holds 1 "
+            "fragment (new.md), so this is a MINOR: 0.99.0",
+            p.stdout,
+        )
+        self.assertNotIn("Bumped to", p.stdout)
+        self.assert_untouched("0.98.4")
+
+    def test_a_skipped_number_is_refused_before_anything_is_made(self) -> None:
+        p = self.make("release-branch", "VERSION=0.100.0")
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("0.100.0 skips a number over v0.98.3", p.stdout)
+        self.assert_untouched("0.100.0")
+
+    def test_the_number_the_fragments_call_for_is_cut(self) -> None:
+        p = self.make("release-branch", "VERSION=0.99.0")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("0.99.0 is the next MINOR over v0.98.3", p.stdout)
+        head = self.r.git("rev-parse", "--abbrev-ref", "HEAD")
+        self.assertEqual(head, "chore/release-0.99.0\n")
+        self.assertEqual(self.r.read("pyproject.toml"), 'version = "0.99.0"\n')
+        text = self.r.read("CHANGELOG.md")
+        self.assertIn("## [0.99.0]", text)
+        self.assertIn("### Added\n\n- **new.**", text)
+        self.assertFalse((self.r.root / "changelog.d/added/new.md").exists())
+
+    def test_a_major_is_cut_only_by_a_typed_decision(self) -> None:
+        # From the environment MAJOR carries no evidence it was meant, the
+        # reason a bare VERSION is refused there too.
+        p = self.make("release-branch", "VERSION=1.0.0", MAJOR="1")
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("1.0.0 is a MAJOR over v0.98.3", p.stdout)
+        self.assert_untouched("1.0.0")
+        p = self.make("release-branch", "VERSION=1.0.0", "MAJOR=1")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.r.read("pyproject.toml"), 'version = "1.0.0"\n')
+        self.assertIn("## [1.0.0]", self.r.read("CHANGELOG.md"))
+
+    def test_the_check_alone_needs_a_version(self) -> None:
+        p = self.make("changelog-version-check")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("usage: make changelog-version-check", p.stdout)
 
 
 if __name__ == "__main__":

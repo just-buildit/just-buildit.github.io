@@ -82,14 +82,15 @@ entry verbatim, starting with `- `.
 
 ### What will stop you, and what it means
 
-| message                           | meaning                                              |
-| --------------------------------- | ---------------------------------------------------- |
-| `standard.mk differs from …`      | your copy drifted — re-fetch canonical               |
-| `cannot fetch …`                  | the gate could not reach its reference, so it failed |
-| `'X' has no '## description'`     | undocumented target, or a rule `help` omits          |
-| `.PHONY targets with no recipe`   | a target that exits 0 having done nothing            |
-| `HAS_X is on, but X_CMD is empty` | flag enabled, its command never set                  |
-| `… so this is a MINOR: 0.99.0`    | the fragments call for another number — cut that one |
+| message                                    | meaning                                              |
+| ------------------------------------------ | ---------------------------------------------------- |
+| `standard.mk differs from …`               | your copy drifted — re-fetch canonical               |
+| `cannot fetch …`                           | the gate could not reach its reference, so it failed |
+| `'X' has no '## description'`              | undocumented target, or a rule `help` omits          |
+| `.PHONY targets with no recipe`            | a target that exits 0 having done nothing            |
+| `HAS_X is on, but X_CMD is empty`          | flag enabled, its command never set                  |
+| `… so this is a MINOR: 0.99.0`             | the fragments call for another number — cut that one |
+| `would close issue(s) it does not declare` | a closing keyword before an issue it does not close  |
 
 ### One job per file
 

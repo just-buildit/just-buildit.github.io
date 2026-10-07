@@ -853,7 +853,10 @@ export VERSION_PROBES
 # Extra guidance echoed after `release-branch`, repo-specific by nature.
 RELEASE_BRANCH_NOTES ?=
 # What `release-branch` does about the changelog: tell a human, unless
-# HAS_CHANGELOG (below) replaces both with the assembly itself.
+# HAS_CHANGELOG (below) replaces both with the assembly itself -- and asks,
+# before anything is made, whether VERSION is the number the fragments call
+# for (`_std_release_version_check`).
+_std_release_version_check  =
 _std_release_changelog      =
 _std_release_changelog_note = @echo "  - edit CHANGELOG.md ([Unreleased] -> [$(VERSION)])"
 
@@ -1253,12 +1256,17 @@ ci-changes-wiring-check: ## Verify GATES_CI_FILE gates every job on the vendored
 # whatever HEAD the invoker happens to be on (a feature branch, a stale main),
 # silently building the release on the wrong base — the bump then misses
 # everything merged since.
+#
+# The version check comes FIRST, before the branch and the bump: the bump
+# rewrites the manifests before the assembly reads the fragments, so a number
+# refused there would leave a half-made branch (just-buildit.github.io#125).
 release-branch: ## VERSION=x.y.z — branch off origin/main and bump
 ifndef VERSION
 	@echo "usage: make release-branch VERSION=<x.y.z>"
 	@exit 1
 endif
 	git fetch origin main
+	$(_std_release_version_check)
 	git checkout -b chore/release-$(VERSION) origin/main
 	@$(MAKE) bump-version VERSION=$(VERSION)
 	$(_std_release_changelog)
@@ -1381,7 +1389,7 @@ endif
 #                         adopters already publish a `### Docs`.
 ifeq ($(HAS_CHANGELOG),1)
 STD_TARGETS += changelog-check changelog-sections-check changelog-assemble \
-               changelog-assembled-check
+               changelog-assembled-check changelog-version-check
 
 CHANGELOG_FILE       ?= CHANGELOG.md
 CHANGELOG_DIR        ?= changelog.d
@@ -1416,8 +1424,34 @@ changelog-sections-check: ## A branch edits no released CHANGELOG section
 # tracked, so the next `make lint` would hand the formatter paths that no
 # longer exist and fail on a step that succeeded (doppler, cutting v0.44.0).
 changelog-assemble: ## [VERSION=x.y.z] Promote changelog.d/ fragments into CHANGELOG.md
-	@$(_std_changelog) assemble $(if $(VERSION),--version $(VERSION))
+	@$(_std_changelog) assemble $(if $(VERSION),--version $(VERSION) $(_std_changelog_major))
 	@git add -A $(CHANGELOG_DIR) $(CHANGELOG_FILE)
+
+# The number a release may take, read from what it releases: a fragment under
+# added/ makes the next MINOR, anything else the next PATCH, over the highest
+# vX.Y.Z tag; a skipped number is refused. just-makeit proposed the wrong kind
+# three times in ten days, each caught by hand, and its tags are immutable
+# (just-buildit.github.io#125; the rule is the header of `## version` in
+# scripts/changelog.py). `changelog-assemble VERSION=` asks it too, before it
+# writes.
+#
+# It reads origin/main, the tree `release-branch` branches from, and every
+# tag, fetched here: `git fetch origin main` brings no tags, and a tag missing
+# locally would measure the release against an older one.
+#
+# A MAJOR -- 1.0.0 is one -- is never read from fragments. It is a decision,
+# and `MAJOR=1` says so, honoured only on the command line for the reason
+# VERSION is (above): a name in the environment carries no evidence of intent.
+_std_major_typed     = $(filter command line,$(origin MAJOR))
+_std_changelog_major = $(if $(and $(_std_major_typed),$(filter 1,$(MAJOR))),--major)
+
+changelog-version-check: ## VERSION=x.y.z [MAJOR=1] — refuse a number changelog.d/ does not call for
+ifndef VERSION
+	@echo "usage: make changelog-version-check VERSION=<x.y.z>"
+	@exit 1
+endif
+	@git fetch --quiet --tags origin main
+	@$(_std_changelog) version $(VERSION) --rev origin/main $(_std_changelog_major)
 
 # Not in `lint`: a feature branch legitimately carries fragments, so it would
 # be red on every PR. The one moment the question means anything is the
@@ -1432,6 +1466,7 @@ tag-release: changelog-assembled-check
 # `release-branch` promotes the fragments into the new version's section
 # itself. Writing an entry is prose and stays prose; renaming a heading is a
 # hand step, and hand steps are the ones that rot (doppler#996).
+_std_release_version_check = @$(MAKE) --no-print-directory changelog-version-check VERSION=$(VERSION)
 _std_release_changelog = @$(MAKE) --no-print-directory changelog-assemble VERSION=$(VERSION)
 _std_release_changelog_note = @echo "  - review CHANGELOG.md: changelog.d/ was promoted into [$(VERSION)]"
 endif
@@ -1694,7 +1729,7 @@ _STD_SECTION = case "$$t" in \
         |ship|ci-changes|ci-tree-tested|ci-docs|ci-check-name \
         |ci-changes-wiring-check|pr-watch) tsec="Release";; \
     changelog-check|changelog-sections-check|changelog-assemble \
-        |changelog-assembled-check) tsec="Changelog";; \
+        |changelog-assembled-check|changelog-version-check) tsec="Changelog";; \
     test-examples) tsec="Examples";; \
     ci-image-config|ci-image-check|ci-image-build|ci-image-smoke|ci-shell) \
         tsec="CI-image";; \

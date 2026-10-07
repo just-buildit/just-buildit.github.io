@@ -72,6 +72,12 @@ entry verbatim, starting with `- `.
     edited).
 - `make release-branch VERSION=x.y.z` promotes the fragments into the new
     section itself, and `tag-release` refuses while any is left.
+- `release-branch` first refuses a number the fragments do not call for,
+    before it branches or bumps: anything under `added/` makes the next
+    MINOR, anything else the next PATCH, over the highest `vX.Y.Z` tag, and
+    a skipped number is refused. A MAJOR (`1.0.0` is one) is a decision:
+    `MAJOR=1` on the command line. To ask the same question alone:
+    `make changelog-version-check VERSION=x.y.z`.
 - CI must pass the PR's base as `CHANGELOG_BASE`, with `fetch-depth: 0`.
 
 ### What will stop you, and what it means
@@ -83,6 +89,7 @@ entry verbatim, starting with `- `.
 | `'X' has no '## description'`     | undocumented target, or a rule `help` omits          |
 | `.PHONY targets with no recipe`   | a target that exits 0 having done nothing            |
 | `HAS_X is on, but X_CMD is empty` | flag enabled, its command never set                  |
+| `… so this is a MINOR: 0.99.0`    | the fragments call for another number — cut that one |
 
 ### One job per file
 

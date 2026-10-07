@@ -9,8 +9,9 @@ call a PR green while it holds.
 
 ``GH`` points the script at a fake that answers from a JSON fixture and
 applies the script's OWN ``--jq`` filter with ``jq``, so the filter is
-exercised as written, as in test_ci_tree_tested.py. Stdlib only; ``jq`` is
-on every Actions runner.
+exercised as written, as in test_ci_tree_tested.py. Stdlib only, plus
+``jq``, which is on every Actions runner; without it each class FAILS,
+naming jq, rather than skipping into an OK (#121).
 
 The two stuck fixtures are the real runs from the issue, fetched with
 ``gh api repos/just-buildit/just-makeit/actions/runs/<id>`` and cut to the
@@ -199,9 +200,18 @@ NO_CHECKS = {
 }
 
 
-@unittest.skipUnless(shutil.which("jq"), "the fake gh needs jq")
 class FakeGh(unittest.TestCase):
     """A fake gh and sleep on PATH, and the real watch loop over them."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # Fail, never skip: unittest reports a skip as OK (#121).
+        if shutil.which("jq") is None:
+            raise RuntimeError(
+                "jq is not on PATH: the fake gh applies pr-watch.sh's own "
+                "--jq filters with it, so these tests cannot run without "
+                "it. Install jq."
+            )
 
     def setUp(self) -> None:
         self.tmp = pathlib.Path(tempfile.mkdtemp())

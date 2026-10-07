@@ -14,7 +14,7 @@ IFS=$'\n\t'
 
 _CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/just-runit"
 _ME="$(basename "$0")"
-_VERSION="0.8.0"
+_VERSION="0.9.0"
 _DEFAULT_TTL=3600
 
 # Default namespace base URL (just-buildit org pages root).

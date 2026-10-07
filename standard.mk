@@ -1431,9 +1431,9 @@ changelog-assemble: ## [VERSION=x.y.z] Promote changelog.d/ fragments into CHANG
 # added/ makes the next MINOR, anything else the next PATCH, over the highest
 # vX.Y.Z tag; a skipped number is refused. just-makeit proposed the wrong kind
 # three times in ten days, each caught by hand, and its tags are immutable
-# (just-buildit.github.io#125; the rule is the header of `## version` in
-# scripts/changelog.py). `changelog-assemble VERSION=` asks it too, before it
-# writes.
+# (just-buildit.github.io#125; the rule and its reasons head the `version`
+# section of scripts/changelog.py). `changelog-assemble VERSION=` asks it too,
+# before it writes.
 #
 # It reads origin/main, the tree `release-branch` branches from, and every
 # tag, fetched here: `git fetch origin main` brings no tags, and a tag missing

@@ -95,7 +95,7 @@ jobs:
       # are short-lived, and revoking is per-org.
       - name: Mint an installation token for ${{ matrix.org }}
         id: token
-        uses: actions/create-github-app-token@v3.2.0
+        uses: actions/create-github-app-token@v3.3.0
         with:
           client-id: ${{ secrets.ADOPTER_APP_CLIENT_ID }}
           private-key: ${{ secrets.ADOPTER_APP_PRIVATE_KEY }}

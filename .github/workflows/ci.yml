@@ -1118,7 +1118,12 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-          shellcheck --severity=warning scripts/*.sh
+          # Default severity, not --severity=warning: these files are
+          # vendored byte-identical, and a consumer that shellchecks its
+          # vendored copy at the default level (just-bashit) went red on an
+          # `info` finding this job let through. -x -P SCRIPTDIR follows a
+          # script's `source ./lib.sh` the way it runs.
+          shellcheck -x -P SCRIPTDIR scripts/*.sh
 
       - name: pwsh_find reaches pwsh.exe when PATH does not (just-buildit.github.io#61)
         # A WSL shell reached over ssh has no Windows directories on PATH;

@@ -324,6 +324,7 @@ jobs:
           # The packager's keys are written and compared only when it is on.
           PACKAGER_IMAGE_ENABLED: ${{ needs.resolve.outputs.packager }}
           PREPO: ${{ needs.resolve.outputs.packager_repo }}
+          PACKAGER_GROUPS: ${{ needs.resolve.outputs.packager_groups }}
         run: |
           set -euo pipefail
           CI_IMAGE_BASES=$(make -s ci-image-config | sed -n 's/^bases=//p')

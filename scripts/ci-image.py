@@ -201,17 +201,43 @@ def _image_bytes(path: Path) -> bytes:
         return b"<absent>"
     if path != BOOTSTRAP:
         return path.read_bytes()
-    keep, depth, out = True, 0, []
+    return _tables_kept(path, lambda name: not _unread_by_the_image(name), True)
+
+
+def _tables_kept(path: Path, keep, start: bool) -> bytes:
+    """The bytes of ``path`` whose table ``keep`` accepts, by its header's name.
+
+    ``start`` says whether lines above the first table are kept. This one
+    reading serves the image's view (every table an image layer reads) and a
+    group's view (one group's tables), so the two cannot disagree about where
+    a table begins.
+    """
+    kept, depth, out = start, 0, []
     for line in path.read_bytes().decode("utf-8").splitlines(keepends=True):
         m = _TABLE.match(line) if depth == 0 else None
         if m:
-            keep = not _unread_by_the_image(m.group(1))
+            kept = keep(m.group(1))
         else:
             bare = _NOT_BRACKETS.sub("", line)
             depth = max(0, depth + bare.count("[") - bare.count("]"))
-        if keep:
+        if kept:
             out.append(line)
     return "".join(out).encode("utf-8")
+
+
+def _group_bytes(path: Path, groups: "list[str]") -> bytes:
+    """``bootstrap.toml`` reduced to the tables of the named groups.
+
+    ``[<group>]`` and ``[<group>.<manager>]`` and nothing else: the packager is
+    fed by its own groups alone, so an edit to the dev group owes it nothing.
+    """
+    if not path.exists():
+        return b"<absent>"
+
+    def ours(name: str) -> bool:
+        return name.split(".", 1)[0].strip().strip("\"'") in groups
+
+    return _tables_kept(path, ours, False)
 
 
 def source_hash() -> str:
@@ -225,19 +251,30 @@ def source_hash() -> str:
 
 
 def packager_source_hash() -> str:
-    """Hash the files the packager image is built from.
+    """Hash what the packager image is built from: its Dockerfile, and its groups.
 
-    The packager's Dockerfile and bootstrap.toml, read by the same rule as
-    source_hash(): ``[project]`` is left out, so a version bump owes nothing.
-    docker/ci-extra.sh is not an input: the packager installs only the
-    bootstrap.toml groups, so an edit to the CI image's extras owes the CI
-    image a repin and the packager nothing.
+    The packager's Dockerfile, and from ``bootstrap.toml`` only the tables of
+    ``PACKAGER_GROUPS`` -- the one declaration of what feeds the image. An edit
+    to the dev group, or a version bump, owes the packager nothing; the group
+    NAMES are hashed too, so changing which groups install moves the hash.
+    docker/ci-extra.sh is not an input: the packager installs no extras.
+
+    What the packages themselves are is NOT in this hash. dnf reads the live
+    distro mirrors at refresh time, with no snapshot to pin (unlike
+    CI_APT_SNAPSHOT); the fingerprint of the installed packages is what catches
+    a package that moved, and that is why a refresh owes a repin on it.
     """
+    groups = os.environ.get("PACKAGER_GROUPS", "").split()
+    if not groups:
+        sys.exit("ci-image: PACKAGER_GROUPS is empty (set it in the Makefile)")
     h = hashlib.sha256()
-    for path in (PACKAGER_DOCKERFILE, BOOTSTRAP):
-        h.update(str(path).encode() + b"\0")
-        h.update(_image_bytes(path))
-        h.update(b"\0")
+    h.update(("groups " + " ".join(sorted(groups))).encode() + b"\0")
+    h.update(str(PACKAGER_DOCKERFILE).encode() + b"\0")
+    h.update(_image_bytes(PACKAGER_DOCKERFILE))
+    h.update(b"\0")
+    h.update(str(BOOTSTRAP).encode() + b"\0")
+    h.update(_group_bytes(BOOTSTRAP, groups))
+    h.update(b"\0")
     return h.hexdigest()
 
 

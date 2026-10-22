@@ -1607,6 +1607,7 @@ $(call _std_require,PACKAGER_IMAGE_REPO,HAS_PACKAGER_IMAGE)
 
 _std_packager_image = PACKAGER_IMAGE_ENABLED=1 \
     CI_IMAGE_BASES='$(CI_IMAGE_BASES)' \
+    PACKAGER_GROUPS='$(PACKAGER_GROUPS)' \
     PACKAGER_BASE_AMD64='$(PACKAGER_IMAGE_BASE_AMD64)' \
     PACKAGER_BASE_ARM64='$(PACKAGER_IMAGE_BASE_ARM64)' \
     python3 scripts/ci-image.py
@@ -1637,9 +1638,11 @@ packager-image-build: ## IMAGE=<tag> BASE=<ref> Build the packager image from th
 packager-image-smoke: ## IMAGE=<ref> Check a packager image: rpmbuild, and the glibc floor
 	@test -n '$(IMAGE)' || { echo "usage: make packager-image-smoke IMAGE=<ref>"; exit 1; }
 	docker run --rm --user $(CI_IMAGE_USER) -v "$$PWD":/w -w /w '$(IMAGE)' \
-	  bash -c 'rpmbuild --version && \
-	    getconf GNU_LIBC_VERSION | grep -qx "glibc 2.28" || \
-	      { echo "packager: glibc is not the manylinux_2_28 floor" >&2; exit 1; }'
+	  bash -c 'rpmbuild --version >/dev/null || \
+	      { echo "packager: rpmbuild is missing" >&2; exit 1; }; \
+	    libc=$$(getconf GNU_LIBC_VERSION); \
+	    [ "$$libc" = "glibc 2.28" ] || \
+	      { echo "packager: glibc is $$libc, not the manylinux_2_28 floor" >&2; exit 1; }'
 endif
 
 # ── Gates ────────────────────────────────────────────────────────────────────

@@ -195,6 +195,7 @@ class TestKeysAndFingerprints(_Tree):
 D2 = "sha256:" + "b" * 64
 PACKAGER_ON = {
     "PACKAGER_IMAGE_ENABLED": "1",
+    "PACKAGER_GROUPS": "packager",
     "PACKAGER_BASE_AMD64": "quay.io/pypa/manylinux_2_28_x86_64",
     "PACKAGER_BASE_ARM64": "quay.io/pypa/manylinux_2_28_aarch64",
 }
@@ -228,7 +229,35 @@ class TestThePackagerFamily(_Tree):
         return self.run_on("write-pin", "--out", out, stdin=lines)
 
     def packager_hash(self) -> str:
-        return self.run_script("packager-source-hash").stdout.strip()
+        return self.run_on("packager-source-hash").stdout.strip()
+
+    def test_a_dev_group_edit_owes_the_packager_nothing(self):
+        """Only the packager's own groups feed its hash (one declaration)."""
+        (self.root / "bootstrap.toml").write_text(
+            "[dev.apt]\npackages = ['jq']\n\n[packager.dnf]\npackages = ['rpm-build']\n")
+        before, ci_before = self.packager_hash(), self.source_hash()
+        (self.root / "bootstrap.toml").write_text(
+            "[dev.apt]\npackages = ['jq', 'yq']\n\n[packager.dnf]\npackages = ['rpm-build']\n")
+        self.assertEqual(self.packager_hash(), before)
+        # ...while the CI image, which installs dev, does owe a repin.
+        self.assertNotEqual(self.source_hash(), ci_before)
+
+    def test_naming_a_different_group_moves_it(self):
+        before = self.packager_hash()
+        r = subprocess.run(
+            [sys.executable, str(SCRIPT), "packager-source-hash"],
+            cwd=self.root, capture_output=True, text=True,
+            env={**os.environ, "PACKAGER_IMAGE_ENABLED": "1",
+                 "CI_IMAGE_BASES": BASES, "PACKAGER_GROUPS": "dev"})
+        self.assertNotEqual(r.stdout.strip(), before)
+
+    def test_with_no_groups_it_refuses_rather_than_hashing_nothing(self):
+        r = subprocess.run(
+            [sys.executable, str(SCRIPT), "packager-source-hash"],
+            cwd=self.root, capture_output=True, text=True,
+            env={**os.environ, "PACKAGER_IMAGE_ENABLED": "1",
+                 "CI_IMAGE_BASES": BASES, "PACKAGER_GROUPS": ""})
+        self.assertNotEqual(r.returncode, 0)
 
     def test_on_the_pin_appends_the_packager_block_after_the_ci_block(self):
         r = self.pin_on(PACKAGER_GOOD)

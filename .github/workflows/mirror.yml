@@ -81,7 +81,7 @@ jobs:
       # runs update the open PR instead of stacking new ones.
       - name: Mint an App token
         id: token
-        uses: actions/create-github-app-token@v3.2.0
+        uses: actions/create-github-app-token@v3.3.0
         with:
           client-id: ${{ secrets.ADOPTER_APP_CLIENT_ID }}
           private-key: ${{ secrets.ADOPTER_APP_PRIVATE_KEY }}

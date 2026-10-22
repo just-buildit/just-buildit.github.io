@@ -1201,14 +1201,22 @@ jobs:
   # on that floor as well as today's interpreter: a 3.10-only spelling would
   # pass here on the newest and break an adopter's lint on the day it
   # re-vendors.
+  #
+  # The floor leg names its runner: setup-python has no 3.9 for Ubuntu
+  # 26.04, which `ubuntu-latest` became in October 2026 ("The version '3.9'
+  # ... was not found for Ubuntu 26.04"). 24.04 still serves it. When 24.04
+  # leaves GitHub's runners, that is the moment to decide whether 3.9 is
+  # still a floor any adopter runs -- not before, and not by accident.
   changelog:
     name: changelog.py (py${{ matrix.python }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.9", "3.13"]
+        include:
+          - { python: "3.9", os: ubuntu-24.04 }
+          - { python: "3.13", os: ubuntu-latest }
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-python@v7.0.0

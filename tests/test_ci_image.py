@@ -192,6 +192,129 @@ class TestKeysAndFingerprints(_Tree):
             a, self.run_script("join-fingerprint", "amd64=a", "arm64=c").stdout)
 
 
+D2 = "sha256:" + "b" * 64
+PACKAGER_ON = {
+    "PACKAGER_IMAGE_ENABLED": "1",
+    "PACKAGER_BASE_AMD64": "quay.io/pypa/manylinux_2_28_x86_64",
+    "PACKAGER_BASE_ARM64": "quay.io/pypa/manylinux_2_28_aarch64",
+}
+PACKAGER_GOOD = {
+    **GOOD,
+    "CI_PACKAGER_BASE_AMD64": f"quay.io/pypa/manylinux_2_28_x86_64@{D}",
+    "CI_PACKAGER_BASE_ARM64": f"quay.io/pypa/manylinux_2_28_aarch64@{D}",
+    "CI_PACKAGER_IMAGE": f"ghcr.io/o/r-packager@{D}",
+    "CI_PACKAGER_FINGERPRINT": "e" * 64,
+    "CI_PACKAGER_SOURCE_HASH": "f" * 64,
+}
+
+
+class TestThePackagerFamily(_Tree):
+    """HAS_PACKAGER_IMAGE: a second image in the same pin, off by default."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        (self.root / "docker" / "packager.Dockerfile").write_text("FROM x\n")
+
+    def run_on(self, *args: str, stdin: str = "") -> subprocess.CompletedProcess:
+        """The script with the packager on, as the workflow runs it."""
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), *args],
+            cwd=self.root, input=stdin, capture_output=True, text=True,
+            env={**os.environ, "CI_IMAGE_BASES": BASES, **PACKAGER_ON},
+        )
+
+    def pin_on(self, values: "dict[str, str]", out: str = ".github/ci-images.env"):
+        lines = "".join(f"{k}={v}\n" for k, v in values.items())
+        return self.run_on("write-pin", "--out", out, stdin=lines)
+
+    def packager_hash(self) -> str:
+        return self.run_script("packager-source-hash").stdout.strip()
+
+    def test_on_the_pin_appends_the_packager_block_after_the_ci_block(self):
+        r = self.pin_on(PACKAGER_GOOD)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        keys = [ln.split("=", 1)[0] for ln in
+                (self.root / ".github/ci-images.env").read_text().splitlines()
+                if ln and not ln.startswith("#")]
+        self.assertEqual(keys[-5:], [
+            "CI_PACKAGER_BASE_AMD64", "CI_PACKAGER_BASE_ARM64",
+            "CI_PACKAGER_IMAGE", "CI_PACKAGER_FINGERPRINT",
+            "CI_PACKAGER_SOURCE_HASH"])
+        self.assertEqual(keys[: len(keys) - 5], list(GOOD)[: len(GOOD)])
+
+    def test_off_a_pin_without_the_packager_keys_is_still_complete(self):
+        """The flag off must not demand packager keys: an adopter is unchanged."""
+        self.write_pin({**GOOD, "CI_IMAGE_SOURCE_HASH": self.source_hash()})
+        self.assertEqual(self.run_script("check").returncode, 0)
+
+    def test_on_a_pin_missing_a_packager_key_is_refused(self):
+        for k in ("CI_PACKAGER_IMAGE", "CI_PACKAGER_SOURCE_HASH"):
+            with self.subTest(missing=k):
+                vals = {x: v for x, v in PACKAGER_GOOD.items() if x != k}
+                self.assertNotEqual(self.pin_on(vals).returncode, 0)
+
+    def test_on_an_unpinned_packager_base_is_refused(self):
+        vals = {**PACKAGER_GOOD, "CI_PACKAGER_BASE_ARM64": "quay.io/x/y"}
+        self.assertNotEqual(self.pin_on(vals).returncode, 0)
+
+    def test_the_packager_dockerfile_is_not_an_input_to_the_ci_image(self):
+        """Adding the packager must not move any adopter's CI source hash."""
+        before = self.source_hash()
+        (self.root / "docker" / "packager.Dockerfile").write_text("FROM y\n")
+        self.assertEqual(self.source_hash(), before)
+
+    def test_its_source_hash_moves_with_its_dockerfile_and_bootstrap(self):
+        seen = {self.packager_hash()}
+        for path, text in (
+            ("docker/packager.Dockerfile", "FROM y\n"),
+            ("bootstrap.toml", "[packager.dnf]\npackages = ['rpm-build']\n"),
+        ):
+            with self.subTest(path=path):
+                (self.root / path).write_text(text)
+                h = self.packager_hash()
+                self.assertNotIn(h, seen)
+                seen.add(h)
+
+    def test_check_refuses_a_packager_pin_from_other_sources(self):
+        self.pin_on({**PACKAGER_GOOD, "CI_IMAGE_SOURCE_HASH": self.source_hash()})
+        r = self.run_on("check")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("packager's sources", r.stdout)
+        self.pin_on({**PACKAGER_GOOD, "CI_IMAGE_SOURCE_HASH": self.source_hash(),
+                     "CI_PACKAGER_SOURCE_HASH": self.packager_hash()})
+        self.assertEqual(self.run_on("check").returncode, 0)
+
+    def test_a_moved_packager_fingerprint_owes_a_repin_and_a_snapshot_alone_does_not(self):
+        self.pin_on(PACKAGER_GOOD)
+        self.pin_on({**PACKAGER_GOOD, "CI_APT_SNAPSHOT": "20261009T000000Z"},
+                    out="new.env")
+        self.assertEqual(self.run_on("changed", "--new", "new.env").stdout.strip(),
+                         "changed=0")
+        self.pin_on({**PACKAGER_GOOD, "CI_PACKAGER_FINGERPRINT": "9" * 64},
+                    out="new.env")
+        self.assertEqual(self.run_on("changed", "--new", "new.env").stdout.strip(),
+                         "changed=1")
+
+
+class TestThePackagerDockerfile(unittest.TestCase):
+    """The real vendored file: every input is a build ARG with no default."""
+
+    def test_no_arg_has_a_default(self):
+        text = (ROOT / "docker" / "packager.Dockerfile").read_text()
+        args = [ln for ln in text.splitlines()
+                if re.match(r"^\s*ARG\s", ln)]
+        self.assertTrue(args, "the packager Dockerfile declares no ARGs")
+        for ln in args:
+            with self.subTest(arg=ln):
+                self.assertNotIn("=", ln)
+
+    def test_the_base_is_an_arg_never_a_literal_image(self):
+        """The glibc floor is the base's: the Dockerfile must not pick one."""
+        text = (ROOT / "docker" / "packager.Dockerfile").read_text()
+        self.assertRegex(text, r"(?m)^FROM \$\{BASE\}$")
+        self.assertNotRegex(text, r"(?m)^FROM (?!\$\{BASE\}$)")
+
+
 def _instructions(text: str) -> "list[str]":
     joined = re.sub(r"\\\n", " ", text)
     return [ln.strip() for ln in joined.splitlines()
@@ -244,10 +367,12 @@ class TestTheWorkflow(unittest.TestCase):
     def test_a_branch_push_builds_only_when_the_pin_is_owed(self):
         """A release bump moves no source the image reads, so it builds
         nothing; a schedule or dispatch always builds (doppler#1765)."""
+        # The condition may name the packager too (HAS_PACKAGER_IMAGE), so the
+        # match is the push test, then the CI check, then the owed=false arm.
         self.assertRegex(
             self.text,
-            r'"\$\{\{ github\.event_name \}\}" = push \] && make -s ci-image-check;'
-            r'\s+then\s+echo "owed=false"',
+            r'(?s)"\$\{\{ github\.event_name \}\}" = push \] && '
+            r'make -s ci-image-check\b.*?;\s+then\s+echo "owed=false"',
         )
         build = self.text[self.text.index("\n  build:"):]
         build = build[:build.index("\n  publish:")]

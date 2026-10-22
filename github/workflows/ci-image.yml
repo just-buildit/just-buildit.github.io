@@ -82,6 +82,7 @@ jobs:
       # The packager image (HAS_PACKAGER_IMAGE): set only when the adopter
       # turns it on, so an adopter without it sees these outputs empty.
       packager: ${{ steps.cfg.outputs.packager }}
+      packager_matrix: ${{ steps.cfg.outputs.packager_matrix }}
       packager_repo: ${{ steps.cfg.outputs.packager_repo }}
       packager_groups: ${{ steps.cfg.outputs.packager_groups }}
     steps:
@@ -136,15 +137,15 @@ jobs:
                 "${a%%:*}" "${a#*:}"
             done
           done
-          # The packager: one entry per arch, its own key, its own repository.
-          if [ "$pk" = 1 ]; then
-            for a in amd64:ubuntu-latest arm64:ubuntu-24.04-arm; do
-              printf '{"family":"packager","base":"packager","key":"packager","arch":"%s","runs_on":"%s"}\n' \
-                "${a%%:*}" "${a#*:}"
-            done
-          fi
           } | jq -sc '{include: .}')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          # The packager has its own job and matrix, set only when it is on.
+          if [ "$pk" = 1 ]; then
+            pmatrix=$(for a in amd64:ubuntu-latest arm64:ubuntu-24.04-arm; do
+              printf '{"arch":"%s","runs_on":"%s"}\n' "${a%%:*}" "${a#*:}"
+            done | jq -sc '{include: .}')
+            echo "packager_matrix=$pmatrix" >> "$GITHUB_OUTPUT"
+          fi
           snap=$(sed -n 's/^CI_APT_SNAPSHOT=//p' inputs.env)
           echo "tag=${snap}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
@@ -182,7 +183,6 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build, smoke, push
-        if: matrix.family != 'packager'
         env:
           REPO: ${{ needs.resolve.outputs.repo }}
           TAG: ${{ needs.resolve.outputs.tag }}
@@ -215,12 +215,43 @@ jobs:
           echo "$ARCH=$fp" > "out/fp-$KEY-$ARCH"
           echo "$KEY $ARCH fingerprint $fp"
 
-      # The packager: the same build, smoke and push, on the manylinux base
-      # for this arch (the pin's CI_PACKAGER_BASE_<ARCH>), from its own
-      # Dockerfile, pushed to its own repository. It runs only in the packager
-      # entries of the matrix, so an adopter without it has none.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-image-fp-${{ matrix.key }}-${{ matrix.arch }}
+          path: out/
+          if-no-files-found: error
+
+  # The packager, in its own job: a job that runs setup-buildx-action is one
+  # the stock-pull gate reads as a container-driver build, so this one does
+  # not. It builds on the classic builder, on the daemon, for this arch, from
+  # the pin's CI_PACKAGER_BASE_<ARCH> (a manylinux_2_28 base), and pushes to its
+  # own repository. It runs only when the packager is on.
+  packager:
+    name: Build and smoke (packager, ${{ matrix.arch }})
+    needs: resolve
+    if: needs.resolve.outputs.owed == 'true' && needs.resolve.outputs.packager == '1'
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.resolve.outputs.packager_matrix) }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ci-image-inputs
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build, smoke, push (packager)
-        if: matrix.family == 'packager'
         env:
           REPO: ${{ needs.resolve.outputs.packager_repo }}
           TAG: ${{ needs.resolve.outputs.tag }}
@@ -232,10 +263,8 @@ jobs:
           . ./inputs.env
           base_ref=$(eval echo "\$CI_PACKAGER_BASE_${ARCH^^}")
           img="$REPO:$KEY-$TAG-$ARCH"
-          # The classic builder, on the daemon -- not buildx's container driver,
-          # which pulls its FROMs where no stock-pull pre-pull reaches, and which
-          # scripts/check_stock_images.py refuses for a new build. The classic
-          # builder makes no attestations, so there is no provenance to switch off.
+          # The classic builder makes no attestations, so there is no
+          # provenance to switch off for the publish job's index to need.
           docker build \
             -f docker/packager.Dockerfile \
             --build-arg BASE="$base_ref" \
@@ -253,13 +282,21 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: ci-image-fp-${{ matrix.key }}-${{ matrix.arch }}
+          name: ci-image-fp-packager-${{ matrix.arch }}
           path: out/
           if-no-files-found: error
 
   publish:
     name: Repin if anything moved
-    needs: [resolve, build]
+    needs: [resolve, build, packager]
+    # Not `success()` alone: a skipped dependency skips this job, and the
+    # packager job is skipped whenever the packager is off. So this names the
+    # results it needs -- the CI build's success, the packager's success or
+    # skip -- and still never runs when nothing was owed or something failed.
+    if: >-
+      always() && !cancelled() && needs.resolve.outputs.owed == 'true' &&
+      needs.build.result == 'success' &&
+      (needs.packager.result == 'success' || needs.packager.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

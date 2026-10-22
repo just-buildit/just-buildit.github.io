@@ -1596,7 +1596,7 @@ ifneq ($(HAS_CI_IMAGE),1)
 $(error HAS_PACKAGER_IMAGE is on, but HAS_CI_IMAGE is off -- the packager \
     shares the CI image's pin and installer)
 endif
-STD_TARGETS += packager-image-check packager-image-smoke
+STD_TARGETS += packager-image-check packager-image-build packager-image-smoke
 
 PACKAGER_IMAGE_REPO       ?=
 PACKAGER_IMAGE_BASE_AMD64 ?= quay.io/pypa/manylinux_2_28_x86_64
@@ -1617,6 +1617,20 @@ lint: packager-image-check
 
 packager-image-check: ## Fail unless CI_IMAGE_PIN pins a packager image built from this tree
 	@$(_std_packager_image) check
+
+# The build itself, on the daemon (the classic builder): the workflow calls it,
+# so the workflow file holds no `docker build` of its own. A build in the
+# workflow file is read as a buildx container-driver build wherever that file
+# runs setup-buildx-action, and scripts/check_stock_images.py refuses it as new.
+# IMAGE is the tag to build; BASE the manylinux_2_28 ref the pin names.
+packager-image-build: ## IMAGE=<tag> BASE=<ref> Build the packager image from the pinned inputs
+	@test -n '$(IMAGE)' -a -n '$(BASE)' || { echo "usage: make packager-image-build IMAGE=<tag> BASE=<manylinux ref>"; exit 1; }
+	docker build -f docker/packager.Dockerfile \
+	  --build-arg BASE='$(BASE)' \
+	  --build-arg JB_VERSION='$(CI_JB_VERSION)' \
+	  --build-arg JB_SHA256='$(CI_JB_SHA256)' \
+	  --build-arg PACKAGER_GROUPS='$(PACKAGER_GROUPS)' \
+	  -t '$(IMAGE)' .
 
 # Run INSIDE a packager image (IMAGE=<ref>): the tool the package build calls,
 # and the glibc floor the packages claim.
@@ -1812,7 +1826,7 @@ _STD_SECTION = case "$$t" in \
     test-examples) tsec="Examples";; \
     ci-image-config|ci-image-check|ci-image-build|ci-image-smoke|ci-shell) \
         tsec="CI-image";; \
-    packager-image-check|packager-image-smoke) tsec="Packager-image";; \
+    packager-image-check|packager-image-build|packager-image-smoke) tsec="Packager-image";; \
     standard-check|standard-update|standard-files|help-check|ghost-check|hook-dispatch-check|hook-stage-check|tracked-paths-check|workflow-timeout-check|workflow-dispatch-check|close-keywords-check) \
         tsec="Gates";; \
     *) tsec="Local";; \

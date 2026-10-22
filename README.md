@@ -80,6 +80,21 @@ entry verbatim, starting with `- `.
     `make changelog-version-check VERSION=x.y.z`.
 - CI must pass the PR's base as `CHANGELOG_BASE`, with `fetch-depth: 0`.
 
+### Packager image (`HAS_PACKAGER_IMAGE = 1`, needs `HAS_CI_IMAGE`)
+
+A distro package build (rpm, from a `manylinux_2_28` base, so the glibc 2.28
+floor its packages claim holds) needs its tools baked into an image. This
+flag builds that image beside the CI image, from the vendored
+`docker/packager.Dockerfile`, and pins it by digest in the same
+`.github/ci-images.env` (`CI_PACKAGER_*`). CI pulls the digest, so no package
+manager runs at CI time; only the weekly refresh reaches a mirror.
+
+- Set `PACKAGER_IMAGE_REPO`, and `PACKAGER_GROUPS` if the package list is not
+    the `packager` group of `bootstrap.toml` (`[packager.dnf]`).
+- Off by default. An adopter that never sets the flag keeps every pin, source
+    hash and `ci-image-config` line it had; `make packager-image-check` exists
+    only when the flag is on.
+
 ### What will stop you, and what it means
 
 | message                                    | meaning                                              |

@@ -10,6 +10,12 @@
 # base is manylinux_2_28 on purpose -- the glibc 2.28 floor is the claim the
 # packages make, and a different base would move it.
 #
+# The packages come from the distro's LIVE mirrors, at the refresh that builds
+# the image. There is no snapshot to pin, as ci.Dockerfile has with
+# CI_APT_SNAPSHOT: dnf reads whatever the mirror serves that week. What holds
+# the packages still is the fingerprint below (rpm -qa), which the workflow
+# compares: a package that moved owes a repin, and a repin pins what was built.
+#
 # Every input is a build ARG with NO default, refused when empty, for the
 # same reason as ci.Dockerfile: a default would be a second copy of the pin.
 #

@@ -91,6 +91,12 @@ manager runs at CI time; only the weekly refresh reaches a mirror.
 
 - Set `PACKAGER_IMAGE_REPO`, and `PACKAGER_GROUPS` if the package list is not
     the `packager` group of `bootstrap.toml` (`[packager.dnf]`).
+- dnf reads the distro's **live** mirrors, at the refresh that builds the
+    image. There is no snapshot to pin, unlike the CI image's apt snapshot.
+    What holds the packages is the fingerprint (`rpm -qa`): a package that
+    moved owes a repin, and the pin then records what was built.
+- The source hash covers the packager's Dockerfile and only its own groups'
+    tables of `bootstrap.toml`. A dev-group edit owes the packager nothing.
 - Off by default. An adopter that never sets the flag keeps every pin, source
     hash and `ci-image-config` line it had; `make packager-image-check` exists
     only when the flag is on.

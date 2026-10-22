@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-#
 # The packager image (HAS_PACKAGER_IMAGE). VENDORED from canonical: change it
 # there, not here -- standard-check fails on any difference. Built by
 # .github/workflows/ci-image.yml alongside the CI toolchain image, pinned by

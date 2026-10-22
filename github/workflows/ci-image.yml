@@ -232,9 +232,11 @@ jobs:
           . ./inputs.env
           base_ref=$(eval echo "\$CI_PACKAGER_BASE_${ARCH^^}")
           img="$REPO:$KEY-$TAG-$ARCH"
-          # The same provenance/SBOM rule as the CI image: the publish job's
-          # index must name exactly the platform images.
-          docker buildx build --load --provenance=false --sbom=false \
+          # The classic builder, on the daemon -- not buildx's container driver,
+          # which pulls its FROMs where no stock-pull pre-pull reaches, and which
+          # scripts/check_stock_images.py refuses for a new build. The classic
+          # builder makes no attestations, so there is no provenance to switch off.
+          docker build \
             -f docker/packager.Dockerfile \
             --build-arg BASE="$base_ref" \
             --build-arg JB_VERSION="$CI_JB_VERSION" \

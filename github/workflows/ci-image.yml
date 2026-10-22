@@ -263,15 +263,11 @@ jobs:
           . ./inputs.env
           base_ref=$(eval echo "\$CI_PACKAGER_BASE_${ARCH^^}")
           img="$REPO:$KEY-$TAG-$ARCH"
-          # The classic builder makes no attestations, so there is no
-          # provenance to switch off for the publish job's index to need.
-          docker build \
-            -f docker/packager.Dockerfile \
-            --build-arg BASE="$base_ref" \
-            --build-arg JB_VERSION="$CI_JB_VERSION" \
-            --build-arg JB_SHA256="$CI_JB_SHA256" \
-            --build-arg PACKAGER_GROUPS="$PKG_GROUPS" \
-            -t "$img" .
+          # The build is the Makefile's (packager-image-build, standard.mk):
+          # this file holds no `docker build` of its own.
+          make packager-image-build IMAGE="$img" BASE="$base_ref" \
+            CI_JB_VERSION="$CI_JB_VERSION" CI_JB_SHA256="$CI_JB_SHA256" \
+            PACKAGER_GROUPS="$PKG_GROUPS"
           # Smoked before anything is pushed, natively, on this arch.
           make packager-image-smoke IMAGE="$img"
           docker push "$img"

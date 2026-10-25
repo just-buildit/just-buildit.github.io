@@ -325,6 +325,152 @@ class TestThePackagerFamily(_Tree):
                          "changed=1")
 
 
+_FAKE_DOCKER = r"""#!/usr/bin/env python3
+# A docker that answers `buildx imagetools inspect REF` from a script: the
+# file named for REF (/ and : as _) holds one outcome per call, the last
+# repeating. Every call is logged, so a test can see who was asked.
+import json, os, pathlib, sys
+d = pathlib.Path(os.environ["FAKE_DOCKER_DIR"])
+ref = sys.argv[4]
+with open(d / "calls.log", "a") as log:
+    log.write(ref + "\n")
+f = d / ref.replace("/", "_").replace(":", "_").replace("@", "_")
+lines = f.read_text().split() if f.exists() else ["unknown"]
+n = sum(1 for ln in (d / "calls.log").read_text().split() if ln == ref)
+out = lines[min(n, len(lines)) - 1]
+if out == "ok":
+    print(json.dumps({"digest": "sha256:" + "f" * 64}))
+    sys.exit(0)
+sys.stderr.write({
+    "429": "ERROR: toomanyrequests: Rate exceeded",
+    "quota": "ERROR: toomanyrequests: Data limit exceeded",
+    "unknown": "ERROR: " + ref + ": not found: manifest unknown",
+}[out] + "\n")
+sys.exit(1)
+"""
+
+REG = "public.ecr.aws/docker/library"
+MIRROR = "mirror.gcr.io/library"
+PINNED = f"ubuntu:24.04@{D}"
+
+
+class TestTheBaseSource(_Tree):
+    """`source`: where a pinned base is fetched from (#139).
+
+    Docker Hub rate-limits anonymous pulls, and a buildx container build
+    pulls its FROM where nothing retries it (doppler-dsp/doppler#1982). So
+    the base's manifest is probed under retry, and the build is told which
+    registry answered.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.fake = self.root / "fake"
+        self.fake.mkdir()
+        (self.fake / "docker").write_text(_FAKE_DOCKER)
+        (self.fake / "docker").chmod(0o755)
+
+    def answers(self, ref: str, *outcomes: str) -> None:
+        name = ref.replace("/", "_").replace(":", "_").replace("@", "_")
+        (self.fake / name).write_text("\n".join(outcomes) + "\n")
+
+    def asked(self) -> "list[str]":
+        log = self.fake / "calls.log"
+        return log.read_text().split() if log.exists() else []
+
+    def source(self, ref: str = PINNED, registry: str = REG,
+               mirror: str = MIRROR, cmd: str = "source"):
+        env = {**os.environ, "CI_IMAGE_BASES": BASES,
+               "PATH": f"{self.fake}:{os.environ['PATH']}",
+               "FAKE_DOCKER_DIR": str(self.fake),
+               "CI_IMAGE_BASE_REGISTRY": registry,
+               "CI_IMAGE_BASE_MIRROR": mirror,
+               "CI_IMAGE_PULL_ATTEMPTS": "3", "CI_IMAGE_PULL_DELAY": "0"}
+        args = [cmd, ref] if cmd == "source" else [cmd, "--refresh"]
+        return subprocess.run([sys.executable, str(SCRIPT), *args],
+                              cwd=self.root, env=env, capture_output=True,
+                              text=True)
+
+    def test_unset_names_the_base_and_asks_no_registry(self):
+        """An adopter without the setting makes no new call at all."""
+        r = self.source(registry="", mirror="")
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, PINNED))
+        self.assertEqual(self.asked(), [])
+
+    def test_a_registry_that_answers_is_the_source(self):
+        self.answers(f"{REG}/{PINNED}", "ok")
+        r = self.source()
+        self.assertEqual(r.stdout.strip(), f"{REG}/{PINNED}", r.stderr)
+        self.assertEqual(self.asked(), [f"{REG}/{PINNED}"])
+
+    def test_a_rate_limit_is_retried_not_sent_to_the_mirror(self):
+        self.answers(f"{REG}/{PINNED}", "429", "429", "ok")
+        r = self.source()
+        self.assertEqual(r.stdout.strip(), f"{REG}/{PINNED}", r.stderr)
+        self.assertEqual(self.asked(), [f"{REG}/{PINNED}"] * 3)
+        self.assertIn("retry 2/3", r.stderr)
+
+    def test_a_quota_goes_to_the_mirror_at_once(self):
+        """A volume quota outlasts any retry window (doppler#2256)."""
+        self.answers(f"{REG}/{PINNED}", "quota")
+        self.answers(f"{MIRROR}/{PINNED}", "ok")
+        r = self.source()
+        self.assertEqual(r.stdout.strip(), f"{MIRROR}/{PINNED}", r.stderr)
+        self.assertEqual(self.asked(), [f"{REG}/{PINNED}", f"{MIRROR}/{PINNED}"])
+
+    def test_retries_that_run_out_go_to_the_mirror(self):
+        self.answers(f"{REG}/{PINNED}", "429")
+        self.answers(f"{MIRROR}/{PINNED}", "ok")
+        r = self.source()
+        self.assertEqual(r.stdout.strip(), f"{MIRROR}/{PINNED}", r.stderr)
+        self.assertEqual(self.asked().count(f"{REG}/{PINNED}"), 3)
+
+    def test_a_missing_tag_fails_and_is_never_sent_to_the_mirror(self):
+        """A tag the registry lacks is a typo, not an outage."""
+        self.answers(f"{REG}/{PINNED}", "unknown")
+        r = self.source()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+        self.assertIn("manifest unknown", r.stderr)
+        self.assertEqual(self.asked(), [f"{REG}/{PINNED}"])
+
+    def test_with_no_mirror_an_unreachable_registry_fails(self):
+        self.answers(f"{REG}/{PINNED}", "quota")
+        r = self.source(mirror="")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+        self.assertIn("CI_IMAGE_BASE_MIRROR is unset", r.stderr)
+
+    def test_both_unreachable_fails(self):
+        self.answers(f"{REG}/{PINNED}", "quota")
+        self.answers(f"{MIRROR}/{PINNED}", "429")
+        r = self.source()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+
+    def test_an_image_with_a_slash_is_fetched_as_named(self):
+        """Only official images live on the mirrors' library paths."""
+        ref = f"quay.io/pypa/manylinux_2_28_x86_64@{D}"
+        self.answers(ref, "ok")
+        r = self.source(ref)
+        self.assertEqual(r.stdout.strip(), ref, r.stderr)
+        self.assertEqual(self.asked(), [ref])
+
+    def test_a_refresh_pins_the_digest_registry_free(self):
+        """The pin names the image, not where it was fetched: changing the
+        registry owes no repin."""
+        for b in BASES.split():
+            self.answers(f"{REG}/{b}", "ok")
+        (self.root / ".github" / "ci-images.env").write_text(
+            "CI_JB_VERSION=v0.7.0\nCI_JB_SHA256=" + "b" * 64 + "\n")
+        r = self.source(cmd="inputs")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("CI_BASE_2404=ubuntu:24.04@sha256:" + "f" * 64,
+                      r.stdout.splitlines())
+        self.assertEqual(sorted(self.asked()),
+                         sorted(f"{REG}/{b}" for b in BASES.split()))
+
+
 class TestThePackagerDockerfile(unittest.TestCase):
     """The real vendored file: every input is a build ARG with no default."""
 
@@ -376,6 +522,12 @@ class TestTheDockerfile(unittest.TestCase):
         self.assertGreaterEqual(len(calls), 2, calls)
         self.assertEqual(
             [c for c in calls if "Timeout=" not in c or "Retries=" not in c], [])
+
+    def test_no_syntax_directive(self):
+        """`# syntax=` makes BuildKit fetch a frontend image from Docker Hub
+        before it builds, anonymously and unretried (#139). Nothing here
+        needs more than the built-in frontend."""
+        self.assertNotRegex(self.text, r"(?im)^#\s*syntax\s*=")
 
     def test_the_optional_extra_cannot_fail_the_copy(self):
         """A COPY wildcard matching nothing fails; a file always present
@@ -471,6 +623,20 @@ class TestTheWorkflow(unittest.TestCase):
     def test_settings_come_from_the_makefile(self):
         self.assertIn("make -s ci-image-config", self.text)
         self.assertIn("make ci-image-smoke", self.text)
+
+    def test_the_build_fetches_its_base_from_the_probed_registry(self):
+        """The FROM is pulled inside BuildKit, where nothing retries it, so
+        the build's BASE is what `ci-image-base` answered (#139)."""
+        build = self.text[self.text.index("\n  build:"):]
+        build = build[:build.index("\n  packager:")]
+        self.assertIn('base_ref=$(make -s ci-image-base REF=', build)
+        self.assertIn('--build-arg BASE="$base_ref"', build)
+
+    def test_a_refresh_reads_digests_through_the_registry(self):
+        for name in ("base_registry", "base_mirror"):
+            self.assertIn(f"sed -n 's/^{name}=//p'", self.text)
+        self.assertIn("export CI_IMAGE_BASE_REGISTRY CI_IMAGE_BASE_MIRROR",
+                      self.text)
 
 
 class TestOptIn(unittest.TestCase):

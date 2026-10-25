@@ -1852,7 +1852,7 @@ _STD_SECTION = case "$$t" in \
     changelog-check|changelog-sections-check|changelog-assemble \
         |changelog-assembled-check|changelog-version-check) tsec="Changelog";; \
     test-examples) tsec="Examples";; \
-    ci-image-config|ci-image-check|ci-image-build|ci-image-smoke|ci-shell) \
+    ci-image-config|ci-image-check|ci-image-build|ci-image-smoke|ci-image-base|ci-shell) \
         tsec="CI-image";; \
     packager-image-check|packager-image-build|packager-image-smoke) tsec="Packager-image";; \
     standard-check|standard-update|standard-files|help-check|ghost-check|hook-dispatch-check|hook-stage-check|tracked-paths-check|workflow-timeout-check|workflow-dispatch-check|close-keywords-check) \

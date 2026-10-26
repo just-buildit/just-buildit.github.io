@@ -289,7 +289,7 @@ read -r -d '' HELP <<-EOF || true
 	  -l        List functions defined by SPEC then exit.
 	  -f        Fetch only — cache SPEC, print its path, run nothing.
 	  -r        Refresh — ignore and overwrite cached copy.
-	  -n        No-cache — fetch fresh and discard (nothing written).
+	  -n        No-cache — fetch fresh, discard on exit (cache untouched).
 	  -c        Clean environment (minimal, like sudo without -E).
 	  -p VARS   Comma-separated var names to pass through with -c.
 	  -t TTL    Cache TTL in seconds (default 3600). 0 = keep forever.
@@ -369,15 +369,21 @@ _err() {
 
 # Parse aliases.toml from NS_BASE/aliases.toml and look up a name.
 # Returns the resolved URL, or empty string if not found.
+#
+# Under -n the file goes to main's per-run directory, never the cache, and as
+# that directory starts empty it is always fetched fresh (just-bashit#122).
 _lookup_alias() {
 	local base="${1}" name="${2}"
 	local aliases_url="${base}/aliases.toml"
 	local key
 	key=$(printf '%s' "${base}" | _sha256)
 	local aliases_cache="${_CACHE_DIR}/aliases-${key}.toml"
+	if [[ ${OPT_NO_CACHE} -eq 1 ]]; then
+		aliases_cache="${_NO_CACHE_DIR}/aliases-${key}.toml"
+	fi
 
 	if [[ ${OPT_REFRESH} -eq 1 ]] || ! _cache_valid "${aliases_cache}"; then
-		mkdir -p "${_CACHE_DIR}"
+		mkdir -p "${aliases_cache%/*}"
 		_log "fetching ${aliases_url}"
 		if ! curl -sSL --proto '=https' --tlsv1.2 --max-time 10 \
 			-o "${aliases_cache}.new" "${aliases_url}" 2>/dev/null; then
@@ -590,9 +596,16 @@ _fetch_to() {
 
 # For just-bashit scripts, all src/ libs are co-fetched into cache/jbs/ so
 # that relative inter-source calls (e.g. logging.sh -> format.sh) resolve.
+#
+# Under -n the bundle goes to jbs/ inside main's per-run directory instead,
+# which starts empty, so it is always fetched fresh: the siblings still
+# resolve beside the script, and main's EXIT trap removes them. This path is
+# taken before _acquire's own -n branch, so it ignored -n and wrote, or
+# reused, the cached bundle (just-bashit#122).
 _acquire_jbs() {
 	local lib="${1}"
 	local jbs_dir="${_CACHE_DIR}/jbs"
+	[[ ${OPT_NO_CACHE} -eq 1 ]] && jbs_dir="${_NO_CACHE_DIR}/jbs"
 	mkdir -p "${jbs_dir}"
 
 	local needs_fetch=0
@@ -732,7 +745,10 @@ _run_python() {
 
 	if ! command -v uv >/dev/null 2>&1; then
 		_log "uv not found — installing via jb run"
-		"${0}" https://astral.sh/uv/install.sh
+		# -n reaches the nested run too, so the installer is not cached.
+		local nested=()
+		[[ ${OPT_NO_CACHE} -eq 1 ]] && nested=(-n)
+		"${0}" "${nested[@]+"${nested[@]}"}" https://astral.sh/uv/install.sh
 		hash -r 2>/dev/null || true
 		command -v uv >/dev/null 2>&1 ||
 			_err "uv install failed; try manually: jb run https://astral.sh/uv/install.sh"
@@ -804,16 +820,17 @@ _run() {
 
 # ---- main -------------------------------------------------------------------
 
-URL=$(_resolve "${RAW_SPEC}")
-_log "resolved: ${URL}"
-
 # -n fetches into a directory this shell owns, so it is THIS shell's EXIT
 # trap that removes it, after the script has run -- not the trap of the
-# $(...) subshell _acquire runs in.
+# $(...) subshell _acquire runs in. Made before _resolve, whose aliases.toml
+# lookup fetches into it too (just-bashit#122).
 if [[ ${OPT_NO_CACHE} -eq 1 ]]; then
 	_NO_CACHE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/just-runit.XXXXXX")
 	trap 'rm -rf "${_NO_CACHE_DIR}"' EXIT
 fi
+
+URL=$(_resolve "${RAW_SPEC}")
+_log "resolved: ${URL}"
 
 SCRIPT=$(_acquire "${URL}")
 _log "script: ${SCRIPT}"

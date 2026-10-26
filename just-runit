@@ -279,7 +279,10 @@ read -r -d '' HELP <<-EOF || true
 
 	Options:
 	  -h        Show this message and exit.
-	  -l        List functions defined by SPEC then exit.
+	  -l        List functions defined by SPEC then exit. A shell script is
+	            sourced to list them, so one whose top level runs a command
+	            (no main guard) is refused, naming the line. Python is
+	            parsed, never run.
 	  -f        Fetch only — cache SPEC, print its path, run nothing.
 	  -r        Refresh — ignore and overwrite cached copy.
 	  -n        No-cache — fetch fresh, discard on exit (cache untouched).
@@ -705,8 +708,850 @@ _detect_lang() {
 
 # ---- list functions ---------------------------------------------------------
 
+# _toplevel_cmd FILE -- the first top-level command in FILE that would RUN
+# something when FILE is sourced, as "LINE<TAB>TEXT" on stdout, and exit 1;
+# exit 0, printing nothing, when FILE's top level only declares.
+#
+# -l lists a script's functions by sourcing it (_list_fns), so a script
+# whose top level does work -- `setup-system` has no main guard -- used to
+# be RUN by a flag that reads as inspection (just-bashit#121). This is the
+# check -l makes first. Allowed at top level:
+#
+#   - comments and blank lines
+#   - function definitions (`name() {`, `name ()`, `function name {`, with
+#     any compound body); the body is skipped whatever it holds
+#   - assignments, alone or chained with && / || (`IFS=$'\n\t'`,
+#     `arr=(a b)`, `[[ -n $X ]] && Y=1 || Y=2`); a `read` fed by a heredoc
+#     or here-string, which only assigns (`read -r -d '' HELP <<-'EOF'`)
+#   - the builtins source . set shopt declare typeset readonly export true :
+#     and the tests [[ ]] [ ] test
+#   - a main guard, whose body never runs when the file is sourced:
+#     `if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then ... fi` (= or -ef, either
+#     operand order, quoted or not, `$BASH_SOURCE` or `${0}` too), the same
+#     test followed by `&& cmd` (or `!=` by `|| cmd`), `if ! (return 0
+#     2>/dev/null); then ... fi`, and `(return 0 2>/dev/null) || cmd`, the
+#     "must be sourced" line every just-bashit library opens with
+#
+# Anything else -- a plain command, `trap`, `exit`, a top-level if/while/
+# for/case/{ }/( ) that is not a guard -- is reported. It is a guard against
+# running a script by accident, not a sandbox: a command substitution inside
+# an assignment or a test (`DIR=$(cd ... && pwd)`) still runs, as do the top
+# levels of the libraries the file sources, since listing what they define
+# is why -l sources at all.
+#
+# It is a lexer, not a line matcher, because a function body ends at the
+# brace that closes it and nowhere else: it tracks quotes, ${...}, $(...),
+# $((...)), backticks, heredocs (bodies skipped, `<<-` tab-stripped),
+# [[ ]], case patterns and the if/case/loop/brace/paren nesting, so a `}`
+# or `fi` inside a string or a heredoc closes nothing. Pure bash, for the
+# reason _lookup_alias is. A construct still open at end of file is
+# reported too, rather than guessed at.
+_toplevel_cmd() {
+	local LC_ALL=C
+	local line="" c nx rest top d ch q
+	local -i lno=0 i=0 n=0 sp=0 j=0 strip=0
+	# The context stack, and per-entry state: a case's "seen in" and "in
+	# pattern position", an arithmetic context's paren depth, and the word
+	# state a $(...) saves and puts back.
+	local -a st=() cin=() cpat=() ard=() tk=() tkl=() tkt=() hd=() hdp=()
+	local -a s_cur=() s_taint=() s_wcmd=() s_cmd=() s_nw=() s_pop=()
+	local -a s_fnhdr=() s_fnkw=() s_redir=() s_wline=() s_wtext=()
+	# The word being read: its text, whether quoting or an expansion makes
+	# it unable to be a reserved word (taint), and whether it began in
+	# command position (wcmd). cmd: the next word is in command position.
+	# nw: words so far in this simple command. pop: an && / || / | is
+	# waiting for its right side. fnhdr / fnkw: a function header is
+	# waiting for its body / for its name.
+	local cur="" wtext="" etext=""
+	local -i taint=0 wcmd=0 cmd=1 nw=0 pop=0 fnhdr=0 fnkw=0 redir=0
+	local -i cont=0 wline=0 eline=0 eelse=0 nonif=0
+	local OPEN=$'\x1e' CLOSE=$'\x1f' PH=$'\x1d'
+	local ordre="^[^[:space:]#\\\\'\"\`\$<>&|;()]+"
+
+	while IFS= read -r line || [[ -n ${line} ]]; do
+		lno+=1
+		if ((${#hd[@]})); then
+			d="${line}"
+			if [[ ${hd[0]:0:1} == 1 ]]; then
+				while [[ ${d} == $'\t'* ]]; do d="${d#$'\t'}"; done
+			fi
+			[[ ${d} == "${hd[0]:1}" ]] && hd=("${hd[@]:1}")
+			continue
+		fi
+		i=0
+		n=${#line}
+		while ((i < n)); do
+			c="${line:i:1}"
+			top=""
+			((sp)) && top="${st[sp - 1]}"
+			case "${top}" in
+			SQ)
+				rest="${line:i}"
+				if [[ ${rest} == *"'"* ]]; then
+					rest="${rest%%"'"*}"
+					i+=${#rest}+1
+					_tl_pop
+				else
+					i=n
+				fi
+				continue
+				;;
+			AQ | BT)
+				q="'"
+				[[ ${top} == BT ]] && q='`'
+				if [[ ${c} == "\\" ]]; then
+					i+=2
+				elif [[ ${c} == "${q}" ]]; then
+					i+=1
+					_tl_pop
+				else
+					i+=1
+				fi
+				continue
+				;;
+			DQ | PE | AR | AP)
+				_tl_inner || return 1
+				continue
+				;;
+			esac
+			# Code: the top level, a { } / ( ) group, a function body, an
+			# if / case / loop, a $(...), or a [[ ]].
+			nx="${line:i+1:1}"
+			case "${c}" in
+			' ' | $'\t')
+				_tl_endword
+				i+=1
+				;;
+			'#')
+				if [[ -z ${cur} ]]; then
+					i=n
+				else
+					cur+="${c}"
+					i+=1
+				fi
+				;;
+			"\\")
+				if ((i + 1 >= n)); then
+					cont=1
+					i=n
+				else
+					_tl_wchar "${PH}"
+					i+=2
+				fi
+				;;
+			"'" | '"' | '`')
+				_tl_wchar "${PH}"
+				case "${c}" in
+				"'") _tl_push SQ ;;
+				'"') _tl_push DQ ;;
+				*) _tl_push BT ;;
+				esac
+				i+=1
+				;;
+			'$')
+				case "${nx}" in
+				'(' | '{' | "'")
+					_tl_wchar "${PH}"
+					_tl_dollar
+					;;
+				*)
+					_tl_wchar '$'
+					i+=1
+					;;
+				esac
+				;;
+			'<' | '>' | '&' | '|' | ';' | '(' | ')')
+				# Inside [[ ]] these are its own operators: they end a
+				# word, and the word may be the ]] that closes it.
+				[[ ${top} == DB ]] && _tl_endword
+				if ((sp)) && [[ ${st[sp - 1]} == DB ]]; then
+					i+=1
+				else
+					_tl_op || return 1
+				fi
+				;;
+			*)
+				if [[ ${line:i} =~ ${ordre} ]]; then
+					_tl_wchar "${BASH_REMATCH[0]}"
+					i+=${#BASH_REMATCH[0]}
+				else
+					_tl_wchar "${c}"
+					i+=1
+				fi
+				;;
+			esac
+		done
+		# End of line: a newline, unless escaped or inside a quote.
+		if ((cont)); then
+			cont=0
+		else
+			top=""
+			((sp)) && top="${st[sp - 1]}"
+			case "${top}" in
+			SQ | AQ | BT | DQ | PE | AR | AP) ;;
+			DB) _tl_endword ;;
+			*) _tl_sep nl || return 1 ;;
+			esac
+		fi
+		if ((${#hdp[@]})); then
+			hd+=("${hdp[@]}")
+			hdp=()
+		fi
+	done <"${1}"
+
+	_tl_endword
+	if ((sp || ${#hd[@]})); then
+		((${#tk[@]})) || eline=lno
+		printf '%s\tunterminated at end of file: %s\n' "${eline}" \
+			"${etext%"${etext##*[![:space:]]}"}"
+		return 1
+	fi
+	_tl_judge
+}
+
+# The helpers below are _toplevel_cmd's: they read and write its locals.
+
+# nonif counts the open contexts that are not an if: the judge sees
+# inside a top-level if, whose branches must declare too, and nothing
+# deeper.
+_tl_push() {
+	st[sp]="${1}"
+	sp=$((sp + 1))
+	[[ ${1} == IF ]] || nonif=$((nonif + 1))
+}
+
+_tl_pop() {
+	sp=$((sp - 1))
+	[[ ${st[sp]} == IF ]] || nonif=$((nonif - 1))
+	unset 'st[sp]'
+}
+
+# _tl_wchar TEXT -- append TEXT to the word, starting one if none is open.
+_tl_wchar() {
+	if [[ -z ${cur} ]]; then
+		wcmd=cmd
+		wline=lno
+		wtext="${line:i}"
+	fi
+	[[ ${1} == "${PH}" || ${1} == "\\"* ]] && taint=1
+	cur+="${1}"
+}
+
+_tl_emit() {
+	((nonif == 0)) || return 0
+	if ((${#tk[@]} == 0)); then
+		eline=wline
+		etext="${wtext}"
+	fi
+	tk+=("${1}")
+	tkl+=("${wline}")
+	tkt+=("${wtext}")
+}
+
+# _tl_open TYPE TOKEN / _tl_close TOKEN -- enter and leave a compound
+# command. At the top level the pair is all the judge sees of it: what is
+# inside is never a top-level command.
+_tl_open() {
+	_tl_emit "${OPEN}${2}"
+	_tl_push "${1}"
+	cmd=1
+	nw=0
+	pop=0
+	fnhdr=0
+}
+
+_tl_close() {
+	_tl_pop
+	_tl_emit "${CLOSE}${1}"
+	cmd=0
+}
+
+# _tl_mark -- note where a word-less token (an opening paren) starts.
+_tl_mark() {
+	wline=lno
+	wtext="${line:i}"
+}
+
+_tl_endword() {
+	[[ -n ${cur} ]] || return 0
+	local w="${cur}" top=""
+	local -i plain=$((!taint)) atcmd=wcmd
+	cur=""
+	taint=0
+	((sp)) && top="${st[sp - 1]}"
+	if ((redir)); then
+		redir=0
+		_tl_emit "${w}"
+		return 0
+	fi
+	if ((plain)); then
+		if [[ ${top} == DB ]]; then
+			[[ ${w} == ']]' ]] && _tl_close ']]'
+			return 0
+		fi
+		if [[ ${top} == CASE ]]; then
+			if ((cin[sp - 1] == 0)) && [[ ${w} == in ]]; then
+				cin[sp - 1]=1
+				cpat[sp - 1]=1
+				return 0
+			fi
+			if ((cpat[sp - 1])) && [[ ${w} == "esac" ]]; then
+				_tl_close "esac"
+				return 0
+			fi
+		fi
+		if ((fnkw)); then
+			fnkw=0
+			fnhdr=1
+			cmd=1
+			_tl_emit "${w}"
+			return 0
+		fi
+		if ((atcmd)); then
+			case "${w}" in
+			'{')
+				_tl_open B '{'
+				return 0
+				;;
+			'}')
+				if [[ ${top} == B ]]; then
+					_tl_close '}'
+					return 0
+				fi
+				;;
+			if)
+				_tl_open IF if
+				return 0
+				;;
+			then | do)
+				cmd=1
+				_tl_emit ';'
+				return 0
+				;;
+			else | elif)
+				cmd=1
+				_tl_emit ';'
+				[[ ${top} == IF ]] && ((sp == 1)) && eelse=1
+				return 0
+				;;
+			"fi" | "done" | "esac")
+				if [[ ${top} == IF && ${w} == "fi" ||
+					${top} == LOOP && ${w} == "done" ||
+					${top} == CASE && ${w} == "esac" ]]; then
+					_tl_close "${w}"
+					return 0
+				fi
+				;;
+			case)
+				_tl_open CASE case
+				cin[sp - 1]=0
+				cpat[sp - 1]=0
+				cmd=0
+				return 0
+				;;
+			while | until | for | select)
+				_tl_open LOOP "${w}"
+				[[ ${w} == for || ${w} == select ]] && cmd=0
+				return 0
+				;;
+			'[[')
+				_tl_open DB '[['
+				return 0
+				;;
+			function)
+				fnkw=1
+				_tl_emit function
+				return 0
+				;;
+			'!' | time)
+				_tl_emit "${w}"
+				return 0
+				;;
+			esac
+		fi
+	fi
+	_tl_emit "${w}"
+	cmd=0
+	nw=$((nw + 1))
+	pop=0
+	fnhdr=0
+}
+
+# _tl_sep KIND -- a newline (nl), `;` or `&`: the end of a command, and of a
+# top-level one when nothing is open.
+_tl_sep() {
+	_tl_endword
+	if [[ ${1} == nl ]] && ((fnhdr || pop)); then
+		return 0
+	fi
+	cmd=1
+	nw=0
+	pop=0
+	if ((sp == 0)); then
+		_tl_judge || return 1
+		tk=()
+		tkl=()
+		tkt=()
+		eelse=0
+	else
+		_tl_emit ';'
+	fi
+	return 0
+}
+
+# _tl_save / _tl_restore -- a $(...) or <(...) reads words of its own; the
+# word it sits in carries on after it.
+_tl_save() {
+	s_cur[sp]="${cur}"
+	s_taint[sp]=taint
+	s_wcmd[sp]=wcmd
+	s_cmd[sp]=cmd
+	s_nw[sp]=nw
+	s_pop[sp]=pop
+	s_fnhdr[sp]=fnhdr
+	s_fnkw[sp]=fnkw
+	s_redir[sp]=redir
+	s_wline[sp]=wline
+	s_wtext[sp]="${wtext}"
+	_tl_push CS
+	cur=""
+	taint=0
+	cmd=1
+	nw=0
+	pop=0
+	fnhdr=0
+	fnkw=0
+	redir=0
+}
+
+_tl_restore() {
+	_tl_pop
+	cur="${s_cur[sp]}"
+	taint=$((s_taint[sp]))
+	wcmd=$((s_wcmd[sp]))
+	cmd=$((s_cmd[sp]))
+	nw=$((s_nw[sp]))
+	pop=$((s_pop[sp]))
+	fnhdr=$((s_fnhdr[sp]))
+	fnkw=$((s_fnkw[sp]))
+	redir=$((s_redir[sp]))
+	wline=$((s_wline[sp]))
+	wtext="${s_wtext[sp]}"
+}
+
+# _tl_dollar -- $( $(( ${ $' at line[i]: enter it.
+_tl_dollar() {
+	case "${line:i+1:1}" in
+	'(')
+		if [[ ${line:i+2:1} == '(' ]]; then
+			_tl_push AR
+			ard[sp - 1]=0
+			i+=3
+		else
+			_tl_save
+			i+=2
+		fi
+		;;
+	'{')
+		_tl_push PE
+		i+=2
+		;;
+	"'")
+		_tl_push AQ
+		i+=2
+		;;
+	esac
+}
+
+# _tl_inner -- one step inside "...", ${...}, $((...)) or an array's ( ).
+_tl_inner() {
+	local re
+	case "${top}" in
+	DQ) re="^[^\\\\\"\`\$]+" ;;
+	PE) re="^[^\\\\\"'\`\$}]+" ;;
+	AR) re="^[^()\\\\\"'\`\$]+" ;;
+	AP) re="^[^()\\\\\"'\`\$#]+" ;;
+	esac
+	if [[ ${line:i} =~ ${re} ]]; then
+		i+=${#BASH_REMATCH[0]}
+		return 0
+	fi
+	case "${c}" in
+	"\\") i+=2 ;;
+	'"')
+		if [[ ${top} == DQ ]]; then
+			_tl_pop
+		else
+			_tl_push DQ
+		fi
+		i+=1
+		;;
+	"'")
+		# Literal inside "...${x:-'}"...; a quote anywhere else here.
+		if [[ ${top} == PE && ${st[sp - 2]:-} == DQ ]]; then
+			:
+		else
+			_tl_push SQ
+		fi
+		i+=1
+		;;
+	'`')
+		_tl_push BT
+		i+=1
+		;;
+	'$')
+		case "${line:i+1:1}" in
+		'(' | '{' | "'") _tl_dollar ;;
+		*) i+=1 ;;
+		esac
+		;;
+	'}')
+		_tl_pop
+		i+=1
+		;;
+	'#')
+		# A comment in an array, when it starts a word.
+		if ((i == 0)) || [[ ${line:i-1:1} == [[:space:]\(] ]]; then
+			i=n
+		else
+			i+=1
+		fi
+		;;
+	'(')
+		if [[ ${top} == AR ]]; then
+			ard[sp - 1]=$((ard[sp - 1] + 1))
+		else
+			_tl_push AP
+		fi
+		i+=1
+		;;
+	')')
+		if [[ ${top} == AR ]] && ((ard[sp - 1] > 0)); then
+			ard[sp - 1]=$((ard[sp - 1] - 1))
+			i+=1
+		elif [[ ${top} == AR ]]; then
+			_tl_pop
+			i+=1
+			[[ ${line:i:1} == ')' ]] && i+=1
+		else
+			_tl_pop
+			i+=1
+		fi
+		;;
+	*) i+=1 ;;
+	esac
+	return 0
+}
+
+# _tl_op -- < > & | ; ( ) in code: redirections, heredocs, operators,
+# separators, groups, function headers and case patterns.
+_tl_op() {
+	local top="" ahead
+	((sp)) && top="${st[sp - 1]}"
+	local -i patpos=0
+	[[ ${top} == CASE ]] && ((cpat[sp - 1])) && patpos=1
+	case "${c}" in
+	'<' | '>')
+		if [[ ${nx} == '(' ]]; then
+			# <(...) / >(...): a command substitution inside a word.
+			_tl_wchar "${PH}"
+			_tl_save
+			i+=2
+		elif [[ ${c}${nx} == '<<' && ${line:i+2:1} != '<' ]]; then
+			_tl_heredoc
+		else
+			# A redirection: [N]op target, kept as one word.
+			[[ ${cur} =~ ^[0-9]+$ ]] || _tl_endword
+			[[ -n ${cur} ]] || _tl_mark
+			while [[ ${line:i:1} == [\<\>\&\|] ]]; do
+				cur+="${line:i:1}"
+				i+=1
+			done
+			while [[ ${line:i:1} == [[:blank:]] ]]; do i+=1; done
+			wcmd=0
+			redir=1
+		fi
+		;;
+	'&')
+		if [[ ${nx} == '&' ]]; then
+			_tl_pipe '&&'
+		elif [[ ${nx} == '>' ]]; then
+			_tl_endword
+			_tl_mark
+			cur='&'
+			i+=1
+			c='>'
+			nx="${line:i+1:1}"
+			_tl_op
+		else
+			i+=1
+			_tl_sep '&' || return 1
+		fi
+		;;
+	'|')
+		if ((patpos)); then
+			_tl_endword
+			i+=1
+		elif [[ ${nx} == '|' || ${nx} == '&' ]]; then
+			_tl_pipe "|${nx}"
+		else
+			_tl_pipe '|'
+		fi
+		;;
+	';')
+		if [[ ${top} == CASE && (${nx} == ';' || ${nx} == '&') ]]; then
+			_tl_endword
+			i+=2
+			[[ ${line:i:1} == '&' ]] && i+=1
+			cpat[sp - 1]=1
+			cmd=0
+		else
+			i+=1
+			_tl_sep ';' || return 1
+		fi
+		;;
+	'(')
+		ahead="${line:i+1}"
+		ahead="${ahead#"${ahead%%[![:blank:]]*}"}"
+		if ((patpos)) && [[ -z ${cur} ]]; then
+			i+=1
+		elif [[ -n ${cur} ]]; then
+			if ((!taint && wcmd)) && [[ ${ahead} == ')'* ]]; then
+				# name() -- a function header.
+				cur+='()'
+				i+=1
+				while [[ ${line:i:1} != ')' ]]; do i+=1; done
+				i+=1
+				_tl_emit "${cur}"
+				cur=""
+				fnkw=0
+				fnhdr=1
+				cmd=1
+			else
+				# arr=( ... ), or an extglob @( ... ): part of the word.
+				_tl_wchar "${PH}"
+				_tl_push AP
+				i+=1
+			fi
+		elif ((nw == 1 || fnhdr)) && [[ ${ahead} == ')'* ]]; then
+			# name () -- a function header, spaced.
+			i+=1
+			while [[ ${line:i:1} != ')' ]]; do i+=1; done
+			i+=1
+			_tl_emit '()'
+			fnhdr=1
+			cmd=1
+		elif [[ ${nx} == '(' ]]; then
+			# (( ... )) -- arithmetic, at any position (`for ((`).
+			_tl_mark
+			_tl_emit "${OPEN}(("
+			_tl_emit "${CLOSE}))"
+			_tl_push AR
+			ard[sp - 1]=0
+			i+=2
+		elif ((cmd)); then
+			_tl_mark
+			_tl_open P '('
+			i+=1
+		else
+			_tl_wchar "${PH}"
+			_tl_push AP
+			i+=1
+		fi
+		;;
+	')')
+		if ((patpos)); then
+			_tl_endword
+			cpat[sp - 1]=0
+			cmd=1
+			nw=0
+			i+=1
+		elif [[ ${top} == P ]]; then
+			_tl_endword
+			i+=1
+			_tl_close ')'
+		elif [[ ${top} == CS ]]; then
+			_tl_endword
+			i+=1
+			_tl_restore
+		else
+			printf '%s\tunbalanced ): %s\n' "${lno}" "${line}"
+			return 1
+		fi
+		;;
+	esac
+	return 0
+}
+
+# _tl_pipe OP -- && || | |&: the command goes on past it.
+_tl_pipe() {
+	_tl_endword
+	_tl_emit "${1}"
+	i+=${#1}
+	cmd=1
+	nw=0
+	pop=1
+}
+
+# _tl_heredoc -- << or <<- at line[i]: queue its delimiter; the body starts
+# on the next line and is skipped there.
+_tl_heredoc() {
+	_tl_endword
+	_tl_mark
+	strip=0
+	j=$((i + 2))
+	if [[ ${line:j:1} == - ]]; then
+		strip=1
+		j+=1
+	fi
+	while [[ ${line:j:1} == [[:blank:]] ]]; do j+=1; done
+	d=""
+	q=""
+	while ((j < n)); do
+		ch="${line:j:1}"
+		if [[ -n ${q} ]]; then
+			if [[ ${ch} == "${q}" ]]; then
+				q=""
+			else
+				d+="${ch}"
+			fi
+		else
+			case "${ch}" in
+			"'" | '"') q="${ch}" ;;
+			"\\")
+				j+=1
+				d+="${line:j:1}"
+				;;
+			[[:space:]] | ';' | '&' | '|' | '<' | '>' | '(' | ')') break ;;
+			*) d+="${ch}" ;;
+			esac
+		fi
+		j+=1
+	done
+	hdp+=("${strip}${d}")
+	_tl_emit '<<'
+	i=j
+}
+
+# _tl_judge -- is the top-level command in tk[] one that only declares? If
+# not, print it as "LINE<TAB>TEXT" and fail.
+_tl_judge() {
+	local -i nt=${#tk[@]} k=0
+	((nt)) || return 0
+	local t first="" t0="${tk[0]}"
+	local -i hdoc=0 at=0
+	local S='"?\$\{?BASH_SOURCE(\[0\])?\}?"?' Z='"?\$\{?0\}?"?'
+	local sp_='[[:space:]]*' T='\[\[?[[:space:]]+' TE='[[:space:]]+\]\]?'
+	local EX="(${S}${sp_}(==|=|-ef)${sp_}${Z}|${Z}${sp_}(==|=|-ef)${sp_}${S})"
+	local SR="(${S}${sp_}!=${sp_}${Z}|${Z}${sp_}!=${sp_}${S})"
+	local RG="\(?${sp_}return([[:space:]]+0)?${sp_}(2>${sp_}/dev/null)?"
+	RG+="${sp_}\)?${sp_}(2>${sp_}/dev/null)?"
+	local re
+
+	# A function definition: header, the body's open and close, and
+	# nothing after them but redirections.
+	if [[ ${t0} == function ]]; then
+		k=2
+		[[ ${tk[2]:-} == '()' ]] && k=3
+	elif [[ ${t0} =~ ^[^=${PH}]+\(\)$ ]]; then
+		k=1
+	elif [[ ${tk[1]:-} == '()' ]]; then
+		k=2
+	fi
+	if ((k)) && [[ ${tk[k]:-} == "${OPEN}"* &&
+		${tk[k + 1]:-} == "${CLOSE}"* ]] && _tl_only_redirs $((k + 2)); then
+		return 0
+	fi
+
+	# A main guard. The || / && the guard relies on must be the only kind
+	# in the list: `guard && main || cmd` runs cmd when sourced.
+	re="^${RG}${sp_}\|\|"
+	[[ ${etext} =~ ${re} ]] && ! _tl_has '&&' && return 0
+	re="^${T}${EX}${TE}${sp_}&&"
+	[[ ${etext} =~ ${re} ]] && ! _tl_has '||' && return 0
+	re="^${T}${SR}${TE}${sp_}\|\|"
+	[[ ${etext} =~ ${re} ]] && ! _tl_has '&&' && return 0
+	re="^if[[:space:]]+(${T}${EX}${TE}|!${sp_}${RG})${sp_}(;|$)"
+	if [[ ${t0} == "${OPEN}if" && ${etext} =~ ${re} ]] && ((!eelse)) &&
+		_tl_only_redirs "$(_tl_fi_end)"; then
+		return 0
+	fi
+
+	# Otherwise every command of the && / || / | list must declare.
+	# An if is judged branch by branch: its condition and each command
+	# of its branches, as tokens split at ; then elif else and fi.
+	for ((k = 0; k <= nt; k++)); do
+		t='&&'
+		((k < nt)) && t="${tk[k]}"
+		case "${t}" in
+		'&&' | '||' | '|' | '|&' | ';' | "${OPEN}if" | "${CLOSE}fi")
+			case "${first}" in
+			'' | source | . | set | shopt | declare | typeset | readonly | \
+				export | unset | true | : | test | '[' | "${OPEN}[[") ;;
+			read) ((hdoc)) || break ;;
+			*) break ;;
+			esac
+			first=""
+			hdoc=0
+			continue
+			;;
+		esac
+		if [[ ${t} =~ ^[0-9]*\&?[\<\>] ]]; then
+			[[ ${t} == '<<'* ]] && hdoc=1
+		elif [[ -z ${first} ]] &&
+			[[ ! ${t} =~ ^[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?= ]]; then
+			first="${t}"
+			at=k
+		fi
+	done
+	[[ -z ${first} ]] && return 0
+	t="${tkt[at]}"
+	printf '%s\t%s\n' "${tkl[at]}" "${t%"${t##*[![:space:]]}"}"
+	return 1
+}
+
+# _tl_fi_end -- the index just past the fi that closes the if tk[] opens.
+_tl_fi_end() {
+	local -i k=0 depth=0
+	for ((k = 0; k < ${#tk[@]}; k++)); do
+		case "${tk[k]}" in
+		"${OPEN}if") depth=$((depth + 1)) ;;
+		"${CLOSE}fi")
+			depth=$((depth - 1))
+			if ((depth == 0)); then
+				echo $((k + 1))
+				return 0
+			fi
+			;;
+		esac
+	done
+	echo "${#tk[@]}"
+}
+
+_tl_has() {
+	local t
+	for t in "${tk[@]}"; do
+		[[ ${t} == "${1}" ]] && return 0
+	done
+	return 1
+}
+
+# _tl_only_redirs K -- tk[K..] holds nothing but redirections.
+_tl_only_redirs() {
+	local t
+	for t in "${tk[@]:${1}}"; do
+		[[ ${t} =~ ^[0-9]*\&?[\<\>] ]] || return 1
+	done
+	return 0
+}
+
+# _list_fns SCRIPT LANG SPEC -- print the functions SCRIPT defines, one per
+# line. Python is parsed (ast), never run. Anything else is treated as
+# bash / sh and SOURCED in a child bash, so the functions it gets from the
+# libraries it sources are listed too -- but only once _toplevel_cmd finds
+# nothing at its top level that would run (just-bashit#121).
 _list_fns() {
-	local script="${1}" lang="${2}"
+	local script="${1}" lang="${2}" spec="${3}" found
 	if [[ ${lang} == "python" ]]; then
 		python3 - "${script}" <<'PYEOF'
 import ast, sys
@@ -719,6 +1564,17 @@ names = sorted(
 print('\n'.join(names))
 PYEOF
 		return
+	fi
+	if ! found=$(_toplevel_cmd "${script}"); then
+		# shellcheck disable=SC2016  # the guard is shown, not expanded
+		_err "$(printf '%s\n' \
+			"-l will not source ${spec}: line ${found%%$'\t'*} of ${script}" \
+			"runs a command at its top level:" \
+			"  ${found#*$'\t'}" \
+			"-l lists functions by sourcing the script, so it lists one only" \
+			"when its top level declares (functions, assignments, source, set)" \
+			"and its work sits behind a main guard, such as" \
+			'  if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi')"
 	fi
 	bash -c "
         _b=\$(compgen -A function)
@@ -840,7 +1696,7 @@ SCRIPT_LANG=$(_detect_lang "${SCRIPT}" "${RAW_SPEC}")
 _log "language: ${SCRIPT_LANG}"
 
 if [[ ${OPT_LIST} -eq 1 ]]; then
-	_list_fns "${SCRIPT}" "${SCRIPT_LANG}"
+	_list_fns "${SCRIPT}" "${SCRIPT_LANG}" "${RAW_SPEC}"
 	exit 0
 fi
 

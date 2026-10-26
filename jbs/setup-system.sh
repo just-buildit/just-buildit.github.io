@@ -333,25 +333,28 @@ _source_line() {
 # ---------------------------------------------------------------------------
 
 # deps — hand the project's deps file to install-deps.
-# Manifest discovery: bootstrap.toml, then the deprecated jb-prefixed names.
-# `jb` reads as just-buildit — the PEP 517 backend, which never opens this
-# file — so the old name pointed at the wrong tool. Both legacy names are
-# still read, and warn, because this script is fetched live from the CDN on
-# every CI run: a hard cutover would break every repo that had not yet
-# renamed, in the window between the publish and their rename.
+# Manifest discovery: prints `bootstrap.toml` when the current directory has
+# one, and nothing when it does not.
+#
+# The legacy names `jb-deps.toml` and `jb.toml` are no longer read (#30), but
+# one found without a bootstrap.toml is REFUSED rather than ignored: ignoring
+# it would quietly install or report nothing for a project that plainly
+# declares its packages. The refusal returns 1, so the caller writes
+# `_found=$(_find_bootstrap_toml) || exit 1` to stop on it.
 _find_bootstrap_toml() {
 	local _n
-	for _n in bootstrap.toml jb-deps.toml jb.toml; do
+	if [ -f bootstrap.toml ]; then
+		printf '%s\n' bootstrap.toml
+		return 0
+	fi
+	for _n in jb-deps.toml jb.toml; do
 		if [ -f "${_n}" ]; then
-			if [ "${_n}" != "bootstrap.toml" ]; then
-				printf 'warning: %s is deprecated, rename it to bootstrap.toml\n' \
-					"${_n}" >&2
-			fi
-			printf '%s\n' "${_n}"
-			return 0
+			printf 'error: %s is no longer read, rename it: git mv %s bootstrap.toml\n' \
+				"${_n}" "${_n}" >&2
+			return 1
 		fi
 	done
-	return 1
+	return 0
 }
 
 # The toolchain every machine gets, whatever directory this runs from: a C
@@ -465,7 +468,7 @@ step_deps() {
 	rm -f "${baseline}"
 
 	local deps_file=""
-	deps_file="$(_find_bootstrap_toml || true)"
+	deps_file="$(_find_bootstrap_toml)" || exit 1
 	if [[ -n ${deps_file} ]]; then
 		_install_manifest "${installer}" "${deps_file}" "${deps_file}" || ok=0
 		done_list="${done_list} + ${deps_file}"
@@ -1512,7 +1515,7 @@ fi
 # Resolve the step list: explicit -s > [tools.setup-system].steps > all.
 if [[ ${STEPS_EXPLICIT} -eq 0 ]]; then
 	_toml_steps=""
-	_steps_toml="$(_find_bootstrap_toml || true)"
+	_steps_toml="$(_find_bootstrap_toml)" || exit 1
 	if [[ -n ${_steps_toml} ]]; then
 		while IFS= read -r _s; do
 			[[ -z ${_s} ]] && continue

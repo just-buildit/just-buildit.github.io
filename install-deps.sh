@@ -29,7 +29,7 @@ read -r -d '' HELP <<-'EOF' || true
 	  Auto-detects the package manager from the OS. By default installs ALL
 	  groups defined in the file.
 	  Input resolution: DEPS_FILE arg > bootstrap.toml > stdin.
-	  (jb-deps.toml and jb.toml are still read, and deprecated.)
+	  A legacy jb-deps.toml or jb.toml is refused: rename it to bootstrap.toml.
 
 	  Section format — standard install:
 
@@ -450,34 +450,40 @@ if [[ ${TEMPLATE} -eq 1 ]]; then
 	exit 0
 fi
 
-# Manifest discovery: bootstrap.toml, then the deprecated jb-prefixed names.
-# `jb` reads as just-buildit — the PEP 517 backend, which never opens this
-# file — so the old name pointed at the wrong tool. Both legacy names are
-# still read, and warn, because this script is fetched live from the CDN on
-# every CI run: a hard cutover would break every repo that had not yet
-# renamed, in the window between the publish and their rename.
+# Manifest discovery: prints `bootstrap.toml` when the current directory has
+# one, and nothing when it does not.
+#
+# The legacy names `jb-deps.toml` and `jb.toml` are no longer read (#30), but
+# one found without a bootstrap.toml is REFUSED rather than ignored: ignoring
+# it would quietly install or report nothing for a project that plainly
+# declares its packages. The refusal returns 1, so the caller writes
+# `_found=$(_find_bootstrap_toml) || exit 1` to stop on it.
 _find_bootstrap_toml() {
 	local _n
-	for _n in bootstrap.toml jb-deps.toml jb.toml; do
+	if [ -f bootstrap.toml ]; then
+		printf '%s\n' bootstrap.toml
+		return 0
+	fi
+	for _n in jb-deps.toml jb.toml; do
 		if [ -f "${_n}" ]; then
-			if [ "${_n}" != "bootstrap.toml" ]; then
-				printf 'warning: %s is deprecated, rename it to bootstrap.toml\n' \
-					"${_n}" >&2
-			fi
-			printf '%s\n' "${_n}"
-			return 0
+			printf 'error: %s is no longer read, rename it: git mv %s bootstrap.toml\n' \
+				"${_n}" "${_n}" >&2
+			return 1
 		fi
 	done
-	return 1
+	return 0
 }
 
 # Slurp deps content: explicit file > discovered manifest > stdin.
 if [ -n "${DEPS_FILE}" ]; then
 	CONTENT=$(cat "${DEPS_FILE}")
-elif _found=$(_find_bootstrap_toml); then
-	CONTENT=$(cat "${_found}")
 else
-	CONTENT=$(cat)
+	_found=$(_find_bootstrap_toml) || exit 1
+	if [ -n "${_found}" ]; then
+		CONTENT=$(cat "${_found}")
+	else
+		CONTENT=$(cat)
+	fi
 fi
 
 # Resolve groups: explicit -g > [tools.install-deps].groups in toml > all.

@@ -159,6 +159,14 @@ if [[ ${_ME} == "just-runit" ]]; then
 		exit 0
 		;;
 	install)
+		# --no-verify reaches every fetch below, which run the runner with -f.
+		_install_opts=()
+		if [[ ${2:-} == --no-verify ]]; then
+			_install_opts=(--no-verify)
+		elif [[ -n ${2:-} ]]; then
+			echo "${_ME} install: unknown argument '${2}'" >&2
+			exit 1
+		fi
 		# Find the bootstrap manifest walking up from CWD.
 		#
 		# The legacy name `jb.toml` is no longer read (#30). The nearest one
@@ -199,7 +207,8 @@ if [[ ${_ME} == "just-runit" ]]; then
 		# (just-bashit#117).
 		for _src in "${_sources[@]}"; do
 			printf '  -> %s ' "${_src}"
-			if "${_runner}" -f "${_src}" >/dev/null 2>&1; then
+			if "${_runner}" "${_install_opts[@]+"${_install_opts[@]}"}" \
+				-f "${_src}" >/dev/null 2>&1; then
 				printf 'ok\n'
 				((_ok++)) || true
 			else
@@ -249,6 +258,8 @@ OPT_LIST=0
 OPT_FETCH=0
 OPT_TTL="${_DEFAULT_TTL}"
 OPT_CHECKSUM=""
+OPT_NO_VERIFY=0
+_CURL_TLS=()
 OPT_PASS=()
 OPTARG=""
 OPTIND=1
@@ -290,6 +301,12 @@ read -r -d '' HELP <<-EOF || true
 	  -p VARS   Comma-separated var names to pass through with -c.
 	  -t TTL    Cache TTL in seconds (default 3600). 0 = keep forever.
 	  -k HASH   Verify script before running: sha256:HASH or md5:HASH.
+	  --no-verify
+	            Skip TLS certificate checks on ${_ME}'s own downloads
+	            (curl --insecure), e.g. behind a TLS-intercepting proxy.
+	            Warns when used. Pair it with -k HASH so the script is
+	            still verified. Downloads the script itself makes are
+	            not affected.
 	  -v        Verbose.
 
 	Language detection (automatic):
@@ -311,6 +328,47 @@ read -r -d '' HELP <<-EOF || true
 EOF
 
 # ---- parse options ----------------------------------------------------------
+
+# --no-verify is the one long option, and getopts reads none, so it is taken
+# out here first. Only the options before SPEC are scanned: an argument after
+# SPEC belongs to the script, so `jbx tool.sh fn --no-verify` passes the flag
+# to fn. The scan has to know which options take a value (p, t, k), so a value
+# such as `-k --no-verify` is not mistaken for the flag, nor for SPEC, and the
+# same for a cluster ending in one (`-nk HASH`).
+_opts=()
+while [[ $# -gt 0 ]]; do
+	case "${1}" in
+	--no-verify)
+		OPT_NO_VERIFY=1
+		shift
+		;;
+	--)
+		_opts+=("${1}")
+		shift
+		break
+		;;
+	-?*)
+		_opts+=("${1}")
+		_cluster="${1#-}"
+		shift
+		# A value-taking letter consumes the rest of the cluster, or, as
+		# its last letter, the next argument.
+		while [[ -n ${_cluster} ]]; do
+			_c="${_cluster:0:1}"
+			_cluster="${_cluster:1}"
+			if [[ ${_c} == [ptk] ]]; then
+				if [[ -z ${_cluster} && $# -gt 0 ]]; then
+					_opts+=("${1}")
+					shift
+				fi
+				break
+			fi
+		done
+		;;
+	*) break ;;
+	esac
+done
+set -- "${_opts[@]+"${_opts[@]}"}" "$@"
 
 while getopts ":hlfrncvp:t:k:" option; do
 	case $option in
@@ -335,6 +393,11 @@ while getopts ":hlfrncvp:t:k:" option; do
 	esac
 done
 shift "$((OPTIND - 1))"
+
+if [[ ${OPT_NO_VERIFY} -eq 1 ]]; then
+	_CURL_TLS=(--insecure)
+	echo "${_ME}: warning: --no-verify: TLS certificates are not checked" >&2
+fi
 
 [[ $# -eq 0 ]] && {
 	echo "${HELP}"
@@ -381,7 +444,7 @@ _lookup_alias() {
 	if [[ ${OPT_REFRESH} -eq 1 ]] || ! _cache_valid "${aliases_cache}"; then
 		mkdir -p "${aliases_cache%/*}"
 		_log "fetching ${aliases_url}"
-		if ! curl -sSL --proto '=https' --tlsv1.2 --max-time 10 \
+		if ! curl -sSL "${_CURL_TLS[@]+"${_CURL_TLS[@]}"}" --proto '=https' --tlsv1.2 --max-time 10 \
 			-o "${aliases_cache}.new" "${aliases_url}" 2>/dev/null; then
 			rm -f "${aliases_cache}.new"
 			echo ""
@@ -431,7 +494,7 @@ _lookup_alias() {
 _head_ok() {
 	local url="${1}"
 	local code
-	code=$(curl -sSL --proto '=https' --tlsv1.2 --max-time 5 \
+	code=$(curl -sSL "${_CURL_TLS[@]+"${_CURL_TLS[@]}"}" --proto '=https' --tlsv1.2 --max-time 5 \
 		-o /dev/null -w '%{http_code}' --head "${url}" 2>/dev/null)
 	[[ ${code} == "200" || ${code} == "301" || ${code} == "302" ]]
 }
@@ -580,7 +643,7 @@ _fetch_to() {
 	# and returns non-zero on >=400, and the retries ride out transient
 	# throttling so a blip retries instead of reddening the build.
 	_curl_retry_opts_init
-	if ! curl -sSL --fail "${_CURL_RETRY_OPTS[@]}" --connect-timeout 30 \
+	if ! curl -sSL --fail "${_CURL_TLS[@]+"${_CURL_TLS[@]}"}" "${_CURL_RETRY_OPTS[@]}" --connect-timeout 30 \
 		-o "${dest}" "${url}"; then
 		rm -f "${dest}"
 		_err "fetch failed (no usable response from ${url})"
@@ -1597,6 +1660,7 @@ _run_python() {
 		# -n reaches the nested run too, so the installer is not cached.
 		local nested=()
 		[[ ${OPT_NO_CACHE} -eq 1 ]] && nested=(-n)
+		[[ ${OPT_NO_VERIFY} -eq 1 ]] && nested+=(--no-verify)
 		"${0}" "${nested[@]+"${nested[@]}"}" https://astral.sh/uv/install.sh
 		hash -r 2>/dev/null || true
 		command -v uv >/dev/null 2>&1 ||

@@ -279,6 +279,12 @@ read -r -d '' HELP <<-EOF || true
 	  gh:USER/REPO/PATH     GitHub raw, default branch main
 	  gh:USER/REPO/PATH@REF GitHub raw at a specific ref/tag/sha
 	  https://URL           direct URL
+	  [FORGE+]https://HOST[:PORT]/PROJECT//PATH[@REF]
+	                        a script in a repository, by its path in the
+	                        repo; REF defaults to HEAD (the default branch).
+	                        FORGE: github, gitlab, gitea (forgejo), bitbucket;
+	                        optional for github.com, gitlab.com, codeberg.org
+	                        and bitbucket.org. Public repos only, HTTPS only.
 
 	Namespaces:
 	  just-buildit          ${_JB_DEFAULT_BASE}/   (default)
@@ -320,6 +326,8 @@ read -r -d '' HELP <<-EOF || true
 	  ${_ME} just-bashit:datetime iso-8601-basic -m
 	  ${_ME} gh:user/repo/tools/deploy.sh run --env prod
 	  ${_ME} gh:user/repo/tool.sh@v2.1.0 setup
+	  ${_ME} https://gitlab.com/group/sub/repo//bin/tool.sh@v2 run
+	  ${_ME} gitea+https://git.example.com:3000/ops/tools//deploy.sh deploy
 	  ${_ME} https://example.com/tool.sh
 	  ${_ME} https://example.com/tool.py --flag value
 	  ${_ME} -l just-bashit:logging
@@ -546,12 +554,127 @@ _resolve_ns() {
 
 # ---- URL resolution ---------------------------------------------------------
 
+# Repository form (just-bashit#136): a script named by its path inside a
+# repository, rather than by a host-specific raw-content URL.
+#
+#   [FORGE+]https://HOST[:PORT]/PROJECT//PATH[@REF]
+#
+# `//` separates the repository from the path, as Terraform module sources and
+# go-getter do: a colon cannot, since the scheme and a port already use one,
+# and no URL path holds `//` legitimately, so a plain script URL is unaffected.
+# REF is a branch, tag or commit SHA, HEAD (the default branch) when omitted.
+#
+# FORGE names the raw-file layout. The four public hosts are known; any other
+# host must say which forge serves it, because jbx does not guess a layout.
+# Each layout was measured against live repositories (just-bashit#136):
+#   github     raw.githubusercontent.com/O/R/REF/PATH, or HOST/O/R/raw/REF/PATH
+#   gitlab     HOST/GROUP/.../PROJECT/-/raw/REF/PATH (nested groups)
+#   gitea      HOST/O/R/raw/REF/PATH (Gitea, Forgejo, Codeberg)
+#   bitbucket  bitbucket.org/O/R/raw/REF/PATH (Cloud only)
+#
+# Prints the raw HTTPS URL, which then goes through the ordinary fetch, so
+# caching, -r, -n, -k and argument forwarding are unchanged. Every refusal
+# names what to do instead, and none echoes credentials.
+_resolve_repo() {
+	local spec="${1}" forge="" rest authority host project path ref="HEAD"
+	if [[ ${spec} =~ ^([a-z]+)\+([a-z][a-z0-9+.-]*://.*)$ ]]; then
+		forge="${BASH_REMATCH[1]}"
+		spec="${BASH_REMATCH[2]}"
+	fi
+	case "${forge}" in
+	"" | github | gitlab | gitea | bitbucket) ;;
+	forgejo) forge=gitea ;;
+	*) _err "unknown forge '${forge}': use github, gitlab, gitea (or forgejo) or bitbucket" ;;
+	esac
+	[[ ${spec} == https://* ]] ||
+		_err "a repository is fetched over HTTPS only: ${spec%%://*}:// is not supported"
+
+	rest="${spec#https://}"
+	authority="${rest%%/*}"
+	rest="${rest#*/}"
+	# Credentials would be written to logs and cache metadata, and jbx sends
+	# none anyway: refuse them, naming the host but never the secret.
+	[[ ${authority} == *@* ]] &&
+		_err "credentials in a repository URL are refused (${authority##*@}): jbx fetches public repositories only"
+	host="${authority%%:*}"
+	[[ -n ${host} ]] || _err "no host in repository URL: ${spec}"
+
+	project="${rest%%//*}"
+	path="${rest#*//}"
+	if [[ ${path} == *@* ]]; then
+		ref="${path##*@}"
+		path="${path%@*}"
+	fi
+	project="${project%/}"
+	project="${project%.git}"
+
+	if [[ -z ${forge} ]]; then
+		case "${host}" in
+		github.com) forge=github ;;
+		gitlab.com) forge=gitlab ;;
+		codeberg.org) forge=gitea ;;
+		bitbucket.org) forge=bitbucket ;;
+		*) _err "jbx does not know which forge serves ${authority}; name it, e.g. gitea+https://${authority}/... (github, gitlab, gitea, bitbucket)" ;;
+		esac
+	fi
+
+	local -a parts
+	IFS=/ read -ra parts <<<"${project}"
+	local part
+	for part in "${parts[@]}"; do
+		[[ -n ${part} ]] || _err "empty segment in repository path '${project}'"
+	done
+	if [[ ${forge} == gitlab ]]; then
+		[[ ${#parts[@]} -ge 2 ]] ||
+			_err "a GitLab project is GROUP/.../PROJECT, not '${project}'"
+	else
+		[[ ${#parts[@]} -eq 2 ]] ||
+			_err "a ${forge} repository is OWNER/REPO, not '${project}'"
+	fi
+
+	[[ -n ${path} && ${path} != /* ]] ||
+		_err "no script path after '//' in ${spec%@*}: name the file inside the repository"
+	IFS=/ read -ra parts <<<"${path}"
+	for part in "${parts[@]}"; do
+		[[ -n ${part} && ${part} != ".." ]] ||
+			_err "bad script path '${path}': no empty or '..' segments"
+	done
+	[[ -n ${ref} ]] || _err "empty ref after '@' in ${spec}"
+	[[ ${ref} != */* ]] ||
+		_err "ref '${ref}' contains '/', which is ambiguous in a raw URL: pin a tag or commit SHA"
+	[[ ${ref} =~ ^[A-Za-z0-9._-]+$ ]] || _err "bad ref '${ref}'"
+
+	case "${forge}" in
+	github)
+		if [[ ${host} == github.com ]]; then
+			echo "https://raw.githubusercontent.com/${project}/${ref}/${path}"
+		else
+			echo "https://${authority}/${project}/raw/${ref}/${path}"
+		fi
+		;;
+	gitlab) echo "https://${authority}/${project}/-/raw/${ref}/${path}" ;;
+	gitea) echo "https://${authority}/${project}/raw/${ref}/${path}" ;;
+	bitbucket)
+		[[ ${host} == bitbucket.org ]] ||
+			_err "only Bitbucket Cloud (bitbucket.org) is supported: Server/Data Center serves raw files on another layout"
+		echo "https://${authority}/${project}/raw/${ref}/${path}"
+		;;
+	esac
+}
+
 _resolve() {
 	local raw="${1}"
 	case "${raw}" in
 	just-bashit:*)
 		# Explicit just-bashit namespace; use co-fetch mechanism.
 		echo "jbs:${raw#just-bashit:}"
+		;;
+	[a-z]*+*://* | *://*/*//*)
+		# A repository and a path inside it (just-bashit#136).
+		_resolve_repo "${raw}"
+		;;
+	*@*:*//*)
+		_err "SSH repository URLs are not supported; use the HTTPS form: [FORGE+]https://HOST/PROJECT//PATH"
 		;;
 	*://*)
 		case "${raw}" in

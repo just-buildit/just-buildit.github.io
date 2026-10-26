@@ -1639,7 +1639,13 @@ PYEOF
 			"and its work sits behind a main guard, such as" \
 			'  if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi')"
 	fi
-	bash -c "
+	# The child starts from bash's default options, not this script's
+	# `set -euo pipefail`. Exported SHELLOPTS (kcov exports it to trace
+	# children) carried errexit in, and `compgen -A function` returns 1 while
+	# no function exists yet, so the child died on its first line; with
+	# nounset too, kcov's PS4 naming BASH_SOURCE failed in every subshell.
+	# Listing a script's functions must not depend on jbx's own options.
+	env -u BASH_ENV -u SHELLOPTS -u BASHOPTS bash -c "
         _b=\$(compgen -A function)
         # shellcheck source=/dev/null
         source '${script}' 2>/dev/null || true

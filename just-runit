@@ -161,33 +161,26 @@ if [[ ${_ME} == "just-runit" ]]; then
 	install)
 		# Find the bootstrap manifest walking up from CWD.
 		#
-		# `bootstrap.toml` is the name; `jb.toml` is accepted and deprecated.
-		# The old name pointed at the wrong tool — `jb` reads as just-buildit,
-		# the PEP 517 backend, which never opens this file. The new one says
-		# what the file declares instead: what must exist before the language
-		# ecosystem's own package manager can run.
-		#
-		# Both names are read during the transition because this script is
-		# fetched live from the CDN on every CI run, so a hard cutover would
-		# break every repo that had not yet renamed, in the window between the
-		# publish and their rename. Removal is tracked separately.
+		# The legacy name `jb.toml` is no longer read (#30). The nearest one
+		# met on the walk, before any bootstrap.toml, is REFUSED rather than
+		# skipped: skipping it would install from some ancestor's manifest
+		# instead of the project's own, or report none at all.
 		_toml=""
 		_dir="${PWD}"
 		while [[ "${_dir}" != "/" ]]; do
-			for _cand in bootstrap.toml jb.toml; do
-				if [[ -f "${_dir}/${_cand}" ]]; then
-					_toml="${_dir}/${_cand}"
-					break 2
-				fi
-			done
+			if [[ -f "${_dir}/bootstrap.toml" ]]; then
+				_toml="${_dir}/bootstrap.toml"
+				break
+			fi
+			if [[ -f "${_dir}/jb.toml" ]]; then
+				echo "${_ME}: ${_dir}/jb.toml is no longer read, rename it: git mv jb.toml bootstrap.toml" >&2
+				exit 1
+			fi
 			_dir="$(dirname "${_dir}")"
 		done
 		if [[ -z "${_toml}" ]]; then
 			echo "${_ME}: no bootstrap.toml found (searched up from ${PWD})" >&2
 			exit 1
-		fi
-		if [[ "$(basename "${_toml}")" == "jb.toml" ]]; then
-			echo "${_ME}: ${_toml} — jb.toml is deprecated, rename it to bootstrap.toml" >&2
 		fi
 		printf '  reading %s\n' "${_toml}"
 		# Extract all source = "..." values from [tools.*] sections.

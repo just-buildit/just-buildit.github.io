@@ -25,6 +25,16 @@ _JB_DEFAULT_BASE="https://just-buildit.github.io"
 # Served from the Pages CDN (mirror of src/just_bashit/), NOT
 # raw.githubusercontent, which rate-limits shared CI runner IPs.
 _JBS_BASE="https://just-buildit.github.io/jbs"
+
+# The built-in namespaces, one row each: "NAME BASE-URL". The resolver, its
+# unknown-namespace error and the help text all read this table, so a
+# namespace is added in one place. just-bashit is listed for the help and the
+# error only: it resolves through the co-fetch bundle, not through a base.
+_NAMESPACES=(
+	"just-buildit ${_JB_DEFAULT_BASE}"
+	"just-bashit ${_JBS_BASE}"
+	"just-makeit ${_JB_DEFAULT_BASE}/just-makeit"
+)
 # All src/ libs; fetched together so relative inter-source calls resolve.
 _JBS_LIBS=(
 	datetime environment file format
@@ -266,6 +276,15 @@ OPTIND=1
 
 # ---- help -------------------------------------------------------------------
 
+# One line per built-in namespace, from the _NAMESPACES table.
+_ns_help=""
+for _row in "${_NAMESPACES[@]}"; do
+	_ns_help+="$(printf '  %-21s %s/' "${_row%% *}" "${_row#* }")"
+	[[ ${_row%% *} == "${_JB_DEFAULT_NS}" ]] && _ns_help+="   (default)"
+	_ns_help+=$'\n'
+done
+_ns_help="${_ns_help%$'\n'}"
+
 read -r -d '' HELP <<-EOF || true
 	Usage: ${_ME} [OPTIONS] SPEC [FUNCTION [ARGS...]]
 	   or: jbx [OPTIONS] SPEC [FUNCTION [ARGS...]]
@@ -287,8 +306,7 @@ read -r -d '' HELP <<-EOF || true
 	                        and bitbucket.org. Public repos only, HTTPS only.
 
 	Namespaces:
-	  just-buildit          ${_JB_DEFAULT_BASE}/   (default)
-	  just-bashit           ${_JBS_BASE}/
+	${_ns_help}
 
 	Resolution order for NAME / NS:NAME:
 	  1. aliases.toml at namespace base
@@ -323,6 +341,7 @@ read -r -d '' HELP <<-EOF || true
 	Examples:
 	  ${_ME} install-deps -s apt
 	  ${_ME} just-bashit:logging log "hello"
+	  ${_ME} just-makeit:install-deps
 	  ${_ME} just-bashit:datetime iso-8601-basic -m
 	  ${_ME} gh:user/repo/tools/deploy.sh run --env prod
 	  ${_ME} gh:user/repo/tool.sh@v2.1.0 setup
@@ -513,18 +532,17 @@ _resolve_ns() {
 	local ns="${1}" name="${2}"
 
 	# Map namespace to base URL.
-	local base
-	case "${ns}" in
-	just-buildit) base="${_JB_DEFAULT_BASE}" ;;
-	just-bashit)
+	local base="" row known=""
+	for row in "${_NAMESPACES[@]}"; do
+		known+="${known:+, }${row%% *}"
+		[[ ${row%% *} == "${ns}" ]] && base="${row#* }"
+	done
+	[[ -n ${base} ]] || _err "unknown namespace '${ns}'; known: ${known}"
+	if [[ ${ns} == just-bashit ]]; then
 		# just-bashit uses the co-fetch mechanism; return internal marker.
 		echo "jbs:${name}"
 		return
-		;;
-	*)
-		_err "unknown namespace '${ns}'; known: just-buildit, just-bashit"
-		;;
-	esac
+	fi
 
 	# 1. Check aliases.toml first (one cached round-trip covers all names).
 	local alias_url

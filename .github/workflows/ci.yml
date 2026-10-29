@@ -1219,7 +1219,7 @@ jobs:
           - { python: "3.13", os: ubuntu-latest }
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/setup-python@v7.1.0
         with:
           python-version: ${{ matrix.python }}
       - name: Doctests

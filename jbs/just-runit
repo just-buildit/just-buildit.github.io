@@ -314,10 +314,9 @@ read -r -d '' HELP <<-EOF || true
 
 	Options:
 	  -h        Show this message and exit.
-	  -l        List functions defined by SPEC then exit. A shell script is
-	            sourced to list them, so one whose top level runs a command
-	            (no main guard) is refused, naming the line. Python is
-	            parsed, never run.
+	  -l        List functions defined by SPEC, and by the files it sources,
+	            then exit. Nothing runs: a shell script is read, a Python
+	            one parsed.
 	  -f        Fetch only — cache SPEC, print its path, run nothing.
 	  -r        Refresh — ignore and overwrite cached copy.
 	  -n        No-cache — fetch fresh, discard on exit (cache untouched).
@@ -912,52 +911,40 @@ _detect_lang() {
 
 # ---- list functions ---------------------------------------------------------
 
-# _toplevel_cmd FILE -- the first top-level command in FILE that would RUN
-# something when FILE is sourced, as "LINE<TAB>TEXT" on stdout, and exit 1;
-# exit 0, printing nothing, when FILE's top level only declares.
+# _scan_defs FILE -- what FILE's top level defines, read and never run:
+# "F<TAB>NAME" for each function it defines and "S<TAB>LINE<TAB>ARG" for
+# each file it sources (ARG as written), one per line on stdout. A construct
+# it cannot read to the end -- one still open at end of file, a stray ) --
+# is "E<TAB>LINE<TAB>WHY", and it exits 1.
 #
-# -l lists a script's functions by sourcing it (_list_fns), so a script
-# whose top level does work -- `setup-system` has no main guard -- used to
-# be RUN by a flag that reads as inspection (just-bashit#121). This is the
-# check -l makes first. Allowed at top level:
+# This is how -l lists a script (_list_fns). -l used to SOURCE the script
+# and diff the functions before and after, so listing ran the script's top
+# level: in full, until -l learned to refuse a top level that runs a command
+# (just-bashit#121), and its command substitutions even then -- `X=$(cmd)`
+# is an assignment, and the assignment ran cmd (just-bashit#143). Reading
+# runs nothing, so -l lists any script, main guard or not.
 #
-#   - comments and blank lines
-#   - function definitions (`name() {`, `name ()`, `function name {`, with
-#     any compound body); the body is skipped whatever it holds
-#   - assignments, alone or chained with && / || (`IFS=$'\n\t'`,
-#     `arr=(a b)`, `[[ -n $X ]] && Y=1 || Y=2`); a `read` fed by a heredoc
-#     or here-string, which only assigns (`read -r -d '' HELP <<-'EOF'`)
-#   - the builtins source . set shopt declare typeset readonly export true :
-#     and the tests [[ ]] [ ] test
-#   - a main guard, whose body never runs when the file is sourced:
-#     `if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then ... fi` (= or -ef, either
-#     operand order, quoted or not, `$BASH_SOURCE` or `${0}` too), the same
-#     test followed by `&& cmd` (or `!=` by `|| cmd`), `if ! (return 0
-#     2>/dev/null); then ... fi`, and `(return 0 2>/dev/null) || cmd`, the
-#     "must be sourced" line every just-bashit library opens with
-#
-# Anything else -- a plain command, `trap`, `exit`, a top-level if/while/
-# for/case/{ }/( ) that is not a guard -- is reported. It is a guard against
-# running a script by accident, not a sandbox: a command substitution inside
-# an assignment or a test (`DIR=$(cd ... && pwd)`) still runs, as do the top
-# levels of the libraries the file sources, since listing what they define
-# is why -l sources at all.
+# Seen at the top level, and inside a top-level if (its condition and its
+# branches): `name() {`, `name ()`, `function name {` and `function
+# name()`, with any compound body, and `source FILE` / `. FILE`. Anything
+# deeper -- a function body, a loop, a case, a { } or ( ) group -- defines
+# nothing when the file is sourced unless it runs, and is skipped.
 #
 # It is a lexer, not a line matcher, because a function body ends at the
 # brace that closes it and nowhere else: it tracks quotes, ${...}, $(...),
 # $((...)), backticks, heredocs (bodies skipped, `<<-` tab-stripped),
 # [[ ]], case patterns and the if/case/loop/brace/paren nesting, so a `}`
 # or `fi` inside a string or a heredoc closes nothing. Pure bash, for the
-# reason _lookup_alias is. A construct still open at end of file is
-# reported too, rather than guessed at.
-_toplevel_cmd() {
+# reason _lookup_alias is.
+_scan_defs() {
 	local LC_ALL=C
 	local line="" c nx rest top d ch q
 	local -i lno=0 i=0 n=0 sp=0 j=0 strip=0
 	# The context stack, and per-entry state: a case's "seen in" and "in
 	# pattern position", an arithmetic context's paren depth, and the word
 	# state a $(...) saves and puts back.
-	local -a st=() cin=() cpat=() ard=() tk=() tkl=() tkt=() hd=() hdp=()
+	local -a st=() cin=() cpat=() ard=() tk=() tkl=() tkt=() tkr=() hd=()
+	local -a hdp=()
 	local -a s_cur=() s_taint=() s_wcmd=() s_cmd=() s_nw=() s_pop=()
 	local -a s_fnhdr=() s_fnkw=() s_redir=() s_wline=() s_wtext=()
 	# The word being read: its text, whether quoting or an expansion makes
@@ -968,7 +955,7 @@ _toplevel_cmd() {
 	# waiting for its body / for its name.
 	local cur="" wtext="" etext=""
 	local -i taint=0 wcmd=0 cmd=1 nw=0 pop=0 fnhdr=0 fnkw=0 redir=0
-	local -i cont=0 wline=0 eline=0 eelse=0 nonif=0
+	local -i cont=0 wline=0 eline=0 nonif=0
 	local OPEN=$'\x1e' CLOSE=$'\x1f' PH=$'\x1d'
 	local ordre="^[^[:space:]#\\\\'\"\`\$<>&|;()]+"
 
@@ -1106,14 +1093,14 @@ _toplevel_cmd() {
 	_tl_endword
 	if ((sp || ${#hd[@]})); then
 		((${#tk[@]})) || eline=lno
-		printf '%s\tunterminated at end of file: %s\n' "${eline}" \
+		printf 'E\t%s\tunterminated at end of file: %s\n' "${eline}" \
 			"${etext%"${etext##*[![:space:]]}"}"
 		return 1
 	fi
-	_tl_judge
+	_tl_collect
 }
 
-# The helpers below are _toplevel_cmd's: they read and write its locals.
+# The helpers below are _scan_defs's: they read and write its locals.
 
 # nonif counts the open contexts that are not an if: the judge sees
 # inside a top-level if, whose branches must declare too, and nothing
@@ -1150,6 +1137,13 @@ _tl_emit() {
 	tk+=("${1}")
 	tkl+=("${wline}")
 	tkt+=("${wtext}")
+	# The word as written, while it is still on the line it began on: the
+	# text from its start to here. A word spanning lines has none.
+	if ((wline == lno)); then
+		tkr+=("${wtext:0:${#wtext}-(n - i)}")
+	else
+		tkr+=("")
+	fi
 }
 
 # _tl_open TYPE TOKEN / _tl_close TOKEN -- enter and leave a compound
@@ -1235,7 +1229,6 @@ _tl_endword() {
 			else | elif)
 				cmd=1
 				_tl_emit ';'
-				[[ ${top} == IF ]] && ((sp == 1)) && eelse=1
 				return 0
 				;;
 			"fi" | "done" | "esac")
@@ -1292,11 +1285,11 @@ _tl_sep() {
 	nw=0
 	pop=0
 	if ((sp == 0)); then
-		_tl_judge || return 1
+		_tl_collect
 		tk=()
 		tkl=()
 		tkt=()
-		eelse=0
+		tkr=()
 	else
 		_tl_emit ';'
 	fi
@@ -1520,8 +1513,10 @@ _tl_op() {
 		if ((patpos)) && [[ -z ${cur} ]]; then
 			i+=1
 		elif [[ -n ${cur} ]]; then
-			if ((!taint && wcmd)) && [[ ${ahead} == ')'* ]]; then
-				# name() -- a function header.
+			if ((!taint && wcmd)) && [[ ${ahead} == ')'* && ${cur} != *=* ]]; then
+				# name() -- a function header. Not `arr=()`, an empty
+				# array: read as a header, it joined the next line's
+				# command to it, and hid the function that line defines.
 				cur+='()'
 				i+=1
 				while [[ ${line:i:1} != ')' ]]; do i+=1; done
@@ -1579,7 +1574,7 @@ _tl_op() {
 			i+=1
 			_tl_restore
 		else
-			printf '%s\tunbalanced ): %s\n' "${lno}" "${line}"
+			printf 'E\t%s\tunbalanced ): %s\n' "${lno}" "${line}"
 			return 1
 		fi
 		;;
@@ -1637,125 +1632,55 @@ _tl_heredoc() {
 	i=j
 }
 
-# _tl_judge -- is the top-level command in tk[] one that only declares? If
-# not, print it as "LINE<TAB>TEXT" and fail.
-_tl_judge() {
-	local -i nt=${#tk[@]} k=0
-	((nt)) || return 0
-	local t first="" t0="${tk[0]}"
-	local -i hdoc=0 at=0
-	local S='"?\$\{?BASH_SOURCE(\[0\])?\}?"?' Z='"?\$\{?0\}?"?'
-	local sp_='[[:space:]]*' T='\[\[?[[:space:]]+' TE='[[:space:]]+\]\]?'
-	local EX="(${S}${sp_}(==|=|-ef)${sp_}${Z}|${Z}${sp_}(==|=|-ef)${sp_}${S})"
-	local SR="(${S}${sp_}!=${sp_}${Z}|${Z}${sp_}!=${sp_}${S})"
-	local RG="\(?${sp_}return([[:space:]]+0)?${sp_}(2>${sp_}/dev/null)?"
-	RG+="${sp_}\)?${sp_}(2>${sp_}/dev/null)?"
-	local re
-
-	# A function definition: header, the body's open and close, and
-	# nothing after them but redirections.
-	if [[ ${t0} == function ]]; then
-		k=2
-		[[ ${tk[2]:-} == '()' ]] && k=3
-	elif [[ ${t0} =~ ^[^=${PH}]+\(\)$ ]]; then
-		k=1
-	elif [[ ${tk[1]:-} == '()' ]]; then
-		k=2
-	fi
-	if ((k)) && [[ ${tk[k]:-} == "${OPEN}"* &&
-		${tk[k + 1]:-} == "${CLOSE}"* ]] && _tl_only_redirs $((k + 2)); then
-		return 0
-	fi
-
-	# A main guard. The || / && the guard relies on must be the only kind
-	# in the list: `guard && main || cmd` runs cmd when sourced.
-	re="^${RG}${sp_}\|\|"
-	[[ ${etext} =~ ${re} ]] && ! _tl_has '&&' && return 0
-	re="^${T}${EX}${TE}${sp_}&&"
-	[[ ${etext} =~ ${re} ]] && ! _tl_has '||' && return 0
-	re="^${T}${SR}${TE}${sp_}\|\|"
-	[[ ${etext} =~ ${re} ]] && ! _tl_has '&&' && return 0
-	re="^if[[:space:]]+(${T}${EX}${TE}|!${sp_}${RG})${sp_}(;|$)"
-	if [[ ${t0} == "${OPEN}if" && ${etext} =~ ${re} ]] && ((!eelse)) &&
-		_tl_only_redirs "$(_tl_fi_end)"; then
-		return 0
-	fi
-
-	# Otherwise every command of the && / || / | list must declare.
-	# An if is judged branch by branch: its condition and each command
-	# of its branches, as tokens split at ; then elif else and fi.
-	for ((k = 0; k <= nt; k++)); do
-		t='&&'
-		((k < nt)) && t="${tk[k]}"
-		case "${t}" in
-		'&&' | '||' | '|' | '|&' | ';' | "${OPEN}if" | "${CLOSE}fi")
-			case "${first}" in
-			'' | source | . | set | shopt | declare | typeset | readonly | \
-				export | unset | true | : | test | '[' | "${OPEN}[[") ;;
-			read) ((hdoc)) || break ;;
-			*) break ;;
+# _tl_collect -- the top-level command in tk[]: print each function it
+# defines as "F<TAB>NAME", and each file it sources as "S<TAB>LINE<TAB>ARG",
+# ARG as written. It looks at every command of an && / || / | list and of a
+# top-level if's condition and branches -- the tokens split at ; then elif
+# else and fi -- and at nothing deeper: a function body, a loop or a case
+# defines nothing when the file is sourced unless it runs.
+_tl_collect() {
+	local -i nt=${#tk[@]} k=0 at=0
+	local t name
+	for ((k = 0; k < nt; k++)); do
+		# A command starts at the list's start or just past a separator.
+		if ((k)); then
+			case "${tk[k - 1]}" in
+			'&&' | '||' | '|' | '|&' | ';' | '!' | time | "${OPEN}if" | \
+				"${CLOSE}fi") ;;
+			*) continue ;;
 			esac
-			first=""
-			hdoc=0
-			continue
-			;;
-		esac
-		if [[ ${t} =~ ^[0-9]*\&?[\<\>] ]]; then
-			[[ ${t} == '<<'* ]] && hdoc=1
-		elif [[ -z ${first} ]] &&
-			[[ ! ${t} =~ ^[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?= ]]; then
-			first="${t}"
-			at=k
+		fi
+		t="${tk[k]}"
+		name=""
+		# function NAME [()] BODY, NAME() BODY, NAME () BODY
+		if [[ ${t} == function ]]; then
+			name="${tk[k + 1]:-}"
+			at=$((k + 2))
+			[[ ${tk[at]:-} == '()' ]] && at=$((at + 1))
+		elif [[ ${t} == *'()' ]]; then
+			name="${t}"
+			at=$((k + 1))
+		elif [[ ${tk[k + 1]:-} == '()' ]]; then
+			name="${t}"
+			at=$((k + 2))
+		fi
+		name="${name%'()'}"
+		if [[ -n ${name} && ${name} != *[=${PH}]* &&
+			${tk[at]:-} == "${OPEN}"* ]]; then
+			printf 'F\t%s\n' "${name}"
+		elif [[ ${t} == source || ${t} == . ]] && ((k + 1 < nt)) &&
+			[[ ! ${tk[k + 1]} =~ ^[0-9]*\&?[\<\>] ]]; then
+			printf 'S\t%s\t%s\n' "${tkl[k + 1]}" "${tkr[k + 1]}"
 		fi
 	done
-	[[ -z ${first} ]] && return 0
-	t="${tkt[at]}"
-	printf '%s\t%s\n' "${tkl[at]}" "${t%"${t##*[![:space:]]}"}"
-	return 1
-}
-
-# _tl_fi_end -- the index just past the fi that closes the if tk[] opens.
-_tl_fi_end() {
-	local -i k=0 depth=0
-	for ((k = 0; k < ${#tk[@]}; k++)); do
-		case "${tk[k]}" in
-		"${OPEN}if") depth=$((depth + 1)) ;;
-		"${CLOSE}fi")
-			depth=$((depth - 1))
-			if ((depth == 0)); then
-				echo $((k + 1))
-				return 0
-			fi
-			;;
-		esac
-	done
-	echo "${#tk[@]}"
-}
-
-_tl_has() {
-	local t
-	for t in "${tk[@]}"; do
-		[[ ${t} == "${1}" ]] && return 0
-	done
-	return 1
-}
-
-# _tl_only_redirs K -- tk[K..] holds nothing but redirections.
-_tl_only_redirs() {
-	local t
-	for t in "${tk[@]:${1}}"; do
-		[[ ${t} =~ ^[0-9]*\&?[\<\>] ]] || return 1
-	done
-	return 0
 }
 
 # _list_fns SCRIPT LANG SPEC -- print the functions SCRIPT defines, one per
-# line. Python is parsed (ast), never run. Anything else is treated as
-# bash / sh and SOURCED in a child bash, so the functions it gets from the
-# libraries it sources are listed too -- but only once _toplevel_cmd finds
-# nothing at its top level that would run (just-bashit#121).
+# line, sorted. Nothing in SCRIPT runs: Python is parsed (ast), and anything
+# else is read as bash by _scan_defs. The functions SCRIPT gets from the
+# files it sources are listed too, read the same way (_list_defs).
 _list_fns() {
-	local script="${1}" lang="${2}" spec="${3}" found
+	local script="${1}" lang="${2}" spec="${3}"
 	if [[ ${lang} == "python" ]]; then
 		python3 - "${script}" <<'PYEOF'
 import ast, sys
@@ -1769,31 +1694,58 @@ print('\n'.join(names))
 PYEOF
 		return
 	fi
-	if ! found=$(_toplevel_cmd "${script}"); then
-		# shellcheck disable=SC2016  # the guard is shown, not expanded
-		_err "$(printf '%s\n' \
-			"-l will not source ${spec}: line ${found%%$'\t'*} of ${script}" \
-			"runs a command at its top level:" \
-			"  ${found#*$'\t'}" \
-			"-l lists functions by sourcing the script, so it lists one only" \
-			"when its top level declares (functions, assignments, source, set)" \
-			"and its work sits behind a main guard, such as" \
-			'  if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi')"
+	local -A seen=()
+	local -a names=()
+	local bad=""
+	if ! _list_defs "${script}"; then
+		_err "-l cannot read ${spec}: line ${bad%%$'\t'*} of ${script}:" \
+			"${bad#*$'\t'}"
 	fi
-	# The child starts from bash's default options, not this script's
-	# `set -euo pipefail`. Exported SHELLOPTS (kcov exports it to trace
-	# children) carried errexit in, and `compgen -A function` returns 1 while
-	# no function exists yet, so the child died on its first line; with
-	# nounset too, kcov's PS4 naming BASH_SOURCE failed in every subshell.
-	# Listing a script's functions must not depend on jbx's own options.
-	env -u BASH_ENV -u SHELLOPTS -u BASHOPTS bash -c "
-        _b=\$(compgen -A function)
-        # shellcheck source=/dev/null
-        source '${script}' 2>/dev/null || true
-        _a=\$(compgen -A function)
-        comm -13 <(printf '%s\n' \${_b} | sort) \
-                 <(printf '%s\n' \${_a} | sort)
-    "
+	((${#names[@]})) || return 0
+	printf '%s\n' "${names[@]}" | sort -u
+}
+
+# _list_defs FILE -- add the functions FILE defines to _list_fns's names[],
+# then those of each file it sources, once each (seen[]). On a FILE that
+# _scan_defs cannot read, set _list_fns's bad to "LINE<TAB>WHY" and fail.
+#
+# A sourced file is found by reading its argument, never by evaluating
+# it: a literal path is taken as it is, and a path built from an
+# expansion -- `source "${_SCRIPT_DIR}/toml.sh"`, every just-bashit
+# library's idiom -- by its last component, beside FILE. That is where jbx
+# co-fetches a just-bashit script's libraries, and where the idiom points.
+# One it cannot find is named on stderr and skipped: listing it would mean
+# running the expansion that names it.
+_list_defs() {
+	local file="${1}" out kind a b lib arg
+	seen["${file}"]=1
+	if ! out=$(_scan_defs "${file}"); then
+		bad="${out##*E$'\t'}"
+		return 1
+	fi
+	while IFS=$'\t' read -r kind a b; do
+		case "${kind}" in
+		F) names+=("${a}") ;;
+		S)
+			arg="${b//[\"\']/}"
+			lib=""
+			if [[ -n ${arg} && ${arg} != *[\$\`]* ]]; then
+				lib="${arg}"
+			elif [[ ${arg} == */* && ${arg##*/} != *[\$\`{}]* ]]; then
+				lib="${file%/*}/${arg##*/}"
+			fi
+			if [[ -z ${lib} || ! -f ${lib} ]]; then
+				echo "${_ME}: -l: not listing what line ${a} of ${file}" \
+					"sources (${b:-a word spanning lines}): found only by" \
+					"running the script" >&2
+			elif [[ -z ${seen["${lib}"]:-} ]] && ! _list_defs "${lib}"; then
+				echo "${_ME}: -l: not listing ${lib}, sourced at line ${a}" \
+					"of ${file}: it cannot be read" >&2
+			fi
+			;;
+		esac
+	done <<<"${out}"
+	return 0
 }
 
 # ---- execute ----------------------------------------------------------------
@@ -1838,32 +1790,35 @@ _run() {
 		return
 	fi
 
-	# Validate func is defined after sourcing the script. Using declare -F
-	# rather than the before/after diff in _list_fns so that script functions
-	# which shadow same-named env functions are accepted.
-	# In verbose mode, also report when the script function shadows a
-	# pre-existing command or builtin.
+	# One child sources the script, once, then calls FUNCTION, checking
+	# between the two that the script defined it. A separate child that
+	# sourced the script only to check ran its top level a second time
+	# (just-bashit#141). declare -F, not a before/after diff, so a script
+	# function that shadows a same-named environment function is accepted.
+	# The check and the message use `builtin`: the script just sourced may
+	# define a function named printf or declare. A missing function exits
+	# 127, the shell's "command not found".
+	local cmd q_script q_func q_miss
+	printf -v q_script '%q' "${script}"
+	cmd=". ${q_script}"
 	if [[ -n ${func} ]]; then
-		local _probe
-		_probe=$(bash -c "
-			_pre=\$(type -t ${func@Q} 2>/dev/null || true)
-			source ${script@Q} 2>/dev/null
-			declare -F ${func@Q} >/dev/null 2>&1 && echo \"ok:\${_pre}\" || echo notfound
-		")
-		case "${_probe}" in
-		notfound) _err "'${func}' is not a function defined by this script" ;;
-		ok:file) _log "note: script function '${func}' shadows a shell command" ;;
-		ok:builtin) _log "note: script function '${func}' shadows a shell builtin" ;;
-		ok:alias) _log "note: script function '${func}' shadows a shell alias" ;;
-		esac
-	fi
-
-	# Build the command string; %q ensures safe quoting of paths/names.
-	local cmd
-	if [[ -n ${func} ]]; then
-		cmd=$(printf '. %q && %q "$@"' "${script}" "${func}")
-	else
-		cmd=$(printf '. %q' "${script}")
+		printf -v q_func '%q' "${func}"
+		printf -v q_miss '%q' \
+			"${_ME}: error: '${func}' is not a function defined by this script"
+		local pre="" note="" q_note
+		if [[ ${OPT_VERBOSE} -eq 1 ]]; then
+			# In verbose mode, report when the script function shadows a
+			# command, builtin or alias that existed before it was sourced.
+			printf -v q_note '%q' \
+				"${_ME}: note: script function '${func}' shadows a shell "
+			pre="_jbx_pre=\$(type -t ${q_func} 2>/dev/null); "
+			note="case \${_jbx_pre} in file | builtin | alias) builtin printf"
+			note+=" '%s%s\n' ${q_note} \"\${_jbx_pre/file/command}\" >&2 ;;"
+			note+=" esac; "
+		fi
+		cmd="${pre}${cmd} && { builtin declare -F ${q_func} >/dev/null ||"
+		cmd+=" { builtin printf '%s\n' ${q_miss} >&2; exit 127; }; "
+		cmd+="${note}${q_func} \"\$@\"; }"
 	fi
 
 	if [[ ${OPT_CLEAN} -eq 1 ]]; then

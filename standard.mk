@@ -254,12 +254,16 @@ all: $(ALL_DEPS) ## Default goal
 #     FAILS: a red run that also dirtied the tree reports both.
 #   - Not a git checkout (an sdist, a tarball): said, and the suite still
 #     runs. There is no tree to compare, which is not the same as a clean one.
+#   - Both snapshots keep git's stderr. A warning git prints every time (an
+#     unreadable ~/.config/git/ignore under a container's foreign HOME) is
+#     then on both sides and cancels; one kept on only the after side failed
+#     a run that changed nothing.
 _STD_TREE_STATUS = git -c safe.directory='*' status --porcelain \
                    --ignore-submodules=none
 # $(1): the private target holding the suite. $(2): the public one, to name.
 _std_tree_guard = \
 	b=$$($(_STD_TMP)); a=$$($(_STD_TMP)); trap 'rm -f "$$b" "$$a"' EXIT; \
-	if ! $(_STD_TREE_STATUS) >"$$b" 2>/dev/null; then \
+	if ! $(_STD_TREE_STATUS) >"$$b" 2>&1; then \
 	    echo "$(2): not a git checkout, so the tree check is OFF this run"; \
 	    $(MAKE) --no-print-directory $(1); exit $$?; \
 	fi; \

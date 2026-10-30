@@ -330,6 +330,14 @@ jobs:
           if make -C "$tmp" test > "$tmp/log" 2>&1; then cat "$tmp/log"; echo "::error::false passed"; exit 1; fi
           if grep -q "changed the working tree" "$tmp/log"; then cat "$tmp/log"; echo "::error::false alarm"; exit 1; fi
 
+          # A warning git prints on every status (an unreadable ignore file
+          # under a foreign HOME) is on both sides: a clean run still passes.
+          x="$(mktemp -d)"; mkdir "$x/git"; echo y > "$x/git/ignore"; chmod 000 "$x/git/ignore"
+          mk '@true'
+          XDG_CONFIG_HOME="$x" make -C "$tmp" test > "$tmp/log" 2>&1 \
+            || { cat "$tmp/log"; echo "::error::a steady git warning failed a clean run"; exit 1; }
+          chmod 600 "$x/git/ignore"
+
           # A checkout git calls foreign (root in a container): still checked.
           mk '@rm tracked'
           if GIT_TEST_ASSUME_DIFFERENT_OWNER=1 make -C "$tmp" test > "$tmp/log" 2>&1; then

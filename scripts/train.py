@@ -63,7 +63,7 @@ LAND_HOW = (
 )
 
 
-class Refused(Exception):
+class RefusedError(Exception):
     """A step failed closed; the message says which and why."""
 
 
@@ -71,7 +71,7 @@ def run(*args: str, check: bool = True, **kw) -> subprocess.CompletedProcess:
     """Runs a command, capturing text output."""
     p = subprocess.run(args, capture_output=True, text=True, **kw)
     if check and p.returncode != 0:
-        raise Refused(
+        raise RefusedError(
             f"`{' '.join(args)}` exited {p.returncode}: "
             f"{(p.stderr or p.stdout).strip()}"
         )
@@ -122,19 +122,22 @@ def same_commit(src: str, dst: str) -> str | None:
 
 
 def check_pr(n: int, base: str, repo: str) -> dict:
-    """The PR's metadata, or Refused naming what makes it not ready."""
+    """The PR's metadata, or RefusedError naming what makes it not ready."""
     pr = json.loads(
         gh(
-            "pr", "view", str(n), "--json",
+            "pr",
+            "view",
+            str(n),
+            "--json",
             "number,state,isDraft,baseRefName,headRefOid,title,url",
         )
     )
     if pr["state"] != "OPEN":
-        raise Refused(f"#{n} is {pr['state'].lower()}, not open")
+        raise RefusedError(f"#{n} is {pr['state'].lower()}, not open")
     if pr["isDraft"]:
-        raise Refused(f"#{n} is a draft")
+        raise RefusedError(f"#{n} is a draft")
     if pr["baseRefName"] != base:
-        raise Refused(f"#{n} targets {pr['baseRefName']}, not {base}")
+        raise RefusedError(f"#{n} targets {pr['baseRefName']}, not {base}")
     owner, name = repo.split("/", 1)
     q = (
         "query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r)"
@@ -143,13 +146,23 @@ def check_pr(n: int, base: str, repo: str) -> dict:
     )
     threads = json.loads(
         gh(
-            "api", "graphql", "-f", f"query={q}", "-f", f"o={owner}",
-            "-f", f"r={name}", "-F", f"n={n}",
+            "api",
+            "graphql",
+            "-f",
+            f"query={q}",
+            "-f",
+            f"o={owner}",
+            "-f",
+            f"r={name}",
+            "-F",
+            f"n={n}",
         )
     )["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
     open_threads = sum(1 for t in threads if not t["isResolved"])
     if open_threads:
-        raise Refused(f"#{n} has {open_threads} unresolved review thread(s)")
+        raise RefusedError(
+            f"#{n} has {open_threads} unresolved review thread(s)"
+        )
     return pr
 
 
@@ -159,23 +172,28 @@ def pr_commits(n: int, pr: dict, remote: str, base: str) -> list[str]:
     git("fetch", "--quiet", "--no-tags", remote, f"+refs/pull/{n}/head:{ref}")
     head = git("rev-parse", ref)
     if head != pr["headRefOid"]:
-        raise Refused(
+        raise RefusedError(
             f"#{n}: refs/pull/{n}/head is {head[:9]} but GitHub reports "
             f"{pr['headRefOid'][:9]}; the PR moved, re-run"
         )
     rng = f"{remote}/{base}..{ref}"
     if git("rev-list", "--merges", rng):
-        raise Refused(
+        raise RefusedError(
             f"#{n} carries a merge commit; rebase it onto {base} first"
         )
     commits = git("rev-list", "--reverse", rng).split()
     if not commits:
-        raise Refused(f"#{n} has no commits ahead of {remote}/{base}")
+        raise RefusedError(f"#{n} has no commits ahead of {remote}/{base}")
     return commits
 
 
-def body_for(prs: list[dict], picks: list[tuple[int, str, str]],
-             base_sha: str, base: str, gate: str) -> str:
+def body_for(
+    prs: list[dict],
+    picks: list[tuple[int, str, str]],
+    base_sha: str,
+    base: str,
+    gate: str,
+) -> str:
     rows = "\n".join(
         f"| `{git('log', '-1', '--format=%s', dst)}` | #{n} |"
         for n, _, dst in picks
@@ -193,20 +211,22 @@ def body_for(prs: list[dict], picks: list[tuple[int, str, str]],
     )
 
 
-def close_keywords(title: str, body: str, head: str, base_sha: str,
-                   repo: str, n: int) -> None:
+def close_keywords(
+    title: str, body: str, head: str, base_sha: str, repo: str, n: int
+) -> None:
     """The vendored closing-keyword gate, on the PR this push will open."""
     script = pathlib.Path("scripts/close-keywords.py")
     if not script.is_file():
         return
-    with tempfile.NamedTemporaryFile(
-        "w", suffix=".json", delete=False
-    ) as f:
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
         json.dump(
             {
                 "pull_request": {
-                    "title": title, "body": body, "commits": n,
-                    "head": {"sha": head}, "base": {"sha": base_sha},
+                    "title": title,
+                    "body": body,
+                    "commits": n,
+                    "head": {"sha": head},
+                    "base": {"sha": base_sha},
                 },
                 "repository": {"full_name": repo},
             },
@@ -217,35 +237,41 @@ def close_keywords(title: str, body: str, head: str, base_sha: str,
     )
     p = subprocess.run(
         [sys.executable, str(script), "--base", base_sha],
-        capture_output=True, text=True, env=env,
+        capture_output=True,
+        text=True,
+        env=env,
     )
     os.unlink(f.name)
     print(p.stdout.rstrip())
     if p.returncode != 0:
-        raise Refused("close-keywords-check refused the train")
+        raise RefusedError("close-keywords-check refused the train")
 
 
 def compose(args: argparse.Namespace) -> int:
     if run("git", "status", "--porcelain", "--untracked-files=no").stdout:
-        raise Refused("the working tree has uncommitted changes")
+        raise RefusedError("the working tree has uncommitted changes")
     repo = json.loads(gh("repo", "view", "--json", "nameWithOwner"))[
         "nameWithOwner"
     ]
     prs = [check_pr(n, args.base, repo) for n in args.prs]
     git("fetch", "--quiet", "--no-tags", args.remote, args.base)
     base_sha = git("rev-parse", f"{args.remote}/{args.base}")
-    commits = {p["number"]: pr_commits(p["number"], p, args.remote,
-                                       args.base) for p in prs}
+    commits = {
+        p["number"]: pr_commits(p["number"], p, args.remote, args.base)
+        for p in prs
+    }
 
     branch = args.branch or "train/" + "-".join(map(str, args.prs))
-    if git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}",
-           check=False):
-        raise Refused(f"branch {branch} already exists locally")
+    if git(
+        "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False
+    ):
+        raise RefusedError(f"branch {branch} already exists locally")
     if git("ls-remote", "--heads", args.remote, branch):
-        raise Refused(f"branch {branch} already exists on {args.remote}")
+        raise RefusedError(f"branch {branch} already exists on {args.remote}")
 
-    start = git("symbolic-ref", "--quiet", "--short", "HEAD", check=False) \
-        or git("rev-parse", "HEAD")
+    start = git(
+        "symbolic-ref", "--quiet", "--short", "HEAD", check=False
+    ) or git("rev-parse", "HEAD")
     git("switch", "--quiet", "-c", branch, base_sha)
     keep = False
     try:
@@ -256,24 +282,26 @@ def compose(args: argparse.Namespace) -> int:
                 r = run("git", "cherry-pick", src, check=False)
                 if r.returncode != 0:
                     run("git", "cherry-pick", "--abort", check=False)
-                    raise Refused(
+                    raise RefusedError(
                         f"#{n}'s commit {src[:9]} does not apply on "
-                        f"{args.base}" + (" and the PRs before it"
-                                          if picks else "")
+                        f"{args.base}"
+                        + (" and the PRs before it" if picks else "")
                         + f"; rebase #{n} or leave it out of the train"
                     )
                 dst = git("rev-parse", "HEAD")
                 why = same_commit(src, dst)
                 if why:
-                    raise Refused(f"#{n}'s commit {src[:9]}: {why}")
+                    raise RefusedError(f"#{n}'s commit {src[:9]}: {why}")
                 picks.append((n, src, dst))
-        print(f"train: {len(picks)} commit(s) from {len(prs)} PR(s) on "
-              f"{branch}, each identical to its source")
+        print(
+            f"train: {len(picks)} commit(s) from {len(prs)} PR(s) on "
+            f"{branch}, each identical to its source"
+        )
 
         print(f"train: running `{args.gate}` on the combined tree")
         if subprocess.run(args.gate, shell=True).returncode != 0:
             keep = True
-            raise Refused(
+            raise RefusedError(
                 f"`{args.gate}` failed on the combined tree; branch {branch} "
                 "is kept so the fix can go into the commit that needs it"
             )
@@ -286,37 +314,62 @@ def compose(args: argparse.Namespace) -> int:
         close_keywords(title, body, head, base_sha, repo, len(picks))
 
         if not args.push:
-            print(f"train: dry run OK. To publish: re-run with --push "
-                  f"(make train PRS='{' '.join(map(str, args.prs))}' "
-                  "PUSH=1)")
+            print(
+                f"train: dry run OK. To publish: re-run with --push "
+                f"(make train PRS='{' '.join(map(str, args.prs))}' "
+                "PUSH=1)"
+            )
             return 0
 
         git("push", "--quiet", "-u", args.remote, branch)
         keep = True
-        with tempfile.NamedTemporaryFile("w", suffix=".md",
-                                         delete=False) as f:
+        with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
             f.write(body)
-        url = gh("pr", "create", "--base", args.base, "--head", branch,
-                 "--title", title, "--body-file", f.name).strip().splitlines()
+        url = (
+            gh(
+                "pr",
+                "create",
+                "--base",
+                args.base,
+                "--head",
+                branch,
+                "--title",
+                title,
+                "--body-file",
+                f.name,
+            )
+            .strip()
+            .splitlines()
+        )
         os.unlink(f.name)
         url = url[-1] if url else ""
         for p in prs:
-            gh("pr", "close", str(p["number"]), "--comment",
-               f"Superseded by the train {url}: this PR's commits, "
-               "cherry-picked unchanged onto the current base (patch-id and "
-               "message verified). The branch is kept until it merges.")
-        print(f"train: opened {url}; closed "
-              + ", ".join(f"#{p['number']}" for p in prs))
-        print(f"train: land it with: gh pr merge {url} --rebase "
-              f"--match-head-commit {head}")
+            gh(
+                "pr",
+                "close",
+                str(p["number"]),
+                "--comment",
+                f"Superseded by the train {url}: this PR's commits, "
+                "cherry-picked unchanged onto the current base (patch-id and "
+                "message verified). The branch is kept until it merges.",
+            )
+        print(
+            f"train: opened {url}; closed "
+            + ", ".join(f"#{p['number']}" for p in prs)
+        )
+        print(
+            f"train: land it with: gh pr merge {url} --rebase "
+            f"--match-head-commit {head}"
+        )
         return 0
     finally:
         git("switch", "--quiet", start, check=False)
         if not keep:
             git("branch", "--quiet", "-D", branch, check=False)
         for p in prs:
-            git("update-ref", "-d", f"refs/train/pr-{p['number']}",
-                check=False)
+            git(
+                "update-ref", "-d", f"refs/train/pr-{p['number']}", check=False
+            )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -324,8 +377,13 @@ def main(argv: list[str] | None = None) -> int:
         description=__doc__.split("\n", 1)[0],
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("prs", nargs="+", type=int, metavar="PR",
-                    help="PR numbers, in the order their commits land")
+    ap.add_argument(
+        "prs",
+        nargs="+",
+        type=int,
+        metavar="PR",
+        help="PR numbers, in the order their commits land",
+    )
     ap.add_argument("--base", default="main")
     ap.add_argument("--remote", default="origin")
     ap.add_argument("--branch", default="")
@@ -338,7 +396,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     try:
         return compose(args)
-    except Refused as e:
+    except RefusedError as e:
         print(f"train: REFUSED -- {e}")
         return 1
 

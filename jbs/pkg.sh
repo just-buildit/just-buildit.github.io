@@ -64,6 +64,80 @@ _WINGET_INSTALL_FLAGS=(
 )
 
 # ---------------------------------------------------------------------------
+# The Visual Studio probe, shared by install-deps (which installs a
+# vs_requires workload and decides the outcome by it, #67) and
+# setup-system's installed report (which reports each vs_requires id by it,
+# #180): one probe, so the two cannot disagree about what is installed.
+# ---------------------------------------------------------------------------
+
+# _powershell_bin -- Windows PowerShell, by either spelling (see winget-bin
+# for why both are tried).
+_powershell_bin() {
+	local _b
+	for _b in powershell powershell.exe; do
+		if command -v "${_b}" >/dev/null 2>&1; then
+			printf '%s\n' "${_b}"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# _win_path LOCAL / _local_path WINDOWS -- translate a path across the
+# boundary: wslpath under WSL, cygpath under MSYS2, Cygwin and Git Bash.
+_win_path() {
+	if command -v wslpath >/dev/null 2>&1; then
+		wslpath -w "$1"
+	else
+		cygpath -w "$1"
+	fi
+}
+_local_path() {
+	if command -v wslpath >/dev/null 2>&1; then
+		wslpath -u "$1"
+	else
+		cygpath -u "$1"
+	fi
+}
+
+# _vs_installer_dir -- the Visual Studio Installer directory, which holds
+# vswhere.exe and setup.exe, as a local path. It is
+# %ProgramFiles(x86)%\Microsoft Visual Studio\Installer on every install;
+# the variable is read through PowerShell because a shell cannot name it
+# (parentheses are not legal in a variable name). JB_VS_INSTALLER
+# overrides, set to a directory of stubs for a test.
+_vs_installer_dir() {
+	local _ps _raw
+	if [ -n "${JB_VS_INSTALLER+x}" ]; then
+		printf '%s\n' "${JB_VS_INSTALLER}"
+		return 0
+	fi
+	_ps="$(_powershell_bin)" || return 1
+	# shellcheck disable=SC2016  # PowerShell expands it, not this shell
+	_raw="$("${_ps}" -NoProfile -NonInteractive \
+		-Command '${env:ProgramFiles(x86)}' 2>/dev/null | tr -d '\r\n')" ||
+		_raw=""
+	[ -n "${_raw}" ] || return 1
+	_local_path "${_raw}\\Microsoft Visual Studio\\Installer"
+}
+
+# _vswhere DIR ARGS... -- the first installationPath vswhere prints for
+# ARGS over every product, or nothing. No vswhere is no instance.
+_vswhere() {
+	local _dir="$1" _l
+	shift
+	[ -f "${_dir}/vswhere.exe" ] || return 0
+	while IFS= read -r _l; do
+		_l="${_l%$'\r'}"
+		if [ -n "${_l}" ]; then
+			printf '%s\n' "${_l}"
+			return 0
+		fi
+	done < <("${_dir}/vswhere.exe" -products '*' "$@" \
+		-property installationPath 2>/dev/null || true)
+}
+
+# ---------------------------------------------------------------------------
 # install-uv [-n]
 #
 # Install uv, the ONE way every just-bashit entry point does it: get-jb.sh,

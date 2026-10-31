@@ -52,6 +52,12 @@
     "$@" and execs jbx. Every argument arrives byte for byte, empty ones
     included, in both PowerShell editions.
 
+    Who called. The functions also export JB_CALLER=pwsh. setup-system
+    reads it: a PowerShell window cannot `exec bash -l`, and needs none of
+    the bash reload reasons (each jbx call starts a fresh login bash), so it
+    is told to open a new PowerShell window only when an install put a
+    directory on the Windows PATH that this window predates (#179).
+
     Environment:
       JB_PS_PROFILE   the one profile file to write (default: both editions')
       JB_BASH         use this bash; skips the search (tests)
@@ -291,8 +297,10 @@ function Get-JbProfileBlock {
         driver); MSYS=noglob is added so the runtime does not expand a `*`
         either way; pipeline input is piped to bash only when there is some,
         because piping nothing would hand bash an empty stdin instead of the
-        console and break every prompt; and every variable is put back as it
-        was, even on Ctrl-C. A variable that was absent is REMOVED, not set
+        console and break every prompt; JB_CALLER=pwsh tells what runs that
+        it was called from PowerShell, so setup-system's closing advice is
+        "open a new PowerShell window" and never `exec bash -l` (#179); and
+        every variable is put back as it was, even on Ctrl-C. A variable that was absent is REMOVED, not set
         to $null: pwsh 7 keeps a variable set that way, empty, and the next
         call would hand bash the previous call's extra arguments. A native call sets $LASTEXITCODE, so jbx's exit
         status is there to read afterwards.
@@ -308,7 +316,7 @@ function Get-JbProfileBlock {
     foreach ($name in 'jbx', 'just-runit') {
         $lines += @(
             "function global:$name {"
-            "    `$set = @{ JB_PS_NAME = '$name'; JB_PS_ARGC = [string]`$args.Count"
+            "    `$set = @{ JB_PS_NAME = '$name'; JB_PS_ARGC = [string]`$args.Count; JB_CALLER = 'pwsh'"
             "        MSYS = ((([string]`$env:MSYS) + ' noglob').Trim()) }"
             "    for (`$i = 0; `$i -lt `$args.Count; `$i++) { `$set[""JB_PS_ARG`$(`$i + 1)""] = [string]`$args[`$i] }"
             "    `$saved = @{}"

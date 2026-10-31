@@ -40,6 +40,12 @@
          task re-scopes the second rule each time WSL's switch comes up.
       6. The sshd service is set to start automatically, and restarted so
          the new configuration is live.
+      7. With -SshAgent, the OpenSSH Authentication Agent service
+         (ssh-agent, Disabled out of the box) is set to start
+         automatically and started, so the user's key has one agent that
+         pwsh, Windows' ssh.exe, Git and VS Code all reach. Adding the key
+         is the user's own step, not this elevated run's: setup-system
+         does it afterwards, as the user, with ssh-add.exe.
 
     Why keys only: once this runs, the machine answers on port 22 from
     boot, unattended. Password logins there are an invitation. Why the
@@ -74,6 +80,11 @@
     7.6.6. setup-system passes its own pin, so Linux and Windows run the
     same release. Required only when pwsh is absent; an installed pwsh is
     never replaced.
+
+.PARAMETER SshAgent
+    Also set the ssh-agent service to Automatic and start it (step 7).
+    setup-system passes it on native Windows, where its sshd step then
+    adds the box key to that agent.
 
 .PARAMETER User
     The Windows account the keys are for. Default: the current user, which
@@ -116,6 +127,7 @@ param(
     [string[]]$RemoteAddress = @('Any'),
     [string]$PwshVersion,
     [string]$User = $env:USERNAME,
+    [switch]$SshAgent,
     [switch]$RescopeWslRule,
     [switch]$CheckWslRule
 )
@@ -549,6 +561,30 @@ function Get-MachineArch {
     }
 }
 
+# ---------------------------------------------------------------------------
+# The OpenSSH Authentication Agent service (#190).
+# ---------------------------------------------------------------------------
+
+# Automatic and running, from Disabled -- how Windows ships it. The service
+# belongs to the OpenSSH CLIENT capability, a default on Windows 10 1809+;
+# where it is absent this says so and changes nothing, rather than failing
+# a run whose server half succeeded. Idempotent: an agent already
+# Automatic and running is left exactly as it is.
+function Enable-SshAgentService {
+    $svc = Get-Service -Name ssh-agent -ErrorAction SilentlyContinue
+    if (-not $svc) {
+        Write-Information '  note  no ssh-agent service (the OpenSSH.Client capability is not installed)'
+        return
+    }
+    if ($svc.StartType -ne 'Automatic') {
+        Set-Service -Name ssh-agent -StartupType Automatic
+    }
+    if ($svc.Status -ne 'Running') {
+        Start-Service -Name ssh-agent
+    }
+    Write-Information '  ok    ssh-agent running, starts at boot'
+}
+
 # The test suite dot-sources this file for the functions above and must not
 # fall through into the part that changes the machine.
 if ($MyInvocation.InvocationName -eq '.') { return }
@@ -780,3 +816,6 @@ foreach ($name in $dependents) { Start-Service -Name $name }
 $listening = Get-NetTCPConnection -State Listen -LocalPort 22 -ErrorAction SilentlyContinue
 if (-not $listening) { throw 'sshd restarted but nothing is listening on port 22' }
 Write-Information '  ok    sshd running, starts at boot, listening on 22'
+
+# -- 8. the ssh agent ------------------------------------------------------------
+if ($SshAgent) { Enable-SshAgentService }

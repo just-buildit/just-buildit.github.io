@@ -389,17 +389,10 @@ _vs_requires() {
 		toml_get_array "$1" "winget.\"$2\"" vs_requires)
 }
 
-# _powershell_bin, _win_path, _local_path, _vs_installer_dir and _vswhere
-# live in pkg.sh, sourced above: setup-system's installed report probes the
-# vs_requires ids through the same _vswhere (#180).
-
-# _ps_literal TEXT -- TEXT as a PowerShell single-quoted string. The quote
-# goes through a variable, not an escaped quote in the replacement, whose
-# meaning changed across bash releases.
-_ps_literal() {
-	local _q="'"
-	printf "'%s'" "${1//${_q}/${_q}${_q}}"
-}
+# _powershell_bin, _win_path, _local_path, _ps_literal, _vs_installer_dir
+# and _vswhere live in pkg.sh, sourced above: setup-system's installed report
+# probes the vs_requires ids through the same _vswhere (#180), and its claude
+# step quotes a path through the same _ps_literal (#189).
 
 # ---------------------------------------------------------------------------
 # _win_exit [--runas | --ssh DEST] EXE ARG... -- run Windows program EXE and set _WIN_RC

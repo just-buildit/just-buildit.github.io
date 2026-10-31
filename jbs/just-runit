@@ -1849,15 +1849,25 @@ _run_python() {
 	shift
 
 	if ! command -v uv >/dev/null 2>&1; then
-		_log "uv not found — installing via jb run"
-		# -n reaches the nested run too, so the installer is not cached.
-		local nested=()
+		_log "uv not found — installing via just-bashit:pkg install-uv"
+		# The one uv installer get-jb.sh and setup-system share: winget on
+		# Windows, which picks the machine's native build even from an
+		# emulated x64 shell, astral's install.sh elsewhere (#171). It
+		# prints the directory uv is in, put first on PATH for this run.
+		# -n reaches the nested run too, so nothing it fetches is cached.
+		local nested=() uv_dir=""
 		[[ ${OPT_NO_CACHE} -eq 1 ]] && nested=(-n)
 		[[ ${OPT_NO_VERIFY} -eq 1 ]] && nested+=(--no-verify)
-		"${0}" "${nested[@]+"${nested[@]}"}" https://astral.sh/uv/install.sh
+		# JB_NO_VERIFY carries --no-verify past the nested run to
+		# install-uv's own fetch of astral's installer.
+		if uv_dir="$(JB_NO_VERIFY="${OPT_NO_VERIFY}" \
+			"${0}" "${nested[@]+"${nested[@]}"}" just-bashit:pkg install-uv)" &&
+			[[ -n ${uv_dir} ]]; then
+			PATH="${uv_dir}:${PATH}"
+		fi
 		hash -r 2>/dev/null || true
 		command -v uv >/dev/null 2>&1 ||
-			_err "uv install failed; try manually: jb run https://astral.sh/uv/install.sh"
+			_err "uv install failed; try manually: jbx just-bashit:pkg install-uv"
 	fi
 
 	_log "using uv run"

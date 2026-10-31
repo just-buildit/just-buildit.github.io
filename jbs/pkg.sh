@@ -41,6 +41,179 @@ winget-bin() {
 }
 
 # ---------------------------------------------------------------------------
+# _winget_installed BIN ID — is this exact id installed already?
+#
+# A `list` probe rather than a reading of the install's own exit code. winget
+# returns HRESULTs and a shell sees only the low byte: `list` for an absent
+# package returns 0x8A150014 and arrives as 20 — a value another tool would
+# use for something else entirely, and nothing in the byte says which. That
+# much was measured on 2026-09-20 against winget v1.29.290, where a present
+# id exits 0 and an absent one exits 20. The 0/non-zero answer needs no
+# decoding, which is why the probe reads it and the install's code is left
+# alone.
+# ---------------------------------------------------------------------------
+_winget_installed() {
+	"$1" list --id "$2" --exact --disable-interactivity >/dev/null 2>&1
+}
+
+# The flags every winget install carries (install-deps and install-uv), bare id or not: no prompt for an
+# agreement or a source, so a run never stops to ask.
+_WINGET_INSTALL_FLAGS=(
+	--exact --source winget --silent --accept-package-agreements
+	--accept-source-agreements --disable-interactivity
+)
+
+# ---------------------------------------------------------------------------
+# install-uv [-n]
+#
+# Install uv, the ONE way every just-bashit entry point does it: get-jb.sh,
+# setup-system's tools step and jbx's Python runner all call this (#171).
+#
+# On Windows (a MINGW/MSYS/CYGWIN uname) with winget present, through winget
+# (id astral-sh.uv). winget chooses the build for the MACHINE: on ARM64
+# Windows it lists uv-aarch64-pc-windows-msvc.zip (measured 2026-10-31).
+# astral's install.sh chooses from `uname -m` alone, with no override, and
+# from x64 Git Bash -- an emulated process on ARM64 Windows -- that reads
+# x86_64, so it installed an x64 uv that then ran emulated. Choosing the
+# architecture is left to winget, so nothing here detects one.
+#
+# Everywhere else, and on Windows when winget is absent or fails, astral's
+# install.sh. It needs awk (a minimal Debian 13 WSL image has none) and
+# curl, and is refused with the reason when either is missing.
+#
+# Prints the directory uv is in on stdout, and only that; the installers'
+# own output goes to stderr. winget links a portable package into
+# %LOCALAPPDATA%\Microsoft\WinGet\Links and adds that to the USER PATH, which
+# reaches new shells and not the running one -- so the caller, which knows
+# whether it can change its own PATH, decides what to do with the directory.
+#
+# -n prints the command that would run, and runs nothing.
+#
+# Example:
+#   dir="$(install-uv)" && PATH="${dir}:${PATH}"
+# ---------------------------------------------------------------------------
+_UV_WINGET_ID="astral-sh.uv"
+_UV_INSTALL_SH="https://astral.sh/uv/install.sh"
+
+# _winget_links_dir -- where winget links a portable package's executables,
+# as a path this shell can open. Read from LOCALAPPDATA, which Git Bash and
+# MSYS2 inherit from Windows.
+_winget_links_dir() {
+	local base="${LOCALAPPDATA:-}"
+	[ -n "${base}" ] || return 1
+	if command -v cygpath >/dev/null 2>&1; then
+		base="$(cygpath -u "${base}")" || return 1
+	fi
+	printf '%s\n' "${base}/Microsoft/WinGet/Links"
+}
+
+# _uv_dir_in DIR [last] -- print the directory uv resolves to with DIR
+# added to PATH -- first, or last with `last` -- or return 1. A resolution
+# rather than a test for DIR/uv: Git Bash finds uv.exe as `uv`, and astral's
+# installer honours UV_INSTALL_DIR, so DIR is only where it USUALLY lands.
+_uv_dir_in() {
+	local p search="${1}:${PATH}"
+	[ "${2:-}" = last ] && search="${PATH}:${1}"
+	p="$(PATH="${search}" command -v uv 2>/dev/null)" || return 1
+	printf '%s\n' "${p%/*}"
+}
+
+install-uv() {
+	local HELP
+	IFS= read -r -d '' HELP <<-'EOF' || true
+		Usage: install-uv [-n]
+
+		  Install uv: through winget (astral-sh.uv) on Windows, which picks
+		  the machine's native build; through astral's install.sh elsewhere,
+		  or when winget is absent or fails. Prints the directory uv is in.
+
+		Options:
+		  -n  Print the command that would run, and run nothing.
+		  -h  Show this message and exit.
+	EOF
+
+	local dry=0 OPTARG="" OPTIND=0 option
+	while getopts ":nh" option; do
+		case $option in
+		n) dry=1 ;;
+		h)
+			echo "${HELP}"
+			return 0
+			;;
+		\?)
+			echo "Invalid option: -${OPTARG}" >&2
+			echo "${HELP}" >&2
+			return 1
+			;;
+		esac
+	done
+	shift "$((OPTIND - 1))"
+
+	local os _w links dir tmp
+	os="${JB_UNAME_S:-$(uname -s)}"
+	case "${os}" in
+	MINGW* | MSYS* | CYGWIN*)
+		if _w="$(winget-bin)"; then
+			if [ "${dry}" -eq 1 ]; then
+				# IFS set here: setup-system sources this under IFS=$'\n\t',
+				# which would join the flags one per line.
+				(
+					IFS=' '
+					printf '%s install --id %s %s\n' "${_w}" \
+						"${_UV_WINGET_ID}" "${_WINGET_INSTALL_FLAGS[*]}"
+				)
+				return 0
+			fi
+			if links="$(_winget_links_dir)" &&
+				{ _winget_installed "${_w}" "${_UV_WINGET_ID}" ||
+					"${_w}" install --id "${_UV_WINGET_ID}" \
+						"${_WINGET_INSTALL_FLAGS[@]}" >&2; } &&
+				dir="$(_uv_dir_in "${links}")"; then
+				printf '%s\n' "${dir}"
+				return 0
+			fi
+			echo "install-uv: winget did not install ${_UV_WINGET_ID};" \
+				"falling back to ${_UV_INSTALL_SH}, whose build matches" \
+				"this shell's architecture, not the machine's" >&2
+		fi
+		;;
+	esac
+
+	if [ "${dry}" -eq 1 ]; then
+		printf 'curl -LsSf %s | sh\n' "${_UV_INSTALL_SH}"
+		return 0
+	fi
+	if ! command -v curl >/dev/null 2>&1; then
+		echo "install-uv: curl not installed -- cannot fetch ${_UV_INSTALL_SH}" >&2
+		return 1
+	fi
+	# uv's installer runs awk; without it, it failed its own checksum
+	# ("got:" empty) and still looked like it had run (2026-10-03).
+	if ! command -v awk >/dev/null 2>&1; then
+		echo "install-uv: uv's installer needs awk, and there is none here" >&2
+		return 1
+	fi
+	# JB_NO_VERIFY=1 is how `jbx --no-verify` reaches this fetch: it
+	# documents covering the nested uv install, and this is that download.
+	local tls=()
+	[ "${JB_NO_VERIFY:-0}" = 1 ] && tls=(--insecure)
+	tmp="$(mktemp "${TMPDIR:-/tmp}/uv-install.XXXXXX")" || return 1
+	if ! curl -LsSf --proto '=https' --tlsv1.2 "${tls[@]+"${tls[@]}"}" \
+		-o "${tmp}" "${_UV_INSTALL_SH}" ||
+		! sh "${tmp}" >&2; then
+		rm -f "${tmp}"
+		echo "install-uv: ${_UV_INSTALL_SH} failed" >&2
+		return 1
+	fi
+	rm -f "${tmp}"
+	if ! dir="$(_uv_dir_in "${HOME}/.local/bin" last)"; then
+		echo "install-uv: ${_UV_INSTALL_SH} ran, but no uv can be found" >&2
+		return 1
+	fi
+	printf '%s\n' "${dir}"
+}
+
+# ---------------------------------------------------------------------------
 # get-pkg-mgr
 # ---------------------------------------------------------------------------
 get-pkg-mgr() {

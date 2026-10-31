@@ -309,28 +309,8 @@ _resolve_prefix() {
 	fi
 }
 
-# ---------------------------------------------------------------------------
-# _winget_installed BIN ID — is this exact id installed already?
-#
-# A `list` probe rather than a reading of the install's own exit code. winget
-# returns HRESULTs and a shell sees only the low byte: `list` for an absent
-# package returns 0x8A150014 and arrives as 20 — a value another tool would
-# use for something else entirely, and nothing in the byte says which. That
-# much was measured on 2026-09-20 against winget v1.29.290, where a present
-# id exits 0 and an absent one exits 20. The 0/non-zero answer needs no
-# decoding, which is why the probe reads it and the install's code is left
-# alone.
-# ---------------------------------------------------------------------------
-_winget_installed() {
-	"$1" list --id "$2" --exact --disable-interactivity >/dev/null 2>&1
-}
-
-# The flags every winget install carries, bare id or not: no prompt for an
-# agreement or a source, so a run never stops to ask.
-_WINGET_INSTALL_FLAGS=(
-	--exact --source winget --silent --accept-package-agreements
-	--accept-source-agreements --disable-interactivity
-)
+# _winget_installed and _WINGET_INSTALL_FLAGS live in pkg.sh, sourced above:
+# install-uv there installs through them too (#171).
 
 # ---------------------------------------------------------------------------
 # A winget package that provides Visual Studio workloads (#67).
@@ -584,6 +564,7 @@ _winget_vs() {
 		# Not probed, as for a bare id: the same plan on any machine.
 		(
 			IFS=' '
+			# shellcheck disable=SC2154  # assigned in pkg.sh, sourced above
 			echo "${_w} install --id ${_p} ${_WINGET_INSTALL_FLAGS[*]} --override \"${_override}\""
 			echo "  or, when ${_p} is present without $*, elevated:"
 			echo "  %ProgramFiles(x86)%\\Microsoft Visual Studio\\Installer\\setup.exe modify --installPath <vswhere installationPath> ${_add[*]} --includeRecommended --quiet --norestart"
@@ -609,6 +590,7 @@ _winget_vs() {
 			"${_add[@]}" --includeRecommended --quiet --norestart
 		_win_verdict "${_p} (setup.exe modify)" "${_dir}" "$@"
 	else
+		# shellcheck disable=SC2154  # assigned in pkg.sh, sourced above
 		_win_exit "${_w}" install --id "${_p}" "${_WINGET_INSTALL_FLAGS[@]}" \
 			--override "${_override}"
 		_win_verdict "${_p} (winget install)" "${_dir}" "$@"
@@ -730,6 +712,7 @@ _do_install() {
 				echo "install-deps: ${_p} already installed" >&2
 				continue
 			fi
+			# shellcheck disable=SC2154  # assigned in pkg.sh, sourced above
 			_run "${_w}" install --id "${_p}" "${_WINGET_INSTALL_FLAGS[@]}"
 		done
 		;;

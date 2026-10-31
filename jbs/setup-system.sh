@@ -28,7 +28,10 @@ _STEPS_ALL_STR="deps certs shell ssh sshd git tools pwsh claude"
 # Steps that run only when named with -s or in bootstrap.toml. sshd opens a
 # listening port on the machine, and certs widens what the machine trusts,
 # with sudo: neither is something a default run gets to decide on the
-# user's behalf.
+# user's behalf. Except sshd on native Windows (#190), where reachability
+# from boot is the reason the box is being set up: there it is a default
+# step (key-only, the firewall scoped by --sshd-allow). The step list is
+# resolved under Main, which drops it from this list there.
 _STEPS_OPT_IN_STR="certs sshd"
 
 DRY_RUN=0
@@ -64,12 +67,14 @@ read -r -d '' HELP <<-'EOF' || true
 	          line to ~/.bashrc and ~/.profile. Your files stay yours.
 	  ssh     Ensure ~/.ssh permissions and an ed25519 key named after this
 	          host; print the public key to register with GitHub.
-	  sshd    Windows only (WSL or native MSYS2 / Git Bash), and only
-	          when asked for (-s sshd): run Windows' OpenSSH server as a
-	          boot-time service -- key-only, keys from
-	          github.com/<user>.keys, pwsh.exe as the login shell -- so
-	          the machine is reachable over ssh even when WSL is not
-	          running. Raises one UAC prompt on the Windows desktop.
+	  sshd    Windows only (WSL or native MSYS2 / Git Bash): run Windows'
+	          OpenSSH server as a boot-time service -- key-only, keys
+	          from github.com/<user>.keys, pwsh.exe as the login shell --
+	          so the machine is reachable over ssh even when WSL is not
+	          running. Raises one UAC prompt on the Windows desktop. On
+	          native Windows it is a default step, and also starts the
+	          ssh-agent service at boot and adds the box key to it; from
+	          WSL only when asked for (-s sshd).
 	  git     Set global git defaults that are not already set. An unset
 	          user.name / user.email comes from GIT_AUTHOR_NAME /
 	          GIT_AUTHOR_EMAIL, else is asked for at a terminal.
@@ -104,9 +109,9 @@ read -r -d '' HELP <<-'EOF' || true
 	       --template-profile [PATH]
 	                             Write the profile template to PATH (or stdout).
 
-	Default steps: all of them except certs and sshd. To restrict the
-	default set, declare steps = [...] under [tools.setup-system] in
-	bootstrap.toml.
+	Default steps: all of them except certs and sshd; on native Windows,
+	all but certs. To restrict the default set, declare steps = [...]
+	under [tools.setup-system] in bootstrap.toml.
 
 	Examples:
 	  setup-system.sh --dry-run           # see the whole plan, touch nothing
@@ -274,7 +279,13 @@ _asset() {
 	fi
 	_log "fetching ${_JBS_BASE}/${name}"
 	_curl_retry_opts_init
-	if ! curl -sSL --fail "${_CURL_RETRY_OPTS[@]}" --connect-timeout 30 \
+	# With MSYS path conversion on, whatever the caller turned off: the sshd
+	# step sets MSYS2_ARG_CONV_EXCL='*' for its Windows programs, and Git for
+	# Windows' curl is one too -- handed `-o /tmp/...` unconverted, it could
+	# not write it (curl: (23)) and the step failed on a jbx run with
+	# "windows-sshd.ps1 unavailable" (measured 2026-10-31, #190).
+	if ! env -u MSYS2_ARG_CONV_EXCL -u MSYS_NO_PATHCONV \
+		curl -sSL --fail "${_CURL_RETRY_OPTS[@]}" --connect-timeout 30 \
 		-o "${dest}" "${_JBS_BASE}/${name}"; then
 		rm -f "${dest}"
 		echo "error: cannot obtain ${name} (no sibling copy, fetch failed)" >&2
@@ -498,8 +509,10 @@ read -r -d '' _BASELINE_TOML <<-'EOF' || true
 	packages = ["cmake", "pkg-config"]
 
 	# Native Windows: clang-cl, the toolchain just-makeit and doppler build
-	# Windows with, plus CMake, Git (Git Bash, the bash host) and PowerShell 7
-	# (pwsh: the .ps1 gates, and the shell a Windows user works in). clang-cl
+	# Windows with, plus CMake, Git (Git Bash, the bash host), PowerShell 7
+	# (pwsh: the .ps1 gates, and the shell a Windows user works in) and gh
+	# (GitHub CLI: the sshd step takes the keys of the account it is signed
+	# in to, and the ssh step checks the key against it, #190). clang-cl
 	# links against the MSVC libraries and the Windows SDK, which are the
 	# Build Tools' C++ workload, and clang-cl itself is the Build Tools'
 	# "C++ Clang Compiler for Windows" component: the id alone installs only
@@ -513,7 +526,7 @@ read -r -d '' _BASELINE_TOML <<-'EOF' || true
 	# directly, and from MSYS2 too: step_deps runs this section there as
 	# well, since msys2's own section no longer carries a compiler.
 	[baseline.winget]
-	packages = ["Kitware.CMake", "Git.Git", "Microsoft.PowerShell", "Microsoft.VisualStudio.BuildTools"]
+	packages = ["Kitware.CMake", "Git.Git", "Microsoft.PowerShell", "GitHub.cli", "Microsoft.VisualStudio.BuildTools"]
 
 	[baseline.winget."Microsoft.VisualStudio.BuildTools"]
 	vs_requires = ["Microsoft.VisualStudio.Workload.VCTools", "Microsoft.VisualStudio.Component.VC.Llvm.Clang"]
@@ -526,6 +539,9 @@ read -r -d '' _BASELINE_TOML <<-'EOF' || true
 
 	[baseline.winget."Microsoft.PowerShell"]
 	provides = ["pwsh"]
+
+	[baseline.winget."GitHub.cli"]
+	provides = ["gh"]
 
 	# MSYS2 as the BASH HOST only. Its MinGW gcc toolchain is gone
 	# (2026-10-03): just-makeit and doppler build native Windows with
@@ -636,6 +652,18 @@ _PROC_VERSION="${JB_PROC_VERSION:-/proc/version}"
 # ssh step (box key adoption) and the sshd step (path translator) ask it.
 _on_wsl() {
 	[[ -r ${_PROC_VERSION} ]] && grep -qi microsoft "${_PROC_VERSION}"
+}
+
+# _on_native_windows -- true under MSYS2 / Git Bash on Windows itself (WSL
+# reports Linux). The one predicate for "native Windows" (#190): the sshd step
+# (which path translator), the default step set (sshd is in it there), the
+# Windows ssh-agent and the git step's core.sshCommand all ask it.
+_on_native_windows() {
+	_pwsh_uname_init
+	case "${_UNAME_S}" in
+	MINGW* | MSYS* | CYGWIN*) return 0 ;;
+	*) return 1 ;;
+	esac
 }
 
 # ---------------------------------------------------------------------------
@@ -1380,6 +1408,86 @@ _sshd_github_user() {
 	printf '%s\n' "${u}"
 }
 
+# _win_openssh NAME -- native Windows: Windows' own OpenSSH client program
+# NAME (ssh.exe, ssh-add.exe, ssh-keygen.exe) as a path this shell can run,
+# or return 1 when it is absent. By full path, never a PATH lookup: Git for
+# Windows puts its own MSYS ssh first on PATH, and that ssh neither reaches
+# the Windows agent service nor is what pwsh and VS Code run.
+# JB_WIN_OPENSSH names the directory instead, for a test.
+_win_openssh() {
+	local dir="${JB_WIN_OPENSSH:-}"
+	if [[ -z ${dir} ]]; then
+		dir="$(cygpath -u "${SYSTEMROOT:-C:\\Windows}" 2>/dev/null)/System32/OpenSSH" ||
+			return 1
+	fi
+	[[ -x "${dir}/$1" ]] || return 1
+	printf '%s\n' "${dir}/$1"
+}
+
+# _win_agent_key -- native Windows: put the box key into Windows' ssh-agent
+# service (#190), as the user, with Windows' own ssh-add.exe. The service
+# keeps it across reboots, so this is a once-per-box add; a later run finds
+# it listed and changes nothing. The service itself -- Automatic, started --
+# is windows-sshd.ps1's -SshAgent, inside the sshd step's one elevated run.
+#
+# A key with a passphrase is added only where ssh-add can ask for it: at a
+# terminal, without --yes. Otherwise it is reported with the command to run,
+# never prompted for behind an unattended run.
+_win_agent_key() {
+	local add keygen
+	if ! add="$(_win_openssh ssh-add.exe)" ||
+		! keygen="$(_win_openssh ssh-keygen.exe)"; then
+		_warn "Windows' OpenSSH client (System32\\OpenSSH) not found"
+		_result "agent:   skipped (no Windows OpenSSH client)"
+		return 0
+	fi
+	local name="${KEY_NAME}"
+	[[ -n ${name} ]] || name="$(ssh-key-name)"
+	local key="${HOME}/.ssh/${name}"
+	if [[ ! -r ${key} || ! -r ${key}.pub ]]; then
+		_info "no box key at ${key} -- the ssh step makes one"
+		_result "agent:   skipped (no key ${key})"
+		return 0
+	fi
+	# ssh-add.exe is a Windows program: it gets the Windows spelling.
+	local wkey
+	wkey="$(cygpath -w "${key}")"
+	if [[ ${DRY_RUN} -eq 1 ]]; then
+		_info "would add ${wkey} to the Windows ssh-agent service (${add})"
+		_result "agent:   ok (dry run)"
+		return 0
+	fi
+
+	# ssh-add -l: 0 lists keys, 1 the agent holds none, 2 no agent to ask.
+	local listed rc=0 fp
+	listed="$("${add}" -l 2>/dev/null | tr -d '\r')" || rc=$?
+	if [[ ${rc} -ge 2 ]]; then
+		_warn "the Windows ssh-agent service is not running -- the sshd step's elevated run starts it"
+		_result "agent:   skipped (ssh-agent service not running)"
+		return 0
+	fi
+	fp="$("${keygen}" -lf "${wkey}.pub" 2>/dev/null | tr -d '\r' | awk '{ print $2 }')" || fp=""
+	if [[ -n ${fp} && $'\n'"${listed}"$'\n' == *" ${fp} "* ]]; then
+		_info "${name} is already in the Windows agent"
+		_result "agent:   ok (${name} already in the Windows agent)"
+		return 0
+	fi
+	# An empty passphrase opens an unprotected key and fails on any other.
+	if ! "${keygen}" -y -P "" -f "${wkey}" >/dev/null 2>&1; then
+		if [[ ${ASSUME_YES} -eq 1 || ! -t 0 ]]; then
+			_warn "${name} has a passphrase -- add it once, from PowerShell: ssh-add '${wkey}'"
+			_result "agent:   skipped (passphrase key: run ssh-add '${wkey}')"
+			return 0
+		fi
+		_info "${name} has a passphrase: ssh-add asks for it once, and the agent keeps it"
+	fi
+	if "${add}" "${wkey}"; then
+		_result "agent:   ok (${name} added to the Windows agent)"
+	else
+		_result "agent:   failed (ssh-add '${wkey}')"
+	fi
+}
+
 # _sshd_failed LOG DEFAULT — the summary line for a failed run: the reason
 # windows-sshd.ps1 stopped on when it names one in LOG, else DEFAULT. The
 # script starts that refusal "reboot pending:" (Install-SshdCapability).
@@ -1393,22 +1501,26 @@ _sshd_failed() {
 
 step_sshd() {
 	_head "sshd — Windows OpenSSH server, started at boot"
+	_sshd_server
+	# Whatever became of the server: the agent service may already be
+	# running from an earlier run, and the key belongs in it either way.
+	if _on_native_windows; then
+		_win_agent_key
+	fi
+}
 
+_sshd_server() {
 	# WSL, or native Windows under MSYS2 / Git Bash: the same Windows
 	# service either way, reached through a different path translator.
 	local topath
-	_pwsh_uname_init
 	if _on_wsl; then
 		topath=wslpath
+	elif _on_native_windows; then
+		topath=cygpath
 	else
-		case "${_UNAME_S}" in
-		MINGW* | MSYS* | CYGWIN*) topath=cygpath ;;
-		*)
-			_info "not Windows — on Linux enable the distro's own sshd unit"
-			_result "sshd:    skipped (not Windows)"
-			return 0
-			;;
-		esac
+		_info "not Windows — on Linux enable the distro's own sshd unit"
+		_result "sshd:    skipped (not Windows)"
+		return 0
 	fi
 
 	local ps_exe cmd_exe c
@@ -1474,6 +1586,12 @@ step_sshd() {
 	if [[ -n ${SSHD_ALLOW} ]]; then
 		local sq="'"
 		ps_args="${ps_args} -RemoteAddress ${sq}${SSHD_ALLOW//,/${sq},${sq}}${sq}"
+	fi
+	# Native Windows: the same elevated run also turns on the OpenSSH
+	# Authentication Agent service, so the box key has an agent pwsh,
+	# Windows' ssh.exe and VS Code all reach -- still one elevation (#190).
+	if [[ ${topath} == cygpath ]]; then
+		ps_args="${ps_args} -SshAgent"
 	fi
 
 	# How it elevates, first match wins: this shell already is; an elevated
@@ -1612,7 +1730,6 @@ step_git() {
 		"color.ui|auto"
 		"core.editor|${EDITOR:-vi}"
 	)
-
 	local pair key value current set_count=0
 	for pair in "${pairs[@]}"; do
 		key="${pair%%|*}"
@@ -1632,7 +1749,43 @@ step_git() {
 		who_count=$((who_count + 1))
 	_git_identity user.email "${GIT_AUTHOR_EMAIL:-}" "your email" &&
 		who_count=$((who_count + 1))
-	_result "git:     ok (${set_count} default(s) set, ${who_count} identity value(s) set)"
+	_GIT_SSH_NOTE=""
+	_on_native_windows && _git_ssh_command
+	_result "git:     ok (${set_count} default(s) set, ${who_count} identity value(s) set${_GIT_SSH_NOTE:+; ${_GIT_SSH_NOTE}})"
+}
+
+# The value _git_ssh_command sets: Windows' own OpenSSH client, spelled with
+# forward slashes because git hands core.sshCommand to a shell, which would
+# eat backslashes.
+_GIT_WIN_SSH="C:/Windows/System32/OpenSSH/ssh.exe"
+
+# _git_ssh_command -- native Windows: point git at Windows' own ssh.exe, the
+# client that talks to the Windows ssh-agent service the sshd step puts the
+# box key in (#190), so Git for Windows, pwsh and VS Code share one agent.
+# Git for Windows' bundled MSYS ssh reaches no agent there at all.
+#
+# Only where the GLOBAL value is unset: --global is read, never the effective
+# value, because the Git for Windows installer may set core.sshCommand (or
+# ssh.variant) in the SYSTEM gitconfig (C:\Program Files\Git\etc\gitconfig),
+# and that must not stop the user's own setting. A global value that is
+# already there is kept and reported. ssh.exe is checked to exist first.
+# The outcome goes in _GIT_SSH_NOTE, for the git step's summary line.
+_git_ssh_command() {
+	local current
+	current="$(git config --global --get core.sshCommand 2>/dev/null || true)"
+	if [[ -n ${current} ]]; then
+		_GIT_SSH_NOTE="core.sshCommand kept: ${current}"
+		_info "${_GIT_SSH_NOTE}"
+		return 0
+	fi
+	if ! _win_openssh ssh.exe >/dev/null; then
+		_warn "Windows' OpenSSH client (${_GIT_WIN_SSH}) not found -- core.sshCommand left unset"
+		_GIT_SSH_NOTE="core.sshCommand not set: no ${_GIT_WIN_SSH}"
+		return 0
+	fi
+	_info "git config --global core.sshCommand ${_GIT_WIN_SSH}"
+	_run git config --global core.sshCommand "${_GIT_WIN_SSH}"
+	_GIT_SSH_NOTE="core.sshCommand set: ${_GIT_WIN_SSH}"
 }
 
 # _git_identity KEY FROM_ENV LABEL — set a global identity value that is
@@ -1690,6 +1843,20 @@ _git_identity() {
 # puts each on the caller's PATH (its marker's `path` line).
 _PATH_ADDED=()
 
+# _path_add DIR -- put DIR first on this run's PATH, and record it in
+# _PATH_ADDED, unless PATH already has it. For a directory an installer
+# just wrote a tool into (uv, claude).
+_path_add() {
+	case ":${PATH}:" in
+	*":$1:"*) ;;
+	*)
+		PATH="$1:${PATH}"
+		_PATH_ADDED+=("$1")
+		;;
+	esac
+	hash -r
+}
+
 # tools — uv, then this repo's pre-commit hooks if that applies here.
 #
 # uv comes from pkg.sh's install-uv, which get-jb.sh and jbx share: winget
@@ -1707,14 +1874,7 @@ step_tools() {
 	else
 		_info "installing uv"
 		if uv_dir="$(install-uv)"; then
-			case ":${PATH}:" in
-			*":${uv_dir}:"*) ;;
-			*)
-				PATH="${uv_dir}:${PATH}"
-				_PATH_ADDED+=("${uv_dir}")
-				;;
-			esac
-			hash -r
+			_path_add "${uv_dir}"
 			_info "uv installed in ${uv_dir}"
 		else
 			_warn "uv was not installed"
@@ -2001,8 +2161,114 @@ step_pwsh() {
 	fi
 }
 
-# claude — Anthropic's own installer; it puts the binary in ~/.local/bin,
-# which the shell step has already put on PATH.
+# ---------------------------------------------------------------------------
+# claude — Claude Code, by one of the installers Anthropic's setup page
+# recommends (https://code.claude.com/docs/en/setup).
+#
+# Off Windows: install.sh, which puts the binary in ~/.local/bin, which the
+# shell step has already put on PATH.
+#
+# On native Windows (a MINGW/MSYS/CYGWIN uname) install.sh is no use: it
+# refuses those unames outright ("Windows is not supported by this script",
+# measured 2026-10-31, #189). There, winget (Anthropic.ClaudeCode) first,
+# the same shape as install-uv (#171): winget resolves the machine's native
+# build by itself (win32-arm64 on an ARM64 box, from an emulated x64 shell
+# too) and links the portable exe into winget's Links directory, which goes
+# on this run's PATH and into the closing advice as uv's does. A WinGet
+# install does not update itself; Anthropic documents
+# `winget upgrade Anthropic.ClaudeCode`, or CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE=1
+# to have Claude Code run that upgrade for you.
+#
+# When winget is absent or fails, install.ps1 through Windows PowerShell. It
+# chooses its build from $env:PROCESSOR_ARCHITECTURE alone, and a PowerShell
+# started from an emulated x64 shell on ARM64 Windows reads AMD64 there. So
+# the child PowerShell dot-sources windows-sshd.ps1 for Get-MachineArch --
+# the ONE machine-architecture check, a registry read the emulation does not
+# virtualise -- and sets PROCESSOR_ARCHITECTURE to the machine's value for
+# itself before running the installer. Only that child process sees it.
+# ---------------------------------------------------------------------------
+_CLAUDE_WINGET_ID="Anthropic.ClaudeCode"
+_CLAUDE_INSTALL_SH="https://claude.ai/install.sh"
+_CLAUDE_INSTALL_PS1="https://claude.ai/install.ps1"
+
+# _claude_ps1_command SSHD_PS1 -- the PowerShell command that runs
+# install.ps1 for this machine's architecture. SSHD_PS1 is the Windows path
+# of a file named windows-sshd.ps1: a dot-sourced script must end in .ps1.
+_claude_ps1_command() {
+	printf '%s' ". $(_ps_literal "$1"); \$env:PROCESSOR_ARCHITECTURE = @{ arm64 = 'ARM64'; x64 = 'AMD64' }[(Get-MachineArch)]; irm $(_ps_literal "${_CLAUDE_INSTALL_PS1}") | iex"
+}
+
+# _claude_windows — step_claude's native-Windows half. Reports into the
+# summary itself.
+_claude_windows() {
+	local w dir
+	if w="$(winget-bin)"; then
+		_info "installing Claude Code"
+		if [[ ${DRY_RUN} -eq 1 ]]; then
+			_info "would run: $(_winget_install_line "${w}" "${_CLAUDE_WINGET_ID}")"
+			_result "claude:  ok (dry run)"
+			return 0
+		fi
+		if dir="$(_winget_portable "${w}" "${_CLAUDE_WINGET_ID}" claude)"; then
+			_path_add "${dir}"
+			_info "claude installed in ${dir}; run 'claude' to sign in"
+			_result "claude:  ok (installed)"
+			return 0
+		fi
+		_warn "winget did not install ${_CLAUDE_WINGET_ID}; falling back to ${_CLAUDE_INSTALL_PS1}"
+	fi
+	_claude_ps1
+}
+
+# _claude_ps1 — install.ps1 through Windows PowerShell, the fallback.
+_claude_ps1() {
+	local ps src dir wpath cmd rc=0
+	if ! ps="$(_powershell_bin)"; then
+		_warn "neither winget nor Windows PowerShell found — cannot install Claude Code"
+		_result "claude:  skipped (no winget, no PowerShell)"
+		return 0
+	fi
+	if ! src="$(_asset windows-sshd.ps1)"; then
+		_result "claude:  failed (windows-sshd.ps1 unavailable)"
+		return 0
+	fi
+	# MSYS rewrites any argument that looks like a POSIX path before a
+	# Windows program sees it; the command below carries a URL.
+	local -x MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1
+
+	_info "installing Claude Code (install.ps1: no winget)"
+	if [[ ${DRY_RUN} -eq 1 ]]; then
+		wpath="$(_win_path "${src}")" || wpath="${src}"
+		_info "would run: ${ps} -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$(_claude_ps1_command "${wpath}")\""
+		_result "claude:  ok (dry run)"
+		return 0
+	fi
+	# _asset may hand back a temp copy with no .ps1 suffix, which
+	# PowerShell will not dot-source; a copy under the real name always is.
+	dir="$(mktemp -d "${TMPDIR:-/tmp}/jb-claude.XXXXXX")" || {
+		_result "claude:  failed"
+		return 0
+	}
+	cp "${src}" "${dir}/windows-sshd.ps1"
+	if wpath="$(_win_path "${dir}/windows-sshd.ps1")"; then
+		cmd="$(_claude_ps1_command "${wpath}")"
+		# -ExecutionPolicy Bypass: a Windows client's default policy,
+		# Restricted, refuses to dot-source any script file.
+		"${ps}" -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+			-Command "${cmd}" || rc=$?
+	else
+		rc=1
+	fi
+	rm -rf "${dir}"
+	if [[ ${rc} -eq 0 ]]; then
+		_info "run 'claude' to sign in"
+		_result "claude:  ok (installed)"
+	else
+		_warn "the Claude Code installer failed (install.ps1, exit ${rc})"
+		_result "claude:  failed"
+	fi
+}
+
 step_claude() {
 	_head "claude — Claude Code"
 
@@ -2011,6 +2277,12 @@ step_claude() {
 		_result "claude:  ok (already installed)"
 		return 0
 	fi
+	case "${JB_UNAME_S:-$(uname -s 2>/dev/null || echo unknown)}" in
+	MINGW* | MSYS* | CYGWIN*)
+		_claude_windows
+		return 0
+		;;
+	esac
 	if ! _have curl; then
 		_warn "curl not installed — cannot install Claude Code"
 		_result "claude:  skipped (no curl)"
@@ -2019,11 +2291,11 @@ step_claude() {
 
 	_info "installing Claude Code"
 	if [[ ${DRY_RUN} -eq 1 ]]; then
-		_info "would run: curl -fsSL https://claude.ai/install.sh | bash"
+		_info "would run: curl -fsSL ${_CLAUDE_INSTALL_SH} | bash"
 		_result "claude:  ok (dry run)"
 		return 0
 	fi
-	if curl -fsSL https://claude.ai/install.sh | bash; then
+	if curl -fsSL "${_CLAUDE_INSTALL_SH}" | bash; then
 		_info "run 'claude' to sign in"
 		_result "claude:  ok (installed)"
 	else
@@ -2061,6 +2333,7 @@ if [[ ${STEPS_EXPLICIT} -eq 0 ]]; then
 		STEPS_STR="${_toml_steps}"
 	else
 		STEPS_STR=""
+		_on_native_windows && _STEPS_OPT_IN_STR="${_STEPS_OPT_IN_STR/sshd/}"
 		for _s in "${_STEPS_ALL[@]}"; do
 			case " ${_STEPS_OPT_IN_STR} " in
 			*" ${_s} "*) continue ;;

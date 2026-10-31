@@ -100,6 +100,14 @@ _local_path() {
 	fi
 }
 
+# _ps_literal TEXT -- TEXT as a PowerShell single-quoted string. The quote
+# goes through a variable, not an escaped quote in the replacement, whose
+# meaning changed across bash releases.
+_ps_literal() {
+	local _q="'"
+	printf "'%s'" "${1//${_q}/${_q}${_q}}"
+}
+
 # _vs_installer_dir -- the Visual Studio Installer directory, which holds
 # vswhere.exe and setup.exe, as a local path. It is
 # %ProgramFiles(x86)%\Microsoft Visual Studio\Installer on every install;
@@ -181,15 +189,38 @@ _winget_links_dir() {
 	printf '%s\n' "${base}/Microsoft/WinGet/Links"
 }
 
-# _uv_dir_in DIR [last] -- print the directory uv resolves to with DIR
-# added to PATH -- first, or last with `last` -- or return 1. A resolution
-# rather than a test for DIR/uv: Git Bash finds uv.exe as `uv`, and astral's
-# installer honours UV_INSTALL_DIR, so DIR is only where it USUALLY lands.
-_uv_dir_in() {
-	local p search="${1}:${PATH}"
-	[ "${2:-}" = last ] && search="${PATH}:${1}"
-	p="$(PATH="${search}" command -v uv 2>/dev/null)" || return 1
+# _cmd_dir_in NAME DIR [last] -- print the directory command NAME resolves
+# to with DIR added to PATH -- first, or last with `last` -- or return 1. A
+# resolution rather than a test for DIR/NAME: Git Bash finds uv.exe as `uv`,
+# and astral's installer honours UV_INSTALL_DIR, so DIR is only where it
+# USUALLY lands.
+_cmd_dir_in() {
+	local p search="${2}:${PATH}"
+	[ "${3:-}" = last ] && search="${PATH}:${2}"
+	p="$(PATH="${search}" command -v "$1" 2>/dev/null)" || return 1
 	printf '%s\n' "${p%/*}"
+}
+
+# _winget_install_line WINGET ID -- the winget install command for ID, as
+# the one line a dry run prints. IFS set here: setup-system sources this
+# under IFS=$'\n\t', which would join the flags one per line.
+_winget_install_line() {
+	(
+		IFS=' '
+		printf '%s install --id %s %s\n' "$1" "$2" "${_WINGET_INSTALL_FLAGS[*]}"
+	)
+}
+
+# _winget_portable WINGET ID NAME -- install the portable winget package ID
+# unless it is installed already, then print the directory command NAME
+# resolves to with winget's Links directory first on PATH (install-uv, and
+# setup-system's claude step, #189). Returns 1 when either part fails.
+_winget_portable() {
+	local links
+	links="$(_winget_links_dir)" &&
+		{ _winget_installed "$1" "$2" ||
+			"$1" install --id "$2" "${_WINGET_INSTALL_FLAGS[@]}" >&2; } &&
+		_cmd_dir_in "$3" "${links}"
 }
 
 install-uv() {
@@ -223,26 +254,16 @@ install-uv() {
 	done
 	shift "$((OPTIND - 1))"
 
-	local os _w links dir tmp
+	local os _w dir tmp
 	os="${JB_UNAME_S:-$(uname -s)}"
 	case "${os}" in
 	MINGW* | MSYS* | CYGWIN*)
 		if _w="$(winget-bin)"; then
 			if [ "${dry}" -eq 1 ]; then
-				# IFS set here: setup-system sources this under IFS=$'\n\t',
-				# which would join the flags one per line.
-				(
-					IFS=' '
-					printf '%s install --id %s %s\n' "${_w}" \
-						"${_UV_WINGET_ID}" "${_WINGET_INSTALL_FLAGS[*]}"
-				)
+				_winget_install_line "${_w}" "${_UV_WINGET_ID}"
 				return 0
 			fi
-			if links="$(_winget_links_dir)" &&
-				{ _winget_installed "${_w}" "${_UV_WINGET_ID}" ||
-					"${_w}" install --id "${_UV_WINGET_ID}" \
-						"${_WINGET_INSTALL_FLAGS[@]}" >&2; } &&
-				dir="$(_uv_dir_in "${links}")"; then
+			if dir="$(_winget_portable "${_w}" "${_UV_WINGET_ID}" uv)"; then
 				printf '%s\n' "${dir}"
 				return 0
 			fi
@@ -280,7 +301,7 @@ install-uv() {
 		return 1
 	fi
 	rm -f "${tmp}"
-	if ! dir="$(_uv_dir_in "${HOME}/.local/bin" last)"; then
+	if ! dir="$(_cmd_dir_in uv "${HOME}/.local/bin" last)"; then
 		echo "install-uv: ${_UV_INSTALL_SH} ran, but no uv can be found" >&2
 		return 1
 	fi

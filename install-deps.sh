@@ -11,9 +11,12 @@ _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${_SCRIPT_DIR}/toml.sh"
 # shellcheck source=/dev/null
 source "${_SCRIPT_DIR}/pkg.sh"
+# shellcheck source=/dev/null
+source "${_SCRIPT_DIR}/windows.sh"
 
 DRY_RUN=0
 VERBOSE=0
+ASSUME_YES=0
 SUDO_MODE="auto"
 PROXY_URL=""
 SECTION_OVERRIDE=""
@@ -60,14 +63,16 @@ read -r -d '' HELP <<-'EOF' || true
 	  package per invocation, skipping any id `winget list` already finds.
 	  Package names there are winget ids, e.g. "Python.Python.3.13".
 
-	  A winget package that provides Visual Studio workloads names them in
-	  a table keyed by its id, probed with vswhere instead of `winget list`:
+	  A winget package that provides Visual Studio workloads or components
+	  names their ids in a table keyed by its id, probed with vswhere
+	  instead of `winget list`:
 
 	    [dev.winget."Microsoft.VisualStudio.BuildTools"]
-	    vs_requires = ["Microsoft.VisualStudio.Workload.VCTools"]
+	    vs_requires = ["Microsoft.VisualStudio.Workload.VCTools",
+	                   "Microsoft.VisualStudio.Component.VC.Llvm.Clang"]
 
-	  Absent, it is installed with --override "... --add <workload>"; present
-	  without the workloads, the VS Installer adds them (elevated).
+	  Absent, it is installed with --override "... --add <id>..."; present
+	  without them, the VS Installer adds them (elevated).
 
 	  Privilege escalation is DERIVED, not assumed: sudo is used only when
 	  the manager needs root, the caller is not already root, and sudo is
@@ -89,6 +94,9 @@ read -r -d '' HELP <<-'EOF' || true
 	  -h / --help              Show this message and exit.
 	  -n / --dry-run           Print commands without executing them.
 	  -v / --verbose           Print section, groups, and packages before acting.
+	  -y / --yes               Never raise a UAC prompt. On Windows a step that
+	                           needs admin runs in an elevated shell, or over
+	                           the admin ssh channel, and is skipped otherwise.
 	  -s / --section SECTION   Override auto-detected package manager.
 	  -g / --groups  GROUP     Comma-separated groups to install (overrides all
 	                           defaults; e.g. -g runtime or -g runtime,dev).
@@ -122,6 +130,10 @@ while [[ $# -gt 0 ]]; do
 		;;
 	-v | --verbose)
 		VERBOSE=1
+		shift
+		;;
+	-y | --yes)
+		ASSUME_YES=1
 		shift
 		;;
 	-s | --section)
@@ -313,7 +325,8 @@ _resolve_prefix() {
 # install-uv there installs through them too (#171).
 
 # ---------------------------------------------------------------------------
-# A winget package that provides Visual Studio workloads (#67).
+# A winget package that provides Visual Studio workloads or components
+# (#67, #181).
 #
 # `Microsoft.VisualStudio.BuildTools` installs the Visual Studio Installer
 # SHELL; the C++ toolchain is a workload added to it. So the id probe answers
@@ -326,11 +339,14 @@ _resolve_prefix() {
 #   packages = ["Microsoft.VisualStudio.BuildTools"]
 #
 #   [baseline.winget."Microsoft.VisualStudio.BuildTools"]
-#   vs_requires = ["Microsoft.VisualStudio.Workload.VCTools"]
+#   vs_requires = ["Microsoft.VisualStudio.Workload.VCTools",
+#                  "Microsoft.VisualStudio.Component.VC.Llvm.Clang"]
 #
-# ONE declaration, read both ways: the probe asks vswhere for an instance
-# with every id (`-requires`), and both installs `--add` every id, so what is
-# probed and what is installed cannot disagree. Three paths, decided by the
+# An id is a workload or a component alike: vswhere -requires and the
+# installer's --add take both kinds, and the second is how clang-cl
+# arrives (#181). ONE declaration, read both ways: the probe asks vswhere
+# for an instance with every id (`-requires`), and both installs `--add`
+# every id, so what is probed and what is installed cannot disagree. Three paths, decided by the
 # probe and never by an install's exit code (a re-install of a present id is
 # cancelled with -1978335135, measured):
 #
@@ -341,6 +357,12 @@ _resolve_prefix() {
 #                       an alternative: a newer bootstrapper refuses to
 #                       modify an older install whenever an update is
 #                       pending (installer exit 1, measured 2026-10-31).
+#
+# The modify elevates by windows.sh's win-admin-route (#184): directly when
+# this shell is already elevated, over the admin ssh channel when there is
+# one, through a UAC prompt otherwise -- except under --yes, which never
+# prompts: the modify is skipped, naming WIN_NEEDS_ADMIN, and the run fails,
+# since the toolchain it wanted is not there.
 #
 # The probe decides the OUTCOME too: after either install it runs again, and
 # only an instance with every id is success. An installer that exits 0
@@ -359,7 +381,7 @@ _vs_requires() {
 	local _r
 	while IFS= read -r _r; do
 		if [[ ! ${_r} =~ ^[A-Za-z0-9._-]+$ ]]; then
-			echo "error: [$1.winget.\"$2\"] vs_requires: not a workload id: ${_r}" >&2
+			echo "error: [$1.winget.\"$2\"] vs_requires: not a workload or component id: ${_r}" >&2
 			return 1
 		fi
 		printf '%s\n' "${_r}"
@@ -367,72 +389,9 @@ _vs_requires() {
 		toml_get_array "$1" "winget.\"$2\"" vs_requires)
 }
 
-# _powershell_bin -- Windows PowerShell, by either spelling (see winget-bin
-# for why both are tried).
-_powershell_bin() {
-	local _b
-	for _b in powershell powershell.exe; do
-		if command -v "${_b}" >/dev/null 2>&1; then
-			printf '%s\n' "${_b}"
-			return 0
-		fi
-	done
-	return 1
-}
-
-# _win_path LOCAL / _local_path WINDOWS -- translate a path across the
-# boundary: wslpath under WSL, cygpath under MSYS2, Cygwin and Git Bash.
-_win_path() {
-	if command -v wslpath >/dev/null 2>&1; then
-		wslpath -w "$1"
-	else
-		cygpath -w "$1"
-	fi
-}
-_local_path() {
-	if command -v wslpath >/dev/null 2>&1; then
-		wslpath -u "$1"
-	else
-		cygpath -u "$1"
-	fi
-}
-
-# _vs_installer_dir -- the Visual Studio Installer directory, which holds
-# vswhere.exe and setup.exe, as a local path. It is
-# %ProgramFiles(x86)%\Microsoft Visual Studio\Installer on every install;
-# the variable is read through PowerShell because a shell cannot name it
-# (parentheses are not legal in a variable name). JB_VS_INSTALLER
-# overrides, set to a directory of stubs for a test.
-_vs_installer_dir() {
-	local _ps _raw
-	if [ -n "${JB_VS_INSTALLER+x}" ]; then
-		printf '%s\n' "${JB_VS_INSTALLER}"
-		return 0
-	fi
-	_ps="$(_powershell_bin)" || return 1
-	# shellcheck disable=SC2016  # PowerShell expands it, not this shell
-	_raw="$("${_ps}" -NoProfile -NonInteractive \
-		-Command '${env:ProgramFiles(x86)}' 2>/dev/null | tr -d '\r\n')" ||
-		_raw=""
-	[ -n "${_raw}" ] || return 1
-	_local_path "${_raw}\\Microsoft Visual Studio\\Installer"
-}
-
-# _vswhere DIR ARGS... -- the first installationPath vswhere prints for
-# ARGS over every product, or nothing. No vswhere is no instance.
-_vswhere() {
-	local _dir="$1" _l
-	shift
-	[ -f "${_dir}/vswhere.exe" ] || return 0
-	while IFS= read -r _l; do
-		_l="${_l%$'\r'}"
-		if [ -n "${_l}" ]; then
-			printf '%s\n' "${_l}"
-			return 0
-		fi
-	done < <("${_dir}/vswhere.exe" -products '*' "$@" \
-		-property installationPath 2>/dev/null || true)
-}
+# _powershell_bin, _win_path, _local_path, _vs_installer_dir and _vswhere
+# live in pkg.sh, sourced above: setup-system's installed report probes the
+# vs_requires ids through the same _vswhere (#180).
 
 # _ps_literal TEXT -- TEXT as a PowerShell single-quoted string. The quote
 # goes through a variable, not an escaped quote in the replacement, whose
@@ -443,14 +402,16 @@ _ps_literal() {
 }
 
 # ---------------------------------------------------------------------------
-# _win_exit [--runas] EXE ARG... -- run Windows program EXE and set _WIN_RC
+# _win_exit [--runas | --ssh DEST] EXE ARG... -- run Windows program EXE and set _WIN_RC
 # to its FULL exit code, or to empty when none was reported (a declined UAC
 # prompt, no PowerShell). EXE's output passes through.
 #
 # Through PowerShell's Start-Process, the way setup-system's sshd step
 # elevates: with --runas, `-Verb RunAs` raises the UAC prompt, and
 # ErrorActionPreference Stop turns a declined prompt into a failure rather
-# than an exit 0. Without it, -NoNewWindow keeps EXE on this console. -Wait
+# than an exit 0. Without it, -NoNewWindow keeps EXE on this console. With
+# --ssh, the same PowerShell runs in an ssh session to DEST, the admin
+# channel (windows.sh win-admin-channel): elevated, with no prompt. -Wait
 # here rather than sshd's WaitForExit, because that is how the VS Installer
 # was measured: it returned 3010 once its modify had finished (301 s,
 # 2026-10-31).
@@ -464,23 +425,27 @@ _ps_literal() {
 # before Windows saw it.
 #
 # JB_WIN_EXIT names a stand-in for PowerShell, for a test: it gets
-# [--runas] EXE ARG... and reports the code the same way.
+# [--runas | --ssh DEST] EXE ARG... and reports the code the same way.
 # ---------------------------------------------------------------------------
 _WIN_RC=""
 _win_exit() {
-	local _runas=0 _ps _exe _a _args="" _how="-NoNewWindow" _l
+	local _runas=0 _ssh="" _ps _exe _a _args="" _how="-NoNewWindow" _l _script
 	if [ "$1" = "--runas" ]; then
 		_runas=1
 		shift
+	elif [ "$1" = "--ssh" ]; then
+		_ssh="$2"
+		shift 2
 	fi
 	_WIN_RC=""
 	local -a _cmd
 	if [ -n "${JB_WIN_EXIT:-}" ]; then
 		_cmd=("${JB_WIN_EXIT}")
 		[ "${_runas}" -eq 1 ] && _cmd+=(--runas)
+		[ -n "${_ssh}" ] && _cmd+=(--ssh "${_ssh}")
 		_cmd+=("$@")
 	else
-		if ! _ps="$(_powershell_bin)"; then
+		if [ -z "${_ssh}" ] && ! _ps="$(_powershell_bin)"; then
 			echo "error: powershell not found (looked for powershell," >&2
 			echo "       then powershell.exe)" >&2
 			return 0
@@ -494,8 +459,15 @@ _win_exit() {
 		done
 		[ -n "${_args}" ] && _args=" -ArgumentList $(_ps_literal "${_args}")"
 		[ "${_runas}" -eq 1 ] && _how="-Verb RunAs"
-		_cmd=("${_ps}" -NoProfile -NonInteractive -ExecutionPolicy Bypass
-			-Command "\$ErrorActionPreference = 'Stop'; \$p = Start-Process -FilePath $(_ps_literal "${_exe}")${_args} -WorkingDirectory \$env:SystemRoot -Wait -PassThru ${_how}; [Console]::Error.WriteLine('jb-exit:' + \$p.ExitCode)")
+		_script="\$ErrorActionPreference = 'Stop'; \$p = Start-Process -FilePath $(_ps_literal "${_exe}")${_args} -WorkingDirectory \$env:SystemRoot -Wait -PassThru ${_how}; [Console]::Error.WriteLine('jb-exit:' + \$p.ExitCode)"
+		if [ -n "${_ssh}" ]; then
+			# WIN_SSH_OPTS is windows.sh's; the far end's shell is PowerShell.
+			# shellcheck disable=SC2154  # assigned in windows.sh, sourced above
+			_cmd=(ssh "${WIN_SSH_OPTS[@]}" "${_ssh}" "${_script}")
+		else
+			_cmd=("${_ps}" -NoProfile -NonInteractive -ExecutionPolicy Bypass
+				-Command "${_script}")
+		fi
 	fi
 	# fd 3 is this function's stdout: EXE's output goes there untouched,
 	# while stderr comes through the loop.
@@ -549,6 +521,21 @@ _win_verdict() {
 	fi
 }
 
+# _vs_modify_how [HOW DEST] -- how the elevated setup.exe modify runs, in
+# words: HOW and DEST as win-admin-route (windows.sh) prints them, asked of
+# it when not given.
+# shellcheck disable=SC2154  # WIN_NEEDS_ADMIN: windows.sh, sourced above
+_vs_modify_how() {
+	local _how="${1:-}" _dest="${2:-}"
+	[ -n "${_how}" ] || IFS=' ' read -r _how _dest <<<"$(win-admin-route "${ASSUME_YES}")"
+	case "${_how}" in
+	elevated) echo "already elevated, no prompt" ;;
+	ssh) echo "over the admin ssh channel (${_dest}), no prompt" ;;
+	skip) echo "skipped under --yes: ${WIN_NEEDS_ADMIN}" ;;
+	*) echo "elevated, through a UAC prompt" ;;
+	esac
+}
+
 # _winget_vs BIN ID REQUIRES... -- install winget package ID so that it
 # provides every REQUIRES id, by the three paths described above.
 _winget_vs() {
@@ -561,12 +548,14 @@ _winget_vs() {
 		echo "--quiet --wait --norestart ${_add[*]} --includeRecommended"
 	)"
 	if [ "${DRY_RUN}" -eq 1 ]; then
-		# Not probed, as for a bare id: the same plan on any machine.
+		# vswhere and winget are not probed, as for a bare id: the same plan
+		# whatever is installed. How the modify would elevate is, since that
+		# is what the plan tells an unattended run (#184).
 		(
 			IFS=' '
 			# shellcheck disable=SC2154  # assigned in pkg.sh, sourced above
 			echo "${_w} install --id ${_p} ${_WINGET_INSTALL_FLAGS[*]} --override \"${_override}\""
-			echo "  or, when ${_p} is present without $*, elevated:"
+			echo "  or, when ${_p} is present without $*, $(_vs_modify_how):"
 			echo "  %ProgramFiles(x86)%\\Microsoft Visual Studio\\Installer\\setup.exe modify --installPath <vswhere installationPath> ${_add[*]} --includeRecommended --quiet --norestart"
 		)
 		return 0
@@ -585,8 +574,20 @@ _winget_vs() {
 			echo "error: ${_p}: winget lists it, but vswhere finds no instance" >&2
 			return 1
 		fi
-		echo "install-deps: ${_p} is present without $*; modifying ${_shell}" >&2
-		_win_exit --runas "${_dir}/setup.exe" modify --installPath "${_shell}" \
+		local _how _dest _via=()
+		IFS=' ' read -r _how _dest <<<"$(win-admin-route "${ASSUME_YES}")"
+		case "${_how}" in
+		elevated) ;;
+		ssh) _via=(--ssh "${_dest}") ;;
+		skip)
+			# shellcheck disable=SC2154  # assigned in windows.sh, sourced above
+			echo "install-deps: ${_p} is present without $*: skipped: ${WIN_NEEDS_ADMIN}" >&2
+			return 1
+			;;
+		*) _via=(--runas) ;;
+		esac
+		echo "install-deps: ${_p} is present without $*; modifying ${_shell}, $(_vs_modify_how "${_how}" "${_dest}")" >&2
+		_win_exit ${_via[@]+"${_via[@]}"} "${_dir}/setup.exe" modify --installPath "${_shell}" \
 			"${_add[@]}" --includeRecommended --quiet --norestart
 		_win_verdict "${_p} (setup.exe modify)" "${_dir}" "$@"
 	else

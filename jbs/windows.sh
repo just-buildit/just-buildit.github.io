@@ -130,6 +130,41 @@ if [[ -n ${_win_key} && -f "${HOME}/.ssh/${_win_key}" ]]; then
 	WIN_SSH_OPTS+=(-i "${HOME}/.ssh/${_win_key}")
 fi
 unset _win_key
+# WIN_ELEVATED_PS -- the PowerShell expression that prints True in an
+# elevated session: its token carries S-1-16-12288, the High Mandatory Level
+# SID. The ONE check: win-admin-channel asks it of the far end, win-elevated
+# of this process. whoami.exe is named by its full path, in single quotes:
+# a powershell.exe started from Git Bash inherits Git's PATH, whose
+# usr\bin\whoami.exe refuses /groups, so a bare `whoami` read False in an
+# elevated shell as well (measured 2026-10-31, ARM64 host, Git for Windows).
+WIN_ELEVATED_PS="[bool](& (Join-Path \$env:SystemRoot 'System32\\whoami.exe') /groups | Select-String 'S-1-16-12288')"
+
+# win-elevated -- return 0 when this process's Windows token is elevated (an
+# admin PowerShell, or a shell started from one), 1 otherwise or when there
+# is no Windows to ask. A Windows program started from here inherits that
+# token, so an elevated step can run directly, with no UAC prompt.
+# JB_WIN_ELEVATED=1 or 0 answers instead, for a test: CI's Windows runners
+# are elevated, so a test that did not pin it would test the runner.
+#
+# Example:
+#   . windows.sh
+#   if win-elevated; then echo "admin: no prompt needed"; fi
+win-elevated() {
+	case "${JB_WIN_ELEVATED:-}" in
+	1) return 0 ;;
+	0) return 1 ;;
+	esac
+	local ps out
+	ps="$(win-exe powershell.exe)" || return 1
+	out="$( (
+		cd /mnt/c 2>/dev/null || true
+		MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 \
+			"${ps}" -NoProfile -NonInteractive -Command "${WIN_ELEVATED_PS}" \
+			2>/dev/null
+	) | tr -d '\r\n')" || return 1
+	[[ ${out} == True ]]
+}
+
 win-admin-channel() {
 	local cmd host user name out
 	cmd="$(win-exe cmd.exe)" || return 1
@@ -144,10 +179,47 @@ win-admin-channel() {
 		"${cmd}" /c 'echo %COMPUTERNAME%' 2>/dev/null
 	) | tr -d '\r\n')"
 	[[ -n ${user} && -n ${name} ]] || return 1
-	# S-1-16-12288 is the High Mandatory Level SID: an elevated token.
+	# WIN_ELEVATED_PS (above): is the far end's session elevated?
+	# shellcheck disable=SC2016  # the far end's PowerShell expands it
 	out="$(ssh "${WIN_SSH_OPTS[@]}" "${user}@${host}" \
-		'$env:COMPUTERNAME; [bool](whoami /groups | Select-String "S-1-16-12288")' \
+		'$env:COMPUTERNAME; '"${WIN_ELEVATED_PS}" \
 		2>/dev/null | tr -d '\r')" || return 1
 	[[ ${out} == "${name}"$'\n'True ]] || return 1
 	printf '%s\n' "${user}@${host}"
+}
+
+# WIN_NEEDS_ADMIN -- the reason a step that needs admin was skipped: the
+# one wording both setup-system and install-deps print.
+# shellcheck disable=SC2034  # read by setup-system and install-deps
+WIN_NEEDS_ADMIN="needs admin -- re-run from an admin PowerShell"
+
+# win-admin-route ASSUME_YES -- how a step that needs admin runs on this
+# machine, as one word (and a destination), first match wins:
+#
+#   elevated    this process is elevated: run it directly, no prompt
+#   ssh DEST    the admin ssh channel (win-admin-channel), no prompt
+#   skip        ASSUME_YES is 1 (--yes, never prompt): skip, saying
+#               WIN_NEEDS_ADMIN
+#   uac         one UAC prompt (Start-Process -Verb RunAs)
+#
+# The ONE ladder: setup-system's sshd step and install-deps' Visual Studio
+# modify both take it, so --yes means the same in both. Only the step that
+# needs admin runs elevated; relaunching the whole run elevated would leave
+# files in the user's profile owned by Administrators, which git's
+# safe.directory and ~/.ssh's ACLs both refuse.
+#
+# Example:
+#   . windows.sh
+#   IFS=' ' read -r how dest <<<"$(win-admin-route 1)"
+win-admin-route() {
+	local chan
+	if win-elevated; then
+		echo elevated
+	elif chan="$(win-admin-channel)"; then
+		echo "ssh ${chan}"
+	elif [[ ${1:-0} -eq 1 ]]; then
+		echo skip
+	else
+		echo uac
+	fi
 }

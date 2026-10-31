@@ -7,8 +7,8 @@ here is one of those ways, and each must be REFUSED with nothing published.
 
 The fixture is a throwaway origin (a bare repo) and a clone. Each PR's head
 is pushed to ``refs/pull/<n>/head`` on the origin, as GitHub serves it, and
-``GH`` points the script at a fake that answers ``pr view``, ``repo view``
-and the review-thread query from a JSON state file and logs every call, so
+``GH`` points the script at a fake that answers ``pr view``, ``repo view``,
+the review-thread query and the closing-issues query from a JSON state file and logs every call, so
 a test can assert what was (and was not) created or closed. Stdlib only.
 """
 
@@ -20,9 +20,11 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import doctest
 import tempfile
 import textwrap
 import unittest
+from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "train.py"
@@ -41,6 +43,24 @@ FAKE_GH = textwrap.dedent(
         print(json.dumps({"nameWithOwner": "o/r"}))
     elif a[:2] == ["pr", "view"]:
         print(json.dumps(state["prs"][a[2]]))
+    elif a[:2] == ["api", "graphql"] and any(
+        "closingIssuesReferences" in x for x in a
+    ):
+        n = next(x[2:] for x in a if x.startswith("n="))
+        if n in state.get("closing_fail", []):
+            sys.exit("gh: HTTP 502: Bad Gateway")
+        if n in state.get("closing_error", []):
+            print(json.dumps({"data": {"repository": {"pullRequest": None}},
+                              "errors": [{"message": "timeout"}]}))
+            sys.exit(0)
+        nodes = [
+            {"number": int(r.split("#")[1]),
+             "repository": {"nameWithOwner": r.split("#")[0] or "o/r"}}
+            for r in state.get("closing", {}).get(n, [])
+        ]
+        print(json.dumps({"data": {"repository": {"pullRequest": {
+            "closingIssuesReferences": {
+                "totalCount": len(nodes), "nodes": nodes}}}}}))
     elif a[:2] == ["api", "graphql"]:
         n = next(x[2:] for x in a if x.startswith("n="))
         nodes = state.get("threads", {}).get(n, [])
@@ -98,7 +118,12 @@ class Fixture(unittest.TestCase):
         (self.work / "shared.txt").write_text("one\ntwo\nthree\n")
         self.commit("base")
         sh(self.work, "git", "push", "--quiet", "origin", "HEAD:main")
-        self.state = {"prs": {}, "threads": {}}
+        self.state: dict[str, Any] = {
+            "prs": {},
+            "threads": {},
+            "closing": {},
+            "closing_fail": [],
+        }
         self.log = self.tmp / "gh.log"
         fake = self.tmp / "gh"
         fake.write_text(FAKE_GH)
@@ -239,6 +264,91 @@ class Composes(Fixture):
         self.assertIn("#2", body)
 
 
+class CarriesClosingIssues(Fixture):
+    """A constituent is closed unmerged, and a PR closed unmerged closes
+    nothing, so the issues each one links must be declared by the train
+    itself (just-bashit#160 left three open)."""
+
+    def vendor_gate(self) -> None:
+        (self.work / "scripts").mkdir()
+        shutil.copy(
+            ROOT / "scripts" / "close-keywords.py",
+            self.work / "scripts" / "close-keywords.py",
+        )
+        self.commit("vendor the gate")
+        sh(self.work, "git", "push", "--quiet", "origin", "HEAD:main")
+
+    def body(self) -> str:
+        return pathlib.Path(str(self.log) + ".body").read_text()
+
+    def test_a_body_only_closing_issue_reaches_the_train(self) -> None:
+        # The commit carries no keyword: the PR description did, so only
+        # GitHub's closingIssuesReferences knows about #41.
+        self.pr(1, {"a.txt": "a\n"}, msg="change 1")
+        self.state["closing"]["1"] = ["#41"]
+        p = self.train("--push", "1")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("- Closes #41, from #1.\n", self.body())
+
+    def test_an_issue_two_prs_close_is_declared_once(self) -> None:
+        self.pr(1, {"a.txt": "a\n"}, msg="change 1")
+        self.pr(2, {"b.txt": "b\n"}, msg="change 2")
+        self.state["closing"]["1"] = ["#41", "#42"]
+        self.state["closing"]["2"] = ["#42"]
+        p = self.train("--push", "1", "2")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        body = self.body()
+        self.assertIn("- Closes #41, from #1.\n", body)
+        self.assertIn("- Closes #42, from #1 and #2.\n", body)
+        self.assertEqual(body.count("Closes #42"), 1)
+
+    def test_a_cross_repo_issue_keeps_its_owner(self) -> None:
+        self.pr(1, {"a.txt": "a\n"}, msg="change 1")
+        self.state["closing"]["1"] = ["x/y#7", "#8"]
+        p = self.train("--push", "1")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        body = self.body()
+        self.assertIn("- Closes x/y#7, from #1.\n", body)
+        self.assertIn("- Closes #8, from #1.\n", body)
+
+    def test_none_linked_adds_no_closing_line(self) -> None:
+        self.pr(1, {"a.txt": "a\n"}, msg="change 1")
+        p = self.train("--push", "1")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        body = self.body()
+        self.assertNotIn("Closes", body)
+        self.assertIn("None of its PRs links an issue.", body)
+
+    def test_the_landing_text_does_not_promise_rebase_carries_them(
+        self,
+    ) -> None:
+        self.assertNotIn("closing keywords", train.LAND_HOW)
+        self.assertIn("closed unmerged", train.LAND_HOW)
+
+    def test_the_keywords_gate_accepts_the_declared_lines(self) -> None:
+        # The gate runs on the train's own title and body. Each added line
+        # must read as a declaration, cross-repo included, or the gate
+        # refuses every train that carries an issue.
+        self.vendor_gate()
+        self.pr(1, {"a.txt": "a\n"}, msg="change 1")
+        self.pr(2, {"b.txt": "b\n"}, msg="change 2")
+        self.state["closing"]["1"] = ["#41", "x/y#7"]
+        self.state["closing"]["2"] = ["#41"]
+        p = self.train("--push", "1", "2")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("closing references: 2, each one declared", p.stdout)
+
+    def test_a_train_declares_what_its_commits_close(self) -> None:
+        # A commit's mid-sentence keyword is not a declaration on its own,
+        # but GitHub's parse links the issue to the PR, and the train's
+        # line declares it, so the gate passes and the issue is closed.
+        self.vendor_gate()
+        self.pr(1, {"a.txt": "a\n"}, msg="change 1\n\nThis fixes #9 here.")
+        self.state["closing"]["1"] = ["#9"]
+        p = self.train("--push", "1")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+
+
 class Refuses(Fixture):
     def test_a_conflicting_pair(self) -> None:
         self.pr(1, {"shared.txt": "one\nTWO\nthree\n"})
@@ -340,6 +450,34 @@ class Refuses(Fixture):
         self.assertRefused(
             self.train("--push", "1"), "close-keywords-check refused"
         )
+
+
+    def test_unreadable_closing_issues(self) -> None:
+        # Absent output is not a pass: a train that cannot see what its
+        # PRs close must not open and silently leave those issues open.
+        self.pr(1, {"a.txt": "a\n"})
+        self.pr(2, {"b.txt": "b\n"})
+        self.state["closing_fail"] = ["2"]
+        self.assertRefused(
+            self.train("--push", "1", "2"), "Bad Gateway"
+        )
+
+    def test_a_graphql_error_reply(self) -> None:
+        # A reply with no list in it, as GraphQL gives alongside "errors",
+        # is refused like a failed call, not read as "nothing linked".
+        self.pr(1, {"a.txt": "a\n"})
+        self.state["closing_error"] = ["1"]
+        self.assertRefused(
+            self.train("--push", "1"), "cannot read the issues it closes"
+        )
+
+
+def load_tests(
+    loader: unittest.TestLoader, tests: unittest.TestSuite, _: object
+) -> unittest.TestSuite:
+    """train.py's doctests run with the rest."""
+    tests.addTests(doctest.DocTestSuite(train))
+    return tests
 
 
 class SameCommit(unittest.TestCase):

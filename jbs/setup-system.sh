@@ -286,7 +286,7 @@ _asset() {
 # to co-fetch and nothing updates it, so one older than a library -- windows.sh
 # against a 0.4.1 jbx, measured on zen-ai445 -- would otherwise die here on a
 # missing file (#75).
-for _lib in toml.sh file.sh windows.sh jbx-shell.sh; do
+for _lib in toml.sh file.sh windows.sh jbx-shell.sh pkg.sh; do
 	_lib_path="$(_asset "${_lib}")" || exit 1
 	# shellcheck source=/dev/null
 	source "${_lib_path}"
@@ -1397,20 +1397,39 @@ _git_identity() {
 	_run git config --global "${key}" "${value}"
 }
 
+# Directories a step put on THIS run's PATH that the calling shell lacks:
+# the end of the run asks for a reload over them, and the jbx shell function
+# puts each on the caller's PATH (its marker's `path` line).
+_PATH_ADDED=()
+
 # tools — uv, then this repo's pre-commit hooks if that applies here.
+#
+# uv comes from pkg.sh's install-uv, which get-jb.sh and jbx share: winget
+# on Windows, so ARM64 gets the native build from an emulated x64 shell
+# (#171), astral's install.sh elsewhere. The directory it prints goes first
+# on this run's PATH, so the hooks below and the installed report find uv.
 step_tools() {
 	_head "tools — dev bootstrap"
 
+	local uv_dir
 	if _have uv; then
 		_info "uv already installed ($(uv --version 2>/dev/null || echo ok))"
-	elif ! _have curl; then
-		_warn "curl not installed — cannot install uv"
+	elif [[ ${DRY_RUN} -eq 1 ]]; then
+		_info "would run: $(install-uv -n)"
 	else
 		_info "installing uv"
-		if [[ ${DRY_RUN} -eq 1 ]]; then
-			_info "would run: curl -LsSf https://astral.sh/uv/install.sh | sh"
+		if uv_dir="$(install-uv)"; then
+			case ":${PATH}:" in
+			*":${uv_dir}:"*) ;;
+			*)
+				PATH="${uv_dir}:${PATH}"
+				_PATH_ADDED+=("${uv_dir}")
+				;;
+			esac
+			hash -r
+			_info "uv installed in ${uv_dir}"
 		else
-			curl -LsSf https://astral.sh/uv/install.sh | sh
+			_warn "uv was not installed"
 		fi
 	fi
 
@@ -1827,6 +1846,11 @@ case ":${PATH}:" in
 	done
 	;;
 esac
+# And a directory a step put on this run's PATH: winget's Links, where it
+# installed uv on Windows, reaches the USER PATH and so only new shells.
+for _d in "${_PATH_ADDED[@]+"${_PATH_ADDED[@]}"}"; do
+	_reload_because "${_d} is not on this shell's PATH"
+done
 if [[ ${#_RELOAD[@]} -gt 0 ]]; then
 	# Run through the `jbx` shell function (jbx-shell.sh), which exported
 	# JB_CALLER_APPLIES: tell it what to apply, in its marker, and it sources
@@ -1840,6 +1864,9 @@ if [[ ${#_RELOAD[@]} -gt 0 ]]; then
 			[[ -r "${PREFIX}/profile.sh" ]] && printf 'profile %s\n' "${PREFIX}/profile.sh"
 			[[ -r "${PREFIX}/bashrc.sh" ]] && printf 'bashrc %s\n' "${PREFIX}/bashrc.sh"
 			printf 'path %s\n' "${HOME}/.local/bin"
+			for _d in "${_PATH_ADDED[@]+"${_PATH_ADDED[@]}"}"; do
+				printf 'path %s\n' "${_d}"
+			done
 		} >"${_mark}"
 		_say "jbx applies this to your shell when setup-system exits:"
 	else

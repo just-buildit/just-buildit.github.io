@@ -505,6 +505,50 @@ function Install-SshdCapability {
     Add-WindowsCapability -Online -Name $cap.Name | Out-Null
 }
 
+# ---------------------------------------------------------------------------
+# The machine's architecture, for the PowerShell MSI (#171).
+# ---------------------------------------------------------------------------
+
+# Where Windows keeps the machine's own PROCESSOR_ARCHITECTURE. The process
+# environment variable is a fact about the PROCESS: an x64 process emulated
+# on ARM64 Windows (one started from x64 Git Bash, say) sees AMD64 there, an
+# empty PROCESSOR_ARCHITEW6432 (which covers only x86 on a 64-bit OS), and
+# OSArchitecture X64. This registry value is not virtualised and reads ARM64
+# from that same emulated process (measured on an ARM64 Windows 11 box,
+# 2026-10-31).
+$MachineArchKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
+
+function Get-MachineArch {
+    <#
+    .SYNOPSIS
+        The PowerShell MSI architecture suffix for this MACHINE: 'arm64' or
+        'x64'. Throws for any other architecture, which has no MSI.
+    .DESCRIPTION
+        The registry value first ($MachineArchKey), which is the machine's
+        whatever the calling process is emulated as. The environment
+        variables only when that read fails: PROCESSOR_ARCHITEW6432 (the
+        real architecture of an x86 process on a 64-bit OS), then
+        PROCESSOR_ARCHITECTURE.
+    .EXAMPLE
+        Get-MachineArch   # 'arm64' on ARM64 Windows, even from x64 Git Bash
+    #>
+    $machine = $null
+    try {
+        $machine = (Get-ItemProperty -LiteralPath $MachineArchKey `
+                -Name PROCESSOR_ARCHITECTURE -ErrorAction Stop).PROCESSOR_ARCHITECTURE
+    }
+    catch {
+        $machine = $null
+    }
+    if (-not $machine) { $machine = $env:PROCESSOR_ARCHITEW6432 }
+    if (-not $machine) { $machine = $env:PROCESSOR_ARCHITECTURE }
+    switch ($machine) {
+        'ARM64' { 'arm64' }
+        'AMD64' { 'x64' }
+        default { throw "no PowerShell MSI for architecture $machine" }
+    }
+}
+
 # The test suite dot-sources this file for the functions above and must not
 # fall through into the part that changes the machine.
 if ($MyInvocation.InvocationName -eq '.') { return }
@@ -675,15 +719,8 @@ if (-not (Test-Path -LiteralPath $pwsh)) {
     if (-not $PwshVersion) {
         throw "pwsh.exe is not installed and no -PwshVersion was given to install"
     }
-    # The MACHINE's architecture: an emulated x86 process reports x86 in
-    # PROCESSOR_ARCHITECTURE and the real one in PROCESSOR_ARCHITEW6432.
-    $machine = $env:PROCESSOR_ARCHITEW6432
-    if (-not $machine) { $machine = $env:PROCESSOR_ARCHITECTURE }
-    switch ($machine) {
-        'ARM64' { $arch = 'arm64' }
-        'AMD64' { $arch = 'x64' }
-        default { throw "no PowerShell MSI for architecture $machine" }
-    }
+    # The MACHINE's architecture, not this process's (see Get-MachineArch).
+    $arch = Get-MachineArch
     $msiName = "PowerShell-$PwshVersion-win-$arch.msi"
     $msi = Join-Path $env:TEMP $msiName
     $msiUrl = "https://github.com/PowerShell/PowerShell/releases/download/v$PwshVersion/$msiName"

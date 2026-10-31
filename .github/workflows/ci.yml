@@ -346,6 +346,15 @@ jobs:
           grep -q "after:  *D tracked" "$tmp/log" || { cat "$tmp/log"; echo "::error::foreign-owned: not named"; exit 1; }
           git -C "$tmp" checkout -q -- tracked
 
+          # `make -n test` shows the suite and runs nothing: the guard's
+          # sub-make is visible to a dry run (`+`), so a plan reader sees TEST_CMD.
+          mk 'touch ran-the-suite' 'touch ran-fast'
+          make -n -C "$tmp" test > "$tmp/log" 2>&1 || { cat "$tmp/log"; echo "::error::make -n test failed"; exit 1; }
+          grep -q 'touch ran-the-suite' "$tmp/log" || { cat "$tmp/log"; echo "::error::make -n test hid the suite"; exit 1; }
+          make -n -C "$tmp" test-fast > "$tmp/log" 2>&1 && grep -q 'touch ran-fast' "$tmp/log" \
+            || { cat "$tmp/log"; echo "::error::make -n test-fast hid the suite"; exit 1; }
+          [ ! -e "$tmp/ran-the-suite" ] && [ ! -e "$tmp/ran-fast" ] || { echo "::error::a dry run ran the suite"; exit 1; }
+
           # Not a git checkout: said so, and the suite still runs.
           rm -rf "$tmp/.git"; mk '@echo ran-the-suite'
           make -C "$tmp" test > "$tmp/log" 2>&1 || { cat "$tmp/log"; echo "::error::no-git run failed"; exit 1; }

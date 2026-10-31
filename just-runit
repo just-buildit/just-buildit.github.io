@@ -453,7 +453,26 @@ _err() {
 # ---- namespace resolution ---------------------------------------------------
 
 # Parse aliases.toml from NS_BASE/aliases.toml and look up a name.
-# Returns the resolved URL, or empty string if not found.
+# Prints the resolved URL, or nothing when the file was read and does not list
+# the name -- the one case in which the caller may fall through to the direct
+# probe.
+#
+# A file that could not be had is never that case (just-bashit#164). Every
+# built-in namespace serves an aliases.toml, so a failed fetch -- after
+# _curl_get's bounded retries -- or an HTTP error is refused, naming the URL
+# and curl's message. Read as "not listed" instead, a blip fetching it sent
+# `jbx install-deps` to the org root's mirror copy of install-deps.sh, which
+# cannot run without the libraries beside it ("toml.sh: No such file").
+# What was fetched must also read as an aliases file -- it has an [aliases]
+# table -- so a 200 that is not one (a captive portal, a cache written by a
+# jbx without --fail) is refused too.
+#
+# A cached copy past its TTL is the one fallback: if the refetch fails, the
+# last good copy answers, with a warning naming the URL. It was fetched and
+# checked in full, so it can be out of date but not wrong, and an outdated
+# alias is a valid source where the probe is not. Its timestamp is left
+# alone, so the next run retries. -r and -n ask for a fresh copy, so under
+# them a failed refetch is refused.
 #
 # Under -n the file goes to main's per-run directory, never the cache, and as
 # that directory starts empty it is always fetched fresh (just-bashit#122).
@@ -467,18 +486,30 @@ _lookup_alias() {
 		aliases_cache="${_NO_CACHE_DIR}/aliases-${key}.toml"
 	fi
 
-	if [[ ${OPT_REFRESH} -eq 1 ]] || ! _cache_valid "${aliases_cache}"; then
+	if [[ ${OPT_REFRESH} -eq 1 ]] || ! _cache_valid "${aliases_cache}" ||
+		! _is_aliases_file "${aliases_cache}"; then
 		mkdir -p "${aliases_cache%/*}"
 		_log "fetching ${aliases_url}"
-		if ! curl -sSL "${_CURL_TLS[@]+"${_CURL_TLS[@]}"}" --proto '=https' --tlsv1.2 --max-time 10 \
-			-o "${aliases_cache}.new" "${aliases_url}" 2>/dev/null; then
-			rm -f "${aliases_cache}.new"
-			echo ""
-			return
+		local why="" rc=0
+		why=$(_curl_get "${aliases_url}" "${aliases_cache}.new" 2>&1) || rc=$?
+		if [[ ${rc} -eq 0 ]] && ! _is_aliases_file "${aliases_cache}.new"; then
+			rc=1 why="the response has no [aliases] table"
 		fi
-		mv "${aliases_cache}.new" "${aliases_cache}"
-		printf 'ts=%s\nurl=%s\n' "$(date +%s)" "${aliases_url}" \
-			>"$(_meta_path "${aliases_cache}")"
+		if [[ ${rc} -ne 0 ]]; then
+			rm -f "${aliases_cache}.new"
+			why="${why//$'\n'/ }"
+			why="${why:-curl exit ${rc}}"
+			if [[ ${OPT_REFRESH} -eq 0 && ${OPT_NO_CACHE} -eq 0 ]] &&
+				_is_aliases_file "${aliases_cache}"; then
+				echo "${_ME}: warning: could not refetch ${aliases_url} (${why}); using the cached copy" >&2
+			else
+				_err "could not fetch ${aliases_url} (${why}); refusing to guess where '${name}' is served from"
+			fi
+		else
+			mv "${aliases_cache}.new" "${aliases_cache}"
+			printf 'ts=%s\nurl=%s\n' "$(date +%s)" "${aliases_url}" \
+				>"$(_meta_path "${aliases_cache}")"
+		fi
 	fi
 
 	# Parse: find key under [aliases] section. Pure bash, not awk: this is
@@ -516,6 +547,16 @@ _lookup_alias() {
 	done <"${aliases_cache}"
 }
 
+# _is_aliases_file FILE -- is FILE there, with an [aliases] table?
+_is_aliases_file() {
+	local line
+	[[ -f ${1} ]] || return 1
+	while IFS= read -r line || [[ -n ${line} ]]; do
+		[[ ${line} == '[aliases]'* ]] && return 0
+	done <"${1}"
+	return 1
+}
+
 # Probe whether a URL exists (HEAD, no download).  Returns 0 if 2xx/3xx.
 _head_ok() {
 	local url="${1}"
@@ -545,7 +586,9 @@ _resolve_ns() {
 
 	# 1. Check aliases.toml first (one cached round-trip covers all names).
 	local alias_url
-	alias_url=$(_lookup_alias "${base}" "${name}")
+	# `|| exit`: errexit does not reach into a command substitution, so a
+	# refusal _lookup_alias made would otherwise be dropped right here.
+	alias_url=$(_lookup_alias "${base}" "${name}") || exit 1
 	if [[ -n ${alias_url} ]]; then
 		_log "resolved '${name}' via aliases.toml -> ${alias_url}"
 		echo "${alias_url}"
@@ -773,6 +816,18 @@ _curl_retry_opts_init() {
 	fi
 }
 
+# _curl_get URL DEST -- the one bounded, fail-closed download every fetch
+# makes: --fail, so an HTTP error is a failure and no error body reaches DEST,
+# and the probed retry flags above, so a transient blip is retried a bounded
+# number of times. Returns curl's exit status; curl's own message (-sS) goes
+# to stderr. A caller decides what a failure means.
+_curl_get() {
+	_curl_retry_opts_init
+	curl -sSL --fail --proto '=https' --tlsv1.2 "${_CURL_TLS[@]+"${_CURL_TLS[@]}"}" \
+		"${_CURL_RETRY_OPTS[@]}" --connect-timeout 30 \
+		-o "${2}" "${1}"
+}
+
 _fetch_to() {
 	local url="${1}" dest="${2}"
 	_log "fetching ${url}"
@@ -782,9 +837,7 @@ _fetch_to() {
 	# as the script ("line 1: 400: command not found"). --fail emits no body
 	# and returns non-zero on >=400, and the retries ride out transient
 	# throttling so a blip retries instead of reddening the build.
-	_curl_retry_opts_init
-	if ! curl -sSL --fail "${_CURL_TLS[@]+"${_CURL_TLS[@]}"}" "${_CURL_RETRY_OPTS[@]}" --connect-timeout 30 \
-		-o "${dest}" "${url}"; then
+	if ! _curl_get "${url}" "${dest}"; then
 		rm -f "${dest}"
 		_err "fetch failed (no usable response from ${url})"
 	fi
@@ -847,29 +900,57 @@ _acquire() {
 		return
 	fi
 
+	local file
 	# -n: into the directory main made, which main's EXIT trap removes. A
 	# trap set HERE belongs to the $(...) subshell every caller runs this
 	# in, and fired as the substitution returned: the script was deleted
 	# before it ran (just-bashit#118).
 	if [[ ${OPT_NO_CACHE} -eq 1 ]]; then
-		local tmp
-		tmp="${_NO_CACHE_DIR}/script$(_cache_ext "${url}")"
-		_fetch_to "${url}" "${tmp}"
-		echo "${tmp}"
+		file="${_NO_CACHE_DIR}/script$(_cache_ext "${url}")"
+		_fetch_to "${url}" "${file}"
+	else
+		mkdir -p "${_CACHE_DIR}"
+		file=$(_cache_path "${url}")
+		if [[ ${OPT_REFRESH} -eq 1 ]] || ! _cache_valid "${file}"; then
+			_fetch_to "${url}" "${file}"
+		else
+			_log "cache hit: ${file}"
+		fi
+	fi
+
+	# A just-bashit script the org serves outside _JBS_BASE runs only beside
+	# its libraries, which a lone fetch never brings. The org root keeps a
+	# byte-identical copy of install-deps.sh for anyone who hardcoded its URL
+	# (just-buildit.github.io mirror.yml); fetched by itself it dies on its
+	# first line, `source "${_SCRIPT_DIR}/toml.sh"` (just-bashit#164). So a
+	# script there that sources one of _JBS_LIBS from its own directory is
+	# run as what it is, through the co-fetch, from _JBS_BASE. Scoped to the
+	# org's own pages: a script elsewhere is its author's, and jbx does not
+	# second-guess its layout.
+	local rest="${url#"${_JB_DEFAULT_BASE}"/}"
+	if [[ ${url} == "${_JB_DEFAULT_BASE}/"*.sh && ${rest} != */* ]] &&
+		_sources_jbs_lib "${file}"; then
+		_log "${url} is a just-bashit script; co-fetching it from ${_JBS_BASE}"
+		_acquire_jbs "${rest%.sh}"
 		return
 	fi
 
-	mkdir -p "${_CACHE_DIR}"
-	local cached
-	cached=$(_cache_path "${url}")
+	echo "${file}"
+}
 
-	if [[ ${OPT_REFRESH} -eq 1 ]] || ! _cache_valid "${cached}"; then
-		_fetch_to "${url}" "${cached}"
-	else
-		_log "cache hit: ${cached}"
-	fi
-
-	echo "${cached}"
+# _sources_jbs_lib FILE -- does FILE source one of _JBS_LIBS from a directory
+# variable, as `source "${_SCRIPT_DIR}/toml.sh"`? That is how a just-bashit
+# script reaches the siblings it is shipped beside.
+_sources_jbs_lib() {
+	local line lib
+	local re='^[[:space:]]*(source|\.)[[:space:]]+"\$\{[A-Za-z_][A-Za-z0-9_]*\}/([A-Za-z0-9_-]+)\.sh"'
+	while IFS= read -r line || [[ -n ${line} ]]; do
+		[[ ${line} =~ ${re} ]] || continue
+		for lib in "${_JBS_LIBS[@]}"; do
+			[[ ${BASH_REMATCH[2]} == "${lib}" ]] && return 0
+		done
+	done <"${1}"
+	return 1
 }
 
 # ---- checksum ---------------------------------------------------------------

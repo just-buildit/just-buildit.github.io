@@ -62,7 +62,7 @@ _jb_install() {
 	trap "rm -f '${tmp_runit}'" RETURN
 
 	_jb_say "fetching jb from ${RUNIT_URL}"
-	if ! curl -sSL --proto '=https' --tlsv1.2 -o "${tmp_runit}" "${RUNIT_URL}"; then
+	if ! curl -sSL --fail --proto '=https' --tlsv1.2 -o "${tmp_runit}" "${RUNIT_URL}"; then
 		printf "\033[1;31m  !!  \033[0mfailed to download jb\n" >&2
 		return 1
 	fi

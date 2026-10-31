@@ -100,6 +100,30 @@ fi
 : "${VISUAL:=${EDITOR:-vi}}"
 export VISUAL
 
+# ---------------------------------------------------------------------------
+# SSL / TLS certificate bundle -- WSL only.
+#
+# On WSL, setup-system's certs step puts Windows' trusted roots (a corporate
+# TLS-inspection root among them) into the system bundle. A tool that ships
+# its own bundle, such as uv, reads the system one only when SSL_CERT_FILE
+# names it, so it is set here when unset. Off WSL nothing is
+# changed: there the distro's defaults are already what the machine trusts.
+# JB_PROC_VERSION and JB_CERTS_ROOT are the test suite's, as in setup-system.
+# ---------------------------------------------------------------------------
+if [ -z "${SSL_CERT_FILE:-}" ] &&
+	grep -qi microsoft "${JB_PROC_VERSION:-/proc/version}" 2>/dev/null; then
+	for _jb_bundle in \
+		"${JB_CERTS_ROOT:-}/etc/ssl/certs/ca-certificates.crt" \
+		"${JB_CERTS_ROOT:-}/etc/pki/tls/certs/ca-bundle.crt"; do
+		if [ -r "${_jb_bundle}" ]; then
+			SSL_CERT_FILE="${_jb_bundle}"
+			export SSL_CERT_FILE
+			break
+		fi
+	done
+	unset _jb_bundle
+fi
+
 if command -v less >/dev/null 2>&1; then
 	export PAGER=less
 	# -R real colours, -i smart-case search, -M verbose status line,

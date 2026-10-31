@@ -28,6 +28,9 @@ jobs:
           set -euo pipefail
           declare -A SOURCES=(
             [get-jb.sh]="https://raw.githubusercontent.com/just-buildit/just-bashit/main/src/just_bashit/get-jb.sh"
+            # The PowerShell front door (just-bashit#172): `irm .../get-jb.ps1 | iex`
+            # on native Windows, beside get-jb.sh at the root.
+            [get-jb.ps1]="https://raw.githubusercontent.com/just-buildit/just-bashit/main/src/just_bashit/get-jb.ps1"
             [just-runit]="https://raw.githubusercontent.com/just-buildit/just-bashit/main/src/just_bashit/just-runit"
             # Shadowed by the aliases.toml entry pointing at jbs/, so this
             # copy is only reached if that fetch fails -- and it sat at

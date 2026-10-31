@@ -1,6 +1,6 @@
 # Mirror artifacts are synced verbatim from just-bashit by mirror.yml — never
 # reformat them here or they drift from source. Everything else is hand-owned.
-exclude: ^(jbs/|get-jb\.sh|just-runit|install-deps\.sh)
+exclude: ^(jbs/|get-jb\.sh|get-jb\.ps1|just-runit|install-deps\.sh)
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks

@@ -1080,7 +1080,20 @@ _scan_defs() {
 			((sp)) && top="${st[sp - 1]}"
 			case "${top}" in
 			SQ | AQ | BT | DQ | PE | AR | AP) ;;
-			DB) _tl_endword ;;
+			DB)
+				# A [[ ]] may span lines, so a newline inside one is not a
+				# separator. But when the line's last word is the ]] that
+				# closes it, the newline after it IS one: without it the
+				# next line's `}` read as an argument, and a function whose
+				# body ended in `[[ ... ]]` never closed (just-bashit#132's
+				# `_certs_have_updater`).
+				_tl_endword
+				top=""
+				((sp)) && top="${st[sp - 1]}"
+				if [[ ${top} != DB ]]; then
+					_tl_sep nl || return 1
+				fi
+				;;
 			*) _tl_sep nl || return 1 ;;
 			esac
 		fi

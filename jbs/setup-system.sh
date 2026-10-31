@@ -430,13 +430,18 @@ read -r -d '' _BASELINE_TOML <<-'EOF' || true
 	# Native Windows: clang-cl, the toolchain just-makeit and doppler build
 	# Windows with, plus CMake, Git (Git Bash, the bash host) and PowerShell 7
 	# (pwsh: the .ps1 gates, and the shell a Windows user works in). clang-cl
-	# also needs the MSVC Build Tools' C++ workload, which winget installs
-	# only with an --override this manifest has no way to pass yet -- see
-	# #67. Windows 10+ ships tar.exe and curl.exe itself. Installed from Git
-	# Bash directly, and from MSYS2 too: step_deps runs this section there as
-	# well, since msys2's own section no longer carries a compiler.
+	# links against the MSVC libraries and the Windows SDK, which are the
+	# Build Tools' C++ workload: the id alone installs only the installer
+	# shell, so its table names the workload, and install-deps probes for it
+	# with vswhere and adds it to a shell that lacks it (#67). Windows 10+
+	# ships tar.exe and curl.exe itself. Installed from Git Bash directly,
+	# and from MSYS2 too: step_deps runs this section there as well, since
+	# msys2's own section no longer carries a compiler.
 	[baseline.winget]
-	packages = ["Kitware.CMake", "Git.Git", "LLVM.LLVM", "Microsoft.PowerShell"]
+	packages = ["Kitware.CMake", "Git.Git", "LLVM.LLVM", "Microsoft.PowerShell", "Microsoft.VisualStudio.BuildTools"]
+
+	[baseline.winget."Microsoft.VisualStudio.BuildTools"]
+	vs_requires = ["Microsoft.VisualStudio.Workload.VCTools"]
 
 	# MSYS2 as the BASH HOST only. Its MinGW gcc toolchain is gone
 	# (2026-10-03): just-makeit and doppler build native Windows with
@@ -1110,6 +1115,17 @@ _sshd_github_user() {
 	printf '%s\n' "${u}"
 }
 
+# _sshd_failed LOG DEFAULT — the summary line for a failed run: the reason
+# windows-sshd.ps1 stopped on when it names one in LOG, else DEFAULT. The
+# script starts that refusal "reboot pending:" (Install-SshdCapability).
+_sshd_failed() {
+	local why="$2"
+	if grep -q 'reboot pending:' "$1" 2>/dev/null; then
+		why="Windows reboot pending: reboot, then re-run setup-system -s sshd"
+	fi
+	_result "sshd:    failed (${why})"
+}
+
 step_sshd() {
 	_head "sshd — Windows OpenSSH server, started at boot"
 
@@ -1225,15 +1241,16 @@ step_sshd() {
 		# ends with (measured on yoga-x2p).
 		local rc=0
 		# WIN_SSH_OPTS comes from windows.sh; ps_args expands HERE on purpose
-		# (it was checked above to hold no quote).
+		# (it was checked above to hold no quote). Teed to log.txt, errors
+		# included, so the summary can name the reason the script stopped.
 		# shellcheck disable=SC2154,SC2029
 		ssh "${WIN_SSH_OPTS[@]}" "${chan}" \
-			"& (Join-Path \$env:TEMP 'jb-windows-sshd\\windows-sshd.ps1') ${ps_args}" |
-			tr -d '\r' || rc=$?
+			"& (Join-Path \$env:TEMP 'jb-windows-sshd\\windows-sshd.ps1') ${ps_args}" 2>&1 |
+			tr -d '\r' | tee "${dir}/log.txt" || rc=$?
 		if [[ ${rc} -eq 0 ]]; then
 			_result "sshd:    ok (keys from github.com/${user}.keys, over ssh)"
 		else
-			_result "sshd:    failed (see above)"
+			_sshd_failed "${dir}/log.txt" "see above"
 		fi
 		return 0
 	fi
@@ -1280,7 +1297,7 @@ step_sshd() {
 		_warn "the elevated run did not start — was the UAC prompt declined?"
 		_result "sshd:    failed (not elevated)"
 	else
-		_result "sshd:    failed (see the log above)"
+		_sshd_failed "${dir}/log.txt" "see the log above"
 	fi
 }
 

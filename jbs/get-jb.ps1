@@ -41,8 +41,16 @@
     a machine that only has 5.1 today gets pwsh 7 from setup-system, and
     jbx should work there the moment it is installed. Documents is resolved
     through Windows, so a OneDrive-redirected Documents folder is honoured.
-    JB_PS_PROFILE names one file to use instead (tests, or a custom
+    JB_PS_PROFILE names the file to use instead (tests, or a custom
     profile).
+
+    A profile that cannot be read is never written: its content may exist
+    nowhere else. The usual case is a OneDrive online-only file under a
+    Documents folder OneDrive still redirects after it was uninstalled --
+    reading it needs OneDrive, and it is not running (#202). Each such
+    profile is named on one line with the fix; the other profile, the
+    driver and this session's jbx are still set up, and the run then ends
+    in one thrown error naming every profile it skipped.
 
     How arguments cross. A Windows program hands bash one command line,
     which the MSYS runtime splits with rules of its own: it globs `*`,
@@ -59,7 +67,8 @@
     directory on the Windows PATH that this window predates (#179).
 
     Environment:
-      JB_PS_PROFILE   the one profile file to write (default: both editions')
+      JB_PS_PROFILE   the profile file(s) to write, separated like PATH
+                      (default: both editions')
       JB_BASH         use this bash; skips the search (tests)
       JB_WINGET       use this winget; empty means "no winget" (tests)
       JB_GET_JB_URL   where get-jb.sh comes from
@@ -224,12 +233,16 @@ function Get-JbProfilePath {
     .SYNOPSIS
         The profile files the jbx block goes in.
     .DESCRIPTION
-        JB_PS_PROFILE, when set, is the only one. On Windows, otherwise,
-        the CurrentUserAllHosts profile of both editions -- 5.1 and 7 read
-        different files -- under Documents as Windows resolves it. Elsewhere
-        (pwsh on Linux or macOS), this host's own.
+        JB_PS_PROFILE, when set, names the only ones: one path, or several
+        separated like PATH (`;` on Windows, `:` elsewhere). On Windows,
+        otherwise, the CurrentUserAllHosts profile of both editions -- 5.1
+        and 7 read different files -- under Documents as Windows resolves
+        it. Elsewhere (pwsh on Linux or macOS), this host's own.
     #>
-    if ($env:JB_PS_PROFILE) { return $env:JB_PS_PROFILE }
+    if ($env:JB_PS_PROFILE) {
+        return @($env:JB_PS_PROFILE -split [regex]::Escape([IO.Path]::PathSeparator) |
+            Where-Object { $_ })
+    }
     if (Test-JbWindows) {
         $docs = [Environment]::GetFolderPath('MyDocuments')
         Join-Path $docs 'WindowsPowerShell\profile.ps1'
@@ -390,27 +403,94 @@ function Merge-JbProfileBlock {
     , $kept.ToArray()
 }
 
+function Read-JbProfile {
+    <#
+    .SYNOPSIS
+        A profile's text and encoding; throws when the file cannot be read.
+    .DESCRIPTION
+        Its own function so a test can make the read fail: there is no
+        portable way to make a real OneDrive placeholder (#202).
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    $reader = New-Object System.IO.StreamReader($Path, $utf8, $true)
+    try {
+        $text = $reader.ReadToEnd()
+        [pscustomobject]@{ Text = $text; Encoding = $reader.CurrentEncoding }
+    } finally { $reader.Dispose() }
+}
+
+function Get-JbUnreadableReason {
+    <#
+    .SYNOPSIS
+        One line naming an unreadable profile, why, and what to do.
+    .DESCRIPTION
+        A OneDrive online-only file is told apart from any other failure
+        two ways, either enough: its attributes (RecallOnDataAccess
+        0x400000 or Offline 0x1000, read with GetAttributes, which does not
+        open the file and so recalls nothing), or the error itself being
+        ERROR_CLOUD_FILE_PROVIDER_NOT_RUNNING (0x8007016A) anywhere in the
+        exception chain.
+
+        The attributes alone are not a reason to skip a file unread: with
+        OneDrive running, reading a placeholder downloads it and works, and
+        nothing here can tell that OneDrive is the provider or that it runs.
+        So the read is always tried, and the attributes only word the
+        failure.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$Exception)
+    $cloud = $false
+    try {
+        $attr = [int][IO.File]::GetAttributes($Path)
+        if ($attr -band (0x400000 -bor 0x1000)) { $cloud = $true }
+    } catch { $cloud = $false }
+    $e = $Exception
+    $detail = $Exception.Message
+    while ($e) {
+        if ($e.HResult -eq -2147024534) { $cloud = $true }
+        $detail = $e.Message
+        $e = $e.InnerException
+    }
+    if ($cloud) {
+        return ("get-jb.ps1: skipped $Path -- it is an online-only OneDrive " +
+            "file and OneDrive is not running or is uninstalled, so it cannot " +
+            "be read, and jb never overwrites a profile it cannot read. To fix: " +
+            "recover it from onedrive.com if you want its content, then delete " +
+            "the placeholder (or reinstall OneDrive to download it), and re-run " +
+            "the one-liner.")
+    }
+    "get-jb.ps1: skipped $Path -- it could not be read ($($detail.Trim())), " +
+        "and jb never overwrites a profile it cannot read. Fix what stops it " +
+        "being read, then re-run the one-liner."
+}
+
 function Write-JbProfile {
     <#
     .SYNOPSIS
         Write the block into one profile file, keeping its encoding and its
-        line endings.
+        line endings. Returns why it did not, or nothing.
     .DESCRIPTION
         Windows PowerShell 5.1's `>` writes UTF-16, and a profile may be
         UTF-8 with or without a BOM; whatever the file is, it stays that.
         A new file is UTF-8 without a BOM (the block is ASCII, which every
         edition reads the same way).
+
+        A file that exists and cannot be read is left exactly as it is, and
+        the one-line reason is returned for the caller to report (#202):
+        writing would replace content that may live only in the cloud.
     #>
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string[]]$Body)
     $enc = New-Object System.Text.UTF8Encoding($false)
     $nl = [Environment]::NewLine
     $existing = @()
     if (Test-Path -LiteralPath $Path) {
-        $reader = New-Object System.IO.StreamReader($Path, $enc, $true)
         try {
-            $text = $reader.ReadToEnd()
-            $enc = $reader.CurrentEncoding
-        } finally { $reader.Dispose() }
+            $read = Read-JbProfile -Path $Path
+        } catch {
+            return (Get-JbUnreadableReason -Path $Path -Exception $_.Exception)
+        }
+        $text = $read.Text
+        $enc = $read.Encoding
         if ($text -match "`r`n") { $nl = "`r`n" } elseif ($text -match "`n") { $nl = "`n" }
         $existing = @($text -split "`r?`n")
     } else {
@@ -421,6 +501,27 @@ function Write-JbProfile {
     }
     $lines = Merge-JbProfileBlock -Existing $existing -Body $Body
     [IO.File]::WriteAllText($Path, (($lines -join $nl) + $nl), $enc)
+}
+
+function Write-JbProfileAll {
+    <#
+    .SYNOPSIS
+        Write the block into each profile; return the ones skipped.
+    .DESCRIPTION
+        One unreadable profile does not stop the others: each is reported
+        as it is met, and the caller fails the run once the rest of the
+        install is done.
+    #>
+    param([Parameter(Mandatory)][string[]]$Path, [Parameter(Mandatory)][string[]]$Body)
+    foreach ($p in $Path) {
+        $why = Write-JbProfile -Path $p -Body $Body
+        if ($why) {
+            Write-Warning $why
+            $p
+        } else {
+            Write-Information "  ok  jbx function in $p"
+        }
+    }
 }
 
 function Write-JbBanner {
@@ -522,10 +623,7 @@ function Install-JustBashit {
     [IO.File]::WriteAllText($driver, $lf, (New-Object System.Text.UTF8Encoding($false)))
 
     $block = Get-JbProfileBlock -Bash $bash -Driver $driver
-    foreach ($p in @(Get-JbProfilePath)) {
-        Write-JbProfile -Path $p -Body $block
-        Write-Information "  ok  jbx function in $p"
-    }
+    $skipped = @(Write-JbProfileAll -Path @(Get-JbProfilePath) -Body $block)
     . ([scriptblock]::Create($block -join "`n"))
 
     if (Test-JbWindows) {
@@ -543,6 +641,12 @@ function Install-JustBashit {
     just-runit --version
     if ($LASTEXITCODE -ne 0) {
         throw "get-jb.ps1: jbx was installed but did not run (exit $LASTEXITCODE)."
+    }
+    if ($skipped.Count -gt 0) {
+        throw ("get-jb.ps1: jbx works in this session, but its function was " +
+            "NOT added to $($skipped -join ', ') (see the warning above), so " +
+            "new sessions reading that profile will not have it. Fix it as " +
+            "the warning says and re-run.")
     }
     Write-Information ''
     Write-Information '  just-runit is ready, in this session and in new ones.'
@@ -565,7 +669,8 @@ try {
         'Find-GitBash', 'Find-JbWinget', 'Install-JbWingetPackage',
         'Add-JbWingetLink', 'Find-JbUv', 'Get-JbProfilePath', 'Get-JbDriverPath',
         'Get-JbDriverText', 'Get-JbProfileBlock', 'Merge-JbProfileBlock',
-        'Write-JbProfile', 'Write-JbBanner', 'Install-JustBashit') {
+        'Read-JbProfile', 'Get-JbUnreadableReason', 'Write-JbProfile',
+        'Write-JbProfileAll', 'Write-JbBanner', 'Install-JustBashit') {
         Remove-Item -Path "Function:\$f" -ErrorAction SilentlyContinue
     }
     Remove-Variable -Name JbBlockBegin, JbBlockEnd, JbDefaultUrl -ErrorAction SilentlyContinue

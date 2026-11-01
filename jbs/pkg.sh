@@ -108,24 +108,30 @@ _ps_literal() {
 	printf "'%s'" "${1//${_q}/${_q}${_q}}"
 }
 
+# _win_env NAME -- the Windows environment variable NAME, as Windows spells
+# it, read through PowerShell; fails when it is empty or there is no
+# PowerShell. A shell cannot read every one itself: ProgramFiles(x86) is
+# not a legal shell variable name, and under WSL none of them is exported.
+_win_env() {
+	local _ps _raw
+	_ps="$(_powershell_bin)" || return 1
+	_raw="$("${_ps}" -NoProfile -NonInteractive \
+		-Command "\${env:$1}" 2>/dev/null | tr -d '\r\n')" || _raw=""
+	[ -n "${_raw}" ] || return 1
+	printf '%s\n' "${_raw}"
+}
+
 # _vs_installer_dir -- the Visual Studio Installer directory, which holds
 # vswhere.exe and setup.exe, as a local path. It is
-# %ProgramFiles(x86)%\Microsoft Visual Studio\Installer on every install;
-# the variable is read through PowerShell because a shell cannot name it
-# (parentheses are not legal in a variable name). JB_VS_INSTALLER
-# overrides, set to a directory of stubs for a test.
+# %ProgramFiles(x86)%\Microsoft Visual Studio\Installer on every install.
+# JB_VS_INSTALLER overrides, set to a directory of stubs for a test.
 _vs_installer_dir() {
-	local _ps _raw
+	local _raw
 	if [ -n "${JB_VS_INSTALLER+x}" ]; then
 		printf '%s\n' "${JB_VS_INSTALLER}"
 		return 0
 	fi
-	_ps="$(_powershell_bin)" || return 1
-	# shellcheck disable=SC2016  # PowerShell expands it, not this shell
-	_raw="$("${_ps}" -NoProfile -NonInteractive \
-		-Command '${env:ProgramFiles(x86)}' 2>/dev/null | tr -d '\r\n')" ||
-		_raw=""
-	[ -n "${_raw}" ] || return 1
+	_raw="$(_win_env 'ProgramFiles(x86)')" || return 1
 	_local_path "${_raw}\\Microsoft Visual Studio\\Installer"
 }
 

@@ -294,7 +294,10 @@ function Get-JbProfileBlock {
         them in this session (from inside a function) and in a profile.
 
         Forwarding, in order: the arguments go in the environment (see the
-        driver); MSYS=noglob is added so the runtime does not expand a `*`
+        driver), an array argument joined with commas -- PowerShell parses an
+        unquoted `-s sshd,git` as an array, which [string] would join with a
+        space, and every comma list jbx takes (-s, -x) means `sshd,git`
+        (#196); MSYS=noglob is added so the runtime does not expand a `*`
         either way; pipeline input is piped to bash only when there is some,
         because piping nothing would hand bash an empty stdin instead of the
         console and break every prompt; JB_CALLER=pwsh tells what runs that
@@ -318,7 +321,11 @@ function Get-JbProfileBlock {
             "function global:$name {"
             "    `$set = @{ JB_PS_NAME = '$name'; JB_PS_ARGC = [string]`$args.Count; JB_CALLER = 'pwsh'"
             "        MSYS = ((([string]`$env:MSYS) + ' noglob').Trim()) }"
-            "    for (`$i = 0; `$i -lt `$args.Count; `$i++) { `$set[""JB_PS_ARG`$(`$i + 1)""] = [string]`$args[`$i] }"
+            "    for (`$i = 0; `$i -lt `$args.Count; `$i++) {"
+            "        `$v = `$args[`$i]"
+            "        if (`$v -is [array]) { `$v = `$v -join ',' }"
+            "        `$set[""JB_PS_ARG`$(`$i + 1)""] = [string]`$v"
+            "    }"
             "    `$saved = @{}"
             "    foreach (`$k in `$set.Keys) {"
             "        `$saved[`$k] = [Environment]::GetEnvironmentVariable(`$k)"

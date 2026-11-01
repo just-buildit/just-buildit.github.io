@@ -20,10 +20,14 @@ _JBS_BASE="${JB_JBS_BASE:-https://just-buildit.github.io/jbs}"
 # before ssh (the agent lives in the shell config), tools and pwsh before
 # claude. pwsh comes after deps because it downloads with curl and unpacks
 # with tar, both of which the deps step is what puts on a bare machine.
-# Kept as an array as well as a string because IFS is newline+tab here, so
-# a space-separated string does not word-split.
+# The array is the one declaration. The string is derived from it, for
+# messages only: matching a step against a space-joined string accepts
+# 'sshd git' as one step, because the two are adjacent in it (#196).
 _STEPS_ALL=(deps certs shell ssh sshd git tools pwsh claude)
-_STEPS_ALL_STR="deps certs shell ssh sshd git tools pwsh claude"
+_STEPS_ALL_STR="$(
+	IFS=' '
+	printf '%s' "${_STEPS_ALL[*]}"
+)"
 
 # Steps that run only when named with -s or in bootstrap.toml. sshd opens a
 # listening port on the machine, and certs widens what the machine trusts,
@@ -2344,17 +2348,26 @@ if [[ ${STEPS_EXPLICIT} -eq 0 ]]; then
 fi
 
 # Validate before doing anything: a typo should not leave a machine half
-# configured.
-for _step in $(tr ',' '\n' <<<"${STEPS_STR},${SKIP_STR}"); do
+# configured. Each comma-separated token is compared with each _STEPS_ALL
+# element exactly, so a token holding a space ('sshd git', what PowerShell
+# makes of an unquoted -s sshd,git) is named here as unknown rather than
+# passing and then matching nothing in the run loop (#196). -s, -x and the
+# bootstrap.toml steps all arrive through these two strings.
+_known_step() {
+	local s
+	for s in "${_STEPS_ALL[@]}"; do
+		[[ ${s} == "$1" ]] && return 0
+	done
+	return 1
+}
+IFS=',' read -r -a _step_tokens <<<"${STEPS_STR},${SKIP_STR}"
+for _step in "${_step_tokens[@]+"${_step_tokens[@]}"}"; do
 	[[ -z ${_step} ]] && continue
-	case " ${_STEPS_ALL_STR} " in
-	*" ${_step} "*) ;;
-	*)
+	if ! _known_step "${_step}"; then
 		echo "error: unknown step '${_step}'" >&2
 		echo "       known steps: ${_STEPS_ALL_STR}" >&2
 		exit 1
-		;;
-	esac
+	fi
 done
 
 _say "just-bashit setup-system"

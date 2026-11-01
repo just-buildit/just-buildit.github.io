@@ -23,7 +23,7 @@ _JBS_BASE="${JB_JBS_BASE:-https://just-buildit.github.io/jbs}"
 # The array is the one declaration. The string is derived from it, for
 # messages only: matching a step against a space-joined string accepts
 # 'sshd git' as one step, because the two are adjacent in it (#196).
-_STEPS_ALL=(deps certs shell ssh sshd git tools pwsh claude)
+_STEPS_ALL=(deps certs folders shell ssh sshd git tools pwsh claude)
 _STEPS_ALL_STR="$(
 	IFS=' '
 	printf '%s' "${_STEPS_ALL[*]}"
@@ -66,7 +66,13 @@ read -r -d '' HELP <<-'EOF' || true
 	          Windows' trusted root certificates into the distro trust
 	          store beside its Mozilla bundle, one file per root, and
 	          remove any Windows no longer trusts.
-	  shell   Install the opinionated bash configuration to
+	  folders Native Windows: move Documents, Desktop, Pictures, Music
+	          and Videos back from OneDrive to the local profile, and
+	          point Windows there (HKCU, no UAC). Online-only files stay
+	          on OneDrive. While OneDrive runs or a policy would redirect
+	          them again, nothing moves; PowerShell gets jbx from the
+	          local profile instead. -x folders leaves them alone.
+	  shell  Install the opinionated bash configuration to
 	          ~/.config/just-bashit/{bashrc,profile}.sh and add one source
 	          line to ~/.bashrc and ~/.profile. Your files stay yours.
 	  ssh     Ensure ~/.ssh permissions and an ed25519 key named after this
@@ -870,6 +876,70 @@ step_certs() {
 	fi
 	rm -rf "${tmp}"
 	_result "certs:   ok (${count} Windows roots in ${cert_dir})"
+}
+
+# ---------------------------------------------------------------------------
+# folders — native Windows, a default step (#204): Documents, Desktop,
+# Pictures, Music and Videos back from OneDrive's Known Folder Move to the
+# local profile. OneDrive left redirecting them is how a box ends with an
+# online-only $PROFILE nothing can read (#202). The work is
+# windows-folders.ps1's, through Windows PowerShell, as the user: the values
+# are HKCU's, so there is no UAC prompt and --yes changes nothing. It
+# dot-sources get-jb.ps1 for the profile writer, so both are copied, under
+# their real names, into one directory.
+#
+# The script's last line is `result: <summary>`; every line before it is
+# progress, relayed as it comes. -x folders leaves the folders alone.
+# ---------------------------------------------------------------------------
+step_folders() {
+	_head "folders — Windows known folders back from OneDrive"
+	if ! _on_native_windows; then
+		if _on_wsl; then
+			_info "run setup-system from Windows (jbx in PowerShell, or Git Bash) for these"
+			_result "folders: skipped (WSL: run it from Windows)"
+		else
+			_result "folders: skipped (not Windows)"
+		fi
+		return 0
+	fi
+	local ps
+	if ! ps="$(_powershell_bin)"; then
+		_warn "Windows PowerShell not found — cannot read the known folders"
+		_result "folders: skipped (no PowerShell)"
+		return 0
+	fi
+	local src getjb dir wpath
+	if ! src="$(_asset windows-folders.ps1)" || ! getjb="$(_asset get-jb.ps1)"; then
+		_result "folders: failed (windows-folders.ps1 unavailable)"
+		return 0
+	fi
+	dir="$(mktemp -d "${TMPDIR:-/tmp}/jb-folders.XXXXXX")" || {
+		_result "folders: failed (no temp directory)"
+		return 0
+	}
+	cp "${src}" "${dir}/windows-folders.ps1"
+	cp "${getjb}" "${dir}/get-jb.ps1"
+	if ! wpath="$(_win_path "${dir}/windows-folders.ps1")"; then
+		rm -rf "${dir}"
+		_result "folders: failed (no Windows path for ${dir})"
+		return 0
+	fi
+	# MSYS rewrites any argument that looks like a POSIX path before a
+	# Windows program sees it.
+	local -x MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1
+	local args=(-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${wpath}")
+	[[ ${DRY_RUN} -eq 1 ]] && args+=(-DryRun)
+	local line result=""
+	while IFS= read -r line; do
+		line="${line%$'\r'}"
+		case "${line}" in
+		"result: "*) result="${line#result: }" ;;
+		"") ;;
+		*) _info "${line}" ;;
+		esac
+	done < <("${ps}" "${args[@]}" 2>&1)
+	rm -rf "${dir}"
+	_result "folders: ${result:-failed (windows-folders.ps1 gave no result; see above)}"
 }
 
 # shell — the bashrc/profile templates plus their one-line hooks.

@@ -172,6 +172,20 @@ function Find-GitBash {
     }
 }
 
+function Find-JbBash {
+    <#
+    .SYNOPSIS
+        The bash the jbx functions run: JB_BASH, else Find-GitBash; nothing
+        when there is neither.
+    .DESCRIPTION
+        One answer for every writer of the profile block: this install, and
+        windows-folders.ps1 rewriting the block into a restored Documents
+        folder (#204).
+    #>
+    if ($env:JB_BASH) { return $env:JB_BASH }
+    Find-GitBash
+}
+
 function Find-JbWinget {
     <#
     .SYNOPSIS
@@ -238,18 +252,28 @@ function Get-JbProfilePath {
         otherwise, the CurrentUserAllHosts profile of both editions -- 5.1
         and 7 read different files -- under Documents as Windows resolves
         it. Elsewhere (pwsh on Linux or macOS), this host's own.
+
+        -Documents names the Documents folder instead, and then only it
+        decides: both editions' profiles under it, whatever JB_PS_PROFILE
+        says. windows-folders.ps1 asks this way about a Documents folder
+        Windows may not resolve yet -- the local one it moves Documents
+        back to, or the OneDrive one it cannot move (#204) -- so the
+        edition-relative names are declared here and nowhere else.
+    .EXAMPLE
+        Get-JbProfilePath -Documents 'C:\Users\me\Documents'
     #>
-    if ($env:JB_PS_PROFILE) {
-        return @($env:JB_PS_PROFILE -split [regex]::Escape([IO.Path]::PathSeparator) |
-            Where-Object { $_ })
+    param([string]$Documents)
+    if (-not $Documents) {
+        if ($env:JB_PS_PROFILE) {
+            return @($env:JB_PS_PROFILE -split [regex]::Escape([IO.Path]::PathSeparator) |
+                Where-Object { $_ })
+        }
+        if (-not (Test-JbWindows)) { return $PROFILE.CurrentUserAllHosts }
+        $Documents = [Environment]::GetFolderPath('MyDocuments')
     }
-    if (Test-JbWindows) {
-        $docs = [Environment]::GetFolderPath('MyDocuments')
-        Join-Path $docs 'WindowsPowerShell\profile.ps1'
-        Join-Path $docs 'PowerShell\profile.ps1'
-        return
+    foreach ($edition in 'WindowsPowerShell', 'PowerShell') {
+        Join-Path (Join-Path $Documents $edition) 'profile.ps1'
     }
-    $PROFILE.CurrentUserAllHosts
 }
 
 function Get-JbDriverPath {
@@ -563,7 +587,7 @@ function Install-JustBashit {
     $winget = Find-JbWinget
 
     # -- bash ---------------------------------------------------------------
-    if ($env:JB_BASH) { $bash = $env:JB_BASH } else { $bash = Find-GitBash }
+    $bash = Find-JbBash
     if (-not $bash) {
         if (-not $winget) {
             throw ('get-jb.ps1: no Git for Windows bash.exe found, and no winget ' +
@@ -666,7 +690,7 @@ try {
     # `irm | iex` runs in the caller's scope: leave only jbx and just-runit
     # behind, as get-jb.sh unsets its helpers.
     foreach ($f in 'Get-JbWingetFlag', 'Test-JbWindows', 'Get-GitBashCandidate',
-        'Find-GitBash', 'Find-JbWinget', 'Install-JbWingetPackage',
+        'Find-GitBash', 'Find-JbBash', 'Find-JbWinget', 'Install-JbWingetPackage',
         'Add-JbWingetLink', 'Find-JbUv', 'Get-JbProfilePath', 'Get-JbDriverPath',
         'Get-JbDriverText', 'Get-JbProfileBlock', 'Merge-JbProfileBlock',
         'Read-JbProfile', 'Get-JbUnreadableReason', 'Write-JbProfile',

@@ -501,7 +501,7 @@ _win_verdict() {
 		if [ -z "${_WIN_RC}" ]; then
 			echo "error: ${_what}: no exit code reported (was the UAC prompt declined?)" >&2
 		else
-			echo "error: ${_what}: failed, exit code ${_WIN_RC}; vswhere finds no instance with $*" >&2
+			echo "error: ${_what}: failed, exit code ${_WIN_RC}; vswhere finds no instance with $(_vs_join "$@")" >&2
 		fi
 		return 1
 	fi
@@ -510,7 +510,7 @@ _win_verdict() {
 	elif [ "${_WIN_RC}" = "0" ]; then
 		echo "install-deps: ${_what}: done" >&2
 	else
-		echo "install-deps: warning: ${_what}: exit code ${_WIN_RC:-(none)}, but vswhere finds $*: done" >&2
+		echo "install-deps: warning: ${_what}: exit code ${_WIN_RC:-(none)}, but vswhere finds $(_vs_join "$@"): done" >&2
 	fi
 }
 
@@ -529,10 +529,201 @@ _vs_modify_how() {
 	esac
 }
 
+# _vs_join ID... -- the ids as one message phrase, joined with ", ". Not
+# "$*": this script's IFS is newline-first, so "$*" put each id on a line of
+# its own and split every message that named more than one (#195).
+_vs_join() {
+	local _s
+	_s="$(printf '%s, ' "$@")"
+	printf '%s\n' "${_s%, }"
+}
+
+# _vs_missing DIR ID... -- the ids vswhere finds in no instance, one per
+# line, each probed alone, so a message names only what is missing (#195).
+# When every id is found alone, but no one instance has them all (two
+# instances, each with half), that answer would be empty, so every id is
+# printed instead: the message then names the set the probe asked for.
+_vs_missing() {
+	local _dir="$1" _r _any=0
+	shift
+	for _r in "$@"; do
+		if [ -z "$(_vswhere "${_dir}" -requires "${_r}")" ]; then
+			printf '%s\n' "${_r}"
+			_any=1
+		fi
+	done
+	[ "${_any}" -eq 1 ] || printf '%s\n' "$@"
+}
+
+# ---------------------------------------------------------------------------
+# What a VS install prints while it runs (#195).
+#
+# The VS Installer streams its whole log to the console -- measured
+# 2026-10-31, about 150 lines of telemetry and harmless
+# OperationCanceledException traces from a channel-feed probe, which read
+# like failures. --quiet hides its UI, not that. So _vs_run sends the
+# installer's output (both streams, PowerShell's relayed stderr too) to a
+# log file under the temp directory, prints that path, and _winget_vs prints
+# the log's tail only when _win_verdict reports a failure.
+#
+# A modify takes 5-20 minutes, and silent it looks hung, so a progress line
+# runs beside it: the elapsed time and the installer's latest activity. On a
+# terminal (stderr a TTY) one line is rewritten in place every second;
+# otherwise one line is printed every JB_VS_PROGRESS_EVERY seconds (30).
+#
+# The activity is read from the VS Installer's own log,
+# %TEMP%\dd_setup_<timestamp>.log -- the main log, not its _errors.log or
+# its per-package _NNN_<id>.log. Measured on a real modify (2026-10-31, 4 MB),
+# it writes one BEGIN line per step, most of them on a package:
+#
+#   [412c:0021][2026-10-31T19:22:46] BEGIN: Downloading package "Microsoft.VisualStudio.VC.Llvm.Clang,version=18.9.11915.232,productarch=neutral"
+#   [412c:000b][2026-10-31T19:23:03] BEGIN: Installing "Microsoft.VisualStudio.VC.Llvm.Base,version=18.9.11915.232,productarch=neutral"
+#
+# and likewise "Verifying existing package", "Caching package '...'",
+# "Removing package '...' from cache" and "Updating legacy dependency for
+# '...'"; the finishing steps name no package ("Syncing DCAT product
+# registration", "Finalize"). It carries no percentage, so none is shown. That file, not the captured console output, is the source because
+# it is the one place every route can be read from: an install through a
+# UAC prompt runs in a window of its own, whose output never reaches the
+# capture at all. The capture is read second, with the same pattern, for
+# the case the file cannot be found (no PowerShell to ask for %TEMP%, or an
+# admin channel that logs in as another user and so writes another %TEMP%);
+# with neither, the line shows the elapsed time alone. The newest
+# dd_setup_<digits>.log written since the install started is the one:
+# the bootstrapper writes a small one first, then the main one.
+# JB_VS_TEMP overrides %TEMP%, for a test.
+# ---------------------------------------------------------------------------
+
+# _vs_temp_dir -- the Windows %TEMP%, as a local path, or failure.
+_vs_temp_dir() {
+	local _raw
+	if [ -n "${JB_VS_TEMP+x}" ]; then
+		printf '%s\n' "${JB_VS_TEMP}"
+		return 0
+	fi
+	_raw="$(_win_env TEMP)" || return 1
+	_local_path "${_raw}"
+}
+
+# _vs_elapsed SECONDS -- as 45s, 3m12s or 1h02m03s.
+_vs_elapsed() {
+	local _s="$1"
+	if [ "${_s}" -ge 3600 ]; then
+		printf '%dh%02dm%02ds\n' $((_s / 3600)) $((_s % 3600 / 60)) $((_s % 60))
+	elif [ "${_s}" -ge 60 ]; then
+		printf '%dm%02ds\n' $((_s / 60)) $((_s % 60))
+	else
+		printf '%ds\n' "${_s}"
+	fi
+}
+
+# _vs_activity TEMP MARK LOG -- the installer's latest step, from the last
+# "BEGIN:" line of the newest main dd_setup log in TEMP, newer than MARK,
+# that has one, else of LOG; nothing when none has one. A step on a package
+# reads "<step> <package id>" ("installing Microsoft.VisualStudio.VC.Llvm.Clang",
+# "removing package <id>"); any other, its own words up to a colon
+# ("syncing DCAT product registration"). A step naming a URL or a path
+# ("Downloading "https://..."", "Creating directory 'C:\..."") is passed
+# over: the package step before it says more.
+#
+# Newest WITH a step, not newest: one modify writes up to three main logs,
+# and the last can be a small one with none -- measured 2026-10-31, a 6.9 KB
+# dd_setup_20261031193128.log of package loading, opened 9 minutes into the
+# 4 MB one doing the work. Only the last 256 KiB of each is read: a main log
+# grows past 3 MB, and steps are never that far apart.
+_vs_activity() {
+	local _temp="$1" _mark="$2" _log="$3" _f _l _t
+	local _pkg="BEGIN: ([^\"':]+) [\"']([A-Za-z0-9._-]+),version="
+	local _own="BEGIN: ([^\"':]+)(:|$)"
+	local -a _src=()
+	if [ -n "${_temp}" ]; then
+		# The glob is sorted, and the name is a timestamp, so prepending
+		# each puts the newest first. "MARK is not newer", not "the log is
+		# newer": macOS's bash 3.2 compares whole seconds, so a log opened
+		# in the second the install started is not -nt its MARK (CI, #195).
+		for _f in "${_temp}"/dd_setup_*.log; do
+			[[ ${_f##*/} =~ ^dd_setup_[0-9]+\.log$ ]] || continue
+			[ ! "${_mark}" -nt "${_f}" ] && _src=("${_f}" ${_src[@]+"${_src[@]}"})
+		done
+	fi
+	for _f in ${_src[@]+"${_src[@]}"} "${_log}"; do
+		[ -f "${_f}" ] || continue
+		_l="$(tail -c 262144 "${_f}" 2>/dev/null | tr -d '\r' |
+			grep -E "${_pkg}|${_own}" | tail -n 1)" || _l=""
+		if [[ ${_l} =~ ${_pkg} ]]; then
+			_t="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+		elif [[ ${_l} =~ ${_own} ]]; then
+			_t="${BASH_REMATCH[1]}"
+		else
+			continue
+		fi
+		_t="${_t%.}"
+		# Lower-case the first letter only: "Syncing DCAT ...".
+		printf '%s%s\n' "$(printf '%s' "${_t:0:1}" | tr '[:upper:]' '[:lower:]')" "${_t:1}"
+		return 0
+	done
+	# None found is an answer, not a failure: under set -e a failing
+	# command substitution would end the progress loop.
+	return 0
+}
+
+# _vs_progress TEMP MARK LOG -- the progress line, until killed. Run in the
+# background by _vs_run. On a TTY it ends its line itself when killed, so
+# the verdict starts on a fresh one; it also stops when this script does.
+_vs_progress() {
+	local _temp="$1" _mark="$2" _log="$3" _every _next _act _line _tty=0
+	[ -t 2 ] && _tty=1
+	if [ "${_tty}" -eq 1 ]; then
+		_every=1
+		_next=0
+		trap 'printf "\n" >&2; exit 0' TERM
+	else
+		_every="${JB_VS_PROGRESS_EVERY:-30}"
+		_next="${_every}"
+	fi
+	SECONDS=0
+	while kill -0 "$$" 2>/dev/null; do
+		if [ "${SECONDS}" -ge "${_next}" ]; then
+			_act="$(_vs_activity "${_temp}" "${_mark}" "${_log}")"
+			_line="    ${_act:-working} ... $(_vs_elapsed "${SECONDS}")"
+			if [ "${_tty}" -eq 1 ]; then
+				printf '\r%s\033[K' "${_line}" >&2
+			else
+				printf '%s\n' "${_line}" >&2
+			fi
+			_next=$((SECONDS + _every))
+		fi
+		sleep 1
+	done
+}
+
+# _vs_run WHAT LOG [--runas | --ssh DEST] EXE ARG... -- _win_exit, with the
+# installer's output in LOG and the progress line beside it. Sets _WIN_RC.
+_vs_run() {
+	local _what="$1" _log="$2" _mark _temp _tick
+	shift 2
+	_mark="${_log}.start"
+	: >"${_mark}"
+	_temp="$(_vs_temp_dir 2>/dev/null)" || _temp=""
+	echo "install-deps: ${_what}: installer output: ${_log}" >&2
+	_vs_progress "${_temp}" "${_mark}" "${_log}" &
+	_tick=$!
+	_win_exit "$@" >"${_log}" 2>&1
+	kill "${_tick}" 2>/dev/null || true
+	wait "${_tick}" 2>/dev/null || true
+	rm -f "${_mark}"
+}
+
+# _vs_tail LOG -- the end of LOG, indented, after a failed verdict.
+_vs_tail() {
+	echo "install-deps: the last 20 lines of $1:" >&2
+	tail -n 20 "$1" | tr -d '\r' | sed 's/^/    /' >&2
+}
+
 # _winget_vs BIN ID REQUIRES... -- install winget package ID so that it
 # provides every REQUIRES id, by the three paths described above.
 _winget_vs() {
-	local _w="$1" _p="$2" _r _dir _shell _override
+	local _w="$1" _p="$2" _r _dir _shell _override _log _what
 	shift 2
 	local -a _add=()
 	for _r in "$@"; do _add+=(--add "${_r}"); done
@@ -558,9 +749,12 @@ _winget_vs() {
 		return 1
 	fi
 	if [ -n "$(_vswhere "${_dir}" -requires "$@")" ]; then
-		echo "install-deps: ${_p} already installed (with $*)" >&2
+		echo "install-deps: ${_p} already installed (with $(_vs_join "$@"))" >&2
 		return 0
 	fi
+	local -a _missing=()
+	while IFS= read -r _r; do _missing+=("${_r}"); done < <(_vs_missing "${_dir}" "$@")
+	_log="$(mktemp "${TMPDIR:-/tmp}/jb-vs-install.XXXXXX")" || return 1
 	if _winget_installed "${_w}" "${_p}"; then
 		_shell="$(_vswhere "${_dir}")"
 		if [ -z "${_shell}" ]; then
@@ -574,20 +768,25 @@ _winget_vs() {
 		ssh) _via=(--ssh "${_dest}") ;;
 		skip)
 			# shellcheck disable=SC2154  # assigned in windows.sh, sourced above
-			echo "install-deps: ${_p} is present without $*: skipped: ${WIN_NEEDS_ADMIN}" >&2
+			echo "install-deps: ${_p} is present without $(_vs_join "${_missing[@]}"): skipped: ${WIN_NEEDS_ADMIN}" >&2
+			rm -f "${_log}"
 			return 1
 			;;
 		*) _via=(--runas) ;;
 		esac
-		echo "install-deps: ${_p} is present without $*; modifying ${_shell}, $(_vs_modify_how "${_how}" "${_dest}")" >&2
-		_win_exit ${_via[@]+"${_via[@]}"} "${_dir}/setup.exe" modify --installPath "${_shell}" \
-			"${_add[@]}" --includeRecommended --quiet --norestart
-		_win_verdict "${_p} (setup.exe modify)" "${_dir}" "$@"
+		echo "install-deps: ${_p} is present without $(_vs_join "${_missing[@]}"); modifying ${_shell}, $(_vs_modify_how "${_how}" "${_dest}")" >&2
+		_what="${_p} (setup.exe modify)"
+		_vs_run "${_what}" "${_log}" ${_via[@]+"${_via[@]}"} "${_dir}/setup.exe" modify \
+			--installPath "${_shell}" "${_add[@]}" --includeRecommended --quiet --norestart
 	else
+		_what="${_p} (winget install)"
 		# shellcheck disable=SC2154  # assigned in pkg.sh, sourced above
-		_win_exit "${_w}" install --id "${_p}" "${_WINGET_INSTALL_FLAGS[@]}" \
-			--override "${_override}"
-		_win_verdict "${_p} (winget install)" "${_dir}" "$@"
+		_vs_run "${_what}" "${_log}" "${_w}" install --id "${_p}" \
+			"${_WINGET_INSTALL_FLAGS[@]}" --override "${_override}"
+	fi
+	if ! _win_verdict "${_what}" "${_dir}" "$@"; then
+		_vs_tail "${_log}"
+		return 1
 	fi
 }
 

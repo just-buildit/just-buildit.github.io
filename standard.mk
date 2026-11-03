@@ -946,7 +946,7 @@ train: ## PRS="<n> <n>..."|RECUT=<n> [PUSH=1] — land ready PRs as ONE PR, so C
 	    $(if $(strip $(TRAIN_BRANCH)),--branch '$(TRAIN_BRANCH)') \
 	    $(if $(strip $(TRAIN_TITLE)),--title '$(TRAIN_TITLE)') \
 	    $(if $(strip $(RECUT)),--recut '$(strip $(RECUT))') \
-	    $(if $(strip $(MOVED)),--moved $(MOVED)) \
+	    $(if $(strip $(MOVED)),--moved '$(strip $(MOVED))') \
 	    $(if $(filter 1,$(PUSH)),--push) $(PRS)
 
 # ── HAS_RELEASE ──────────────────────────────────────────────────────────────

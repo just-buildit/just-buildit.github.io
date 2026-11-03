@@ -458,14 +458,45 @@ def moved_line(n: int, old: str, new: str) -> str:
     )
 
 
-def push_lease(remote: str, br: str, expect: str, sha: str) -> None:
+def moved(
+    pr: dict[str, Any], old: dict[str, Any], remote: str
+) -> str | None:
+    """Why constituent ``pr`` of train ``old`` counts as moved, or None.
+
+    A closed one is planned for reopening (``plan_reopen``). An open one
+    was reopened already, by a re-cut that stopped part way or by hand,
+    and its head is compared with the train's record all the same. With
+    no record (a train cut before ``source``) an open one's head cannot be
+    told from a moved one, so it counts as moved: only MOVED accepts it.
+    """
+    n, was = pr["number"], old["heads"][pr["number"]]
+    if pr["state"] == "CLOSED":
+        return plan_reopen(pr, was, remote)
+    now = pr["headRefOid"]
+    if was == now:
+        return None
+    ref = f"refs/train/closed-{n}-new"
+    git("fetch", "--quiet", "--no-tags", remote, f"+refs/pull/{n}/head:{ref}")
+    if was is None:
+        return (
+            f"#{n} is open and the train #{old['number']} recorded no head "
+            f"for it; it is at {now[:9]} ({subject(now)})"
+        )
+    return moved_line(n, was, now)
+
+
+def push_lease(
+    remote: str, br: str, expect: str, sha: str, check: bool = True
+) -> subprocess.CompletedProcess[str]:
     """Sets ``br`` to ``sha`` only if it is still exactly ``expect``."""
-    git(
+    return run(
+        "git",
         "push",
         "--quiet",
         f"--force-with-lease=refs/heads/{br}:{expect}",
         remote,
         f"{sha}:refs/heads/{br}",
+        check=check,
     )
 
 
@@ -494,7 +525,18 @@ def reopen(pr: dict[str, Any], remote: str) -> None:
         try:
             gh("pr", "reopen", str(n))
         finally:
-            push_lease(remote, br, old, new)
+            # Runs whether or not the reopen worked: the reviewed head goes
+            # back either way. If it cannot, say exactly how to put it back.
+            back = push_lease(remote, br, old, new, check=False)
+            if back.returncode != 0:
+                raise RefusedError(
+                    f"#{n}: branch {br} may be left at {old[:9]}, not the "
+                    f"reviewed head {new[:9]} (kept locally at "
+                    f"refs/train/closed-{n}-new): "
+                    f"{(back.stderr or back.stdout).strip()}; restore with: "
+                    f"git push --force-with-lease=refs/heads/{br}:{old} "
+                    f"{remote} {new}:refs/heads/{br}"
+                )
     for i in range(VERIFY_TRIES):
         got = json.loads(
             gh("pr", "view", str(n), "--json", "state,headRefOid")
@@ -546,6 +588,24 @@ def close_keywords(
 
 
 def compose(args: argparse.Namespace) -> int:
+    """``compose_train``, then drops the refs it fetched under
+    ``refs/train/``. A failed run keeps each ``closed-<n>-new``: it holds a
+    reviewed head a failed restore may have left nowhere else."""
+    ok = False
+    try:
+        rc = compose_train(args)
+        ok = True
+        return rc
+    finally:
+        for n in args.prs:
+            for r in ("pr-{}", "closed-{}") + (() if not ok else (
+                "closed-{}-new",
+            )):
+                ref = "refs/train/" + r.format(n)
+                git("update-ref", "-d", ref, check=False)
+
+
+def compose_train(args: argparse.Namespace) -> int:
     if run("git", "status", "--porcelain", "--untracked-files=no").stdout:
         raise RefusedError("the working tree has uncommitted changes")
     repo = json.loads(gh("repo", "view", "--json", "nameWithOwner"))[
@@ -561,20 +621,9 @@ def compose(args: argparse.Namespace) -> int:
     if old is not None:
         moves = {}
         for p in prs:
-            n, was = p["number"], old["heads"][p["number"]]
-            if p["state"] == "CLOSED":
-                why = plan_reopen(p, was, args.remote)
-            elif was and p["headRefOid"] != was:
-                # Already reopened (a re-cut that stopped part way): its
-                # head is compared with the record all the same.
-                ref = f"refs/train/closed-{n}-new"
-                pull = f"+refs/pull/{n}/head:{ref}"
-                git("fetch", "--quiet", "--no-tags", args.remote, pull)
-                why = moved_line(n, was, p["headRefOid"])
-            else:
-                why = None
+            why = moved(p, old, args.remote)
             if why:
-                moves[n] = why
+                moves[p["number"]] = why
         for line in moves.values():
             print(f"train: {line}")
         unnamed = sorted(set(moves) - args.moved)
@@ -608,12 +657,26 @@ def compose(args: argparse.Namespace) -> int:
         raise RefusedError(f"branch {branch} already exists locally")
     on_remote = git("ls-remote", "--heads", args.remote, branch).split()[:1]
     if on_remote and on_remote[0] != reuse:
-        raise RefusedError(f"branch {branch} already exists on {args.remote}")
+        # Most often a run that pushed the branch and stopped before
+        # `gh pr create`: the push is not recognisable (the picks get new
+        # committer dates), so name the recovery instead of guessing.
+        raise RefusedError(
+            f"branch {branch} already exists on {args.remote} at "
+            f"{on_remote[0][:9]}; if it is a train push that never got its "
+            f"PR, delete it with: git push --force-with-lease=refs/heads/"
+            f"{branch}:{on_remote[0]} {args.remote} :refs/heads/{branch} "
+            "-- or pass TRAIN_BRANCH=<another name>"
+        )
 
     start = git(
         "symbolic-ref", "--quiet", "--short", "HEAD", check=False
     ) or git("rev-parse", "HEAD")
-    git("switch", "--quiet", "-C" if local else "-c", branch, base_sha)
+    # A dry run composes on a scratch branch of its own, so it never resets
+    # or deletes a branch that was there before it. A push replaces a local
+    # copy of the train branch only where it holds the old train's head.
+    work = branch if args.push else f"dry-run/{branch}"
+    reset = bool(local) if args.push else True
+    git("switch", "--quiet", "-C" if reset else "-c", work, base_sha)
     keep = False
     try:
         picks: list[tuple[int, str, str]] = []
@@ -643,7 +706,7 @@ def compose(args: argparse.Namespace) -> int:
         if subprocess.run(args.gate, shell=True).returncode != 0:
             keep = True
             raise RefusedError(
-                f"`{args.gate}` failed on the combined tree; branch {branch} "
+                f"`{args.gate}` failed on the combined tree; branch {work} "
                 "is kept so the fix can go into the commit that needs it"
             )
 
@@ -664,7 +727,7 @@ def compose(args: argparse.Namespace) -> int:
                     + (", ".join(f"#{p['number']}" for p in closed) or "none")
                 )
                 again = f"RECUT={args.recut}" + (
-                    f" MOVED='{' '.join(map(str, sorted(args.moved)))}'"
+                    f" MOVED='{','.join(map(str, sorted(args.moved)))}'"
                     if args.moved
                     else ""
                 )
@@ -743,11 +806,7 @@ def compose(args: argparse.Namespace) -> int:
     finally:
         git("switch", "--quiet", start, check=False)
         if not keep:
-            git("branch", "--quiet", "-D", branch, check=False)
-        for p in prs:
-            for r in ("pr-{}", "closed-{}", "closed-{}-new"):
-                ref = "refs/train/" + r.format(p["number"])
-                git("update-ref", "-d", ref, check=False)
+            git("branch", "--quiet", "-D", work, check=False)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -777,14 +836,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument(
         "--moved",
-        type=int,
-        nargs="*",
-        default=[],
-        metavar="PR",
-        help="with --recut: constituents whose moved head was reviewed",
+        default="",
+        metavar="'PR[,PR...]'",
+        help="with --recut: constituents whose moved head was reviewed, "
+        "comma or space separated, as ONE argument",
     )
     args = ap.parse_args(argv)
-    args.moved = set(args.moved)
+    try:
+        args.moved = {int(x) for x in re.split(r"[,\s]+", args.moved) if x}
+    except ValueError:
+        print(f"train: REFUSED -- --moved {args.moved!r} is not PR numbers")
+        return 1
     if bool(args.prs) == bool(args.recut):
         print("train: REFUSED -- give PRs or --recut T, not both or neither")
         return 1

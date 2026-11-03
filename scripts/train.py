@@ -81,8 +81,10 @@ A re-cut:
    composed. It then publishes as above, reusing ``T``'s branch name with
    a lease pinned to ``T``'s head. Without ``--push`` it changes nothing
    on GitHub. If the restoring push fails, it stops with the command that
-   restores the branch; after that, re-running the same re-cut recovers
-   (the constituents it reopened read as open, the rest are reopened).
+   restores the branch, and the same re-cut as a dry run: once its
+   ``#n moved:`` line ends at the reviewed head, adding ``--push``
+   recovers (the constituents it reopened read as open, the rest are
+   reopened). MOVED names a PR, not a sha, so that check is the reader's.
 
 Environment: ``GH`` names the gh binary (default ``gh``), which is how the
 tests substitute a fake.
@@ -194,11 +196,12 @@ def same_commit(src: str, dst: str) -> str | None:
 def placeholder_identity(sha: str) -> str | None:
     """Why commit ``sha`` carries a placeholder identity, or None.
 
-    A placeholder is an email whose domain (the part after the last
-    ``@``) contains no dot -- ``t@t``, ``me@localhost``, or no ``@`` at
-    all. No real mailbox and no bot noreply address looks like that, so
-    this needs no list of known owners. The author is checked first,
-    then the committer.
+    A placeholder is an email with no ``@`` at all (``t.t``), or whose
+    domain (the part after the last ``@``) contains no dot -- ``t@t``,
+    ``me@localhost``. A single-label domain is refused by design: no real
+    mailbox and no bot noreply address uses one, so this needs no list of
+    known owners. It is a shape check, not validation: ``t@t.`` passes.
+    The author is checked first, then the committer.
     """
     fmt = "--format=%an%x00%ae%x00%cn%x00%ce"
     fields = git("show", "-s", fmt, sha).split("\0")
@@ -206,7 +209,7 @@ def placeholder_identity(sha: str) -> str | None:
         ("authored", fields[0], fields[1]),
         ("committed", fields[2], fields[3]),
     ):
-        if "." not in email.rpartition("@")[2]:
+        if "@" not in email or "." not in email.rpartition("@")[2]:
             return f"is {role} by `{name} <{email}>`"
     return None
 
@@ -566,12 +569,13 @@ def reopen(pr: dict[str, Any], remote: str, rerun: str) -> None:
     restored; each push's lease pins the exact sha it replaces.
 
     If that restoring push fails, the refusal prints the exact command
-    that restores the branch, then ``rerun`` (the ``make train`` command
-    of this run): once the branch holds the reviewed head again, the same
-    re-cut finishes the job, since a reopened constituent at its moved
-    head is accepted by MOVED and a still-closed one is reopened. Re-run
-    BEFORE the restore, it is refused: the PR reads as not moved, and
-    MOVED names it.
+    that restores the branch, then ``rerun``: this run's ``make train``
+    command WITHOUT ``PUSH=1``. Its dry run prints ``#n moved: old ->
+    new``, and only once that ``new`` is the reviewed head is the push
+    safe: MOVED names a PR, not a sha, so a re-cut pushed blind would take
+    whatever the branch holds. When the lease was rejected (``stale
+    info``), someone pushed after the reopen, and the refusal says the
+    branch may hold a head nobody reviewed.
     """
     n, br = pr["number"], pr["headRefName"]
     old, new = pr["closed_head"], pr["headRefOid"]
@@ -594,15 +598,26 @@ def reopen(pr: dict[str, Any], remote: str, rerun: str) -> None:
             # back either way. If it cannot, say exactly how to put it back.
             back = push_lease(remote, br, old, new, check=False)
             if back.returncode != 0:
+                why = (back.stderr or back.stdout).strip()
+                # A rejected lease means the branch is not at the closed
+                # head: someone pushed after the reopen.
+                raced = (
+                    f"Someone pushed to {br} after the reopen, so it may "
+                    "hold a head nobody reviewed; the restore below "
+                    "refuses until you decide which head is right.\n"
+                    if "stale info" in why
+                    else ""
+                )
                 raise RefusedError(
                     f"#{n}: branch {br} may be left at {old[:9]}, not the "
                     f"reviewed head {new[:9]} (kept locally at "
-                    f"refs/train/closed-{n}-new): "
-                    f"{(back.stderr or back.stdout).strip()}; restore with: "
-                    f"git push --force-with-lease=refs/heads/{br}:{old} "
-                    f"{remote} {new}:refs/heads/{br}\n"
-                    f"Then re-run the same command to recover: {rerun}. "
-                    f"Before the restore it refuses #{n} as not moved."
+                    f"refs/train/closed-{n}-new): {why}\n{raced}"
+                    f"Restore with: git push --force-with-lease="
+                    f"refs/heads/{br}:{old} {remote} {new}:refs/heads/{br}"
+                    f"\nThen dry-run the same re-cut, with any TRAIN_* "
+                    f"overrides you gave: {rerun}\n"
+                    f"Add PUSH=1 only once its `#{n} moved:` line ends at "
+                    f"the reviewed head {new[:9]}."
                 )
     for i in range(VERIFY_TRIES):
         got = json.loads(
@@ -811,7 +826,7 @@ def compose_train(args: argparse.Namespace) -> int:
                 )
             for p in prs:
                 if p["state"] == "CLOSED":
-                    reopen(p, args.remote, f"make train {again(args)} PUSH=1")
+                    reopen(p, args.remote, f"make train {again(args)}")
         if on_remote:
             git(
                 "push",

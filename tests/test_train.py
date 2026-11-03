@@ -567,6 +567,32 @@ class Target(unittest.TestCase):
         self.assertNotIn("--push", p.stdout)
         self.assertIn("'--gate', 'make lint'", p.stdout)
 
+    def _flags(self, flags: str) -> None:
+        (self.tmp / "Makefile").write_text(
+            flags + "TEST_CMD = @echo t\nTEST_FAST_CMD = @echo t\n"
+            "PYEXT_CMD = @echo p\nCLEAN_PATHS = dist/\ninclude standard.mk\n"
+        )
+
+    def test_an_extension_repo_rebuilds_it_before_the_lint(self) -> None:
+        # The train lints in the checkout it switched, whose extension was
+        # built from whatever that checkout last held; a lint importing it
+        # judges the old code (doppler#2749). So with pyext, it goes first.
+        self._flags("HAS_C = 1\nHAS_PYTHON = 1\n")
+        p = self.make("train", "PRS=3")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("'--gate', 'make pyext && make lint'", p.stdout)
+
+    def test_python_without_c_has_no_extension_to_rebuild(self) -> None:
+        self._flags("HAS_PYTHON = 1\n")
+        p = self.make("train", "PRS=3")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("'--gate', 'make lint'", p.stdout)
+
+    def test_an_explicit_gate_still_wins(self) -> None:
+        self._flags("HAS_C = 1\nHAS_PYTHON = 1\n")
+        p = self.make("train", "PRS=3", "TRAIN_GATE=true")
+        self.assertIn("'--gate', 'true'", p.stdout)
+
     def test_push_reaches_the_script(self) -> None:
         p = self.make("train", "PRS=3", "PUSH=1")
         self.assertIn("'--push'", p.stdout)

@@ -49,15 +49,19 @@ What this script does, failing closed at every step:
    it. Their branches are kept, for the train's merge to retire.
 
 Once the train PR exists nothing is REFUSED, because something was
-published. Each constituent close is tried ``RETRY_TRIES`` times, waiting
+published. Each constituent gets its comment (``gh pr comment``), then is
+closed (``gh pr close``): two calls, so a retry never repeats a comment
+that landed. Each is tried ``RETRY_TRIES`` times, waiting
 ``TRAIN_RETRY_DELAY`` seconds (default 2), doubling, between tries: a
-GitHub API failure there is usually transient. If one still fails, the run
+GitHub API failure there is usually transient. A constituent merged in
+the meantime counts as done. If one still fails, the run
 prints ``train: PUBLISHED`` with the train's URL, the constituents closed
 and those still open, and the exact ``gh pr close`` that finishes each,
 and exits ``EXIT_PUBLISHED_PARTIAL`` (3). Do not re-run it: a re-run
 refuses before it changes anything, on the first closed constituent, or
-on the train branch, which it reports as the open train; one given
-another ``--branch`` could open a second train for the same PRs.
+on the train branch, which it reports as the open train (printing the
+same finish commands); one given another ``--branch`` could open a second
+train for the same PRs.
 
 Exit status: 0 published (or a clean dry run); 1 REFUSED, nothing
 published; 2 a usage error; 3 published, but a constituent is still open.
@@ -156,6 +160,9 @@ RETRY_DELAY = 2.0
 #: The exit status when the train PR is open but a constituent is not
 #: closed. 1 is REFUSED (nothing published); argparse's usage error is 2.
 EXIT_PUBLISHED_PARTIAL = 3
+
+#: What ``gh pr close`` prints, failing, for a PR that is already merged.
+MERGED = "because it was already merged"
 
 
 class RefusedError(Exception):
@@ -658,13 +665,15 @@ def reopen(pr: dict[str, Any], remote: str, rerun: str) -> None:
     )
 
 
-def gh_retried(*args: str) -> str | None:
+def gh_retried(*args: str, stop: str = "") -> str | None:
     """Runs ``gh *args`` up to ``RETRY_TRIES`` times; None once it succeeds.
 
     For a step that runs after the train PR exists, where a transient
     GitHub failure (a 502, a GraphQL timeout) must not end the run. Waits
     ``TRAIN_RETRY_DELAY`` seconds (default ``RETRY_DELAY``), doubling,
-    between tries. Returns the last failure's text when every try failed.
+    between tries. Returns the last failure's text when every try failed,
+    or at once when a failure's output contains ``stop``: a failure that
+    another try cannot change.
     """
     delay = float(os.environ.get("TRAIN_RETRY_DELAY", RETRY_DELAY))
     why = ""
@@ -673,59 +682,98 @@ def gh_retried(*args: str) -> str | None:
         if p.returncode == 0:
             return None
         why = f"exited {p.returncode}: {(p.stderr or p.stdout).strip()}"
+        if stop and stop in why:
+            return why
         if i + 1 < RETRY_TRIES:
             time.sleep(delay * 2**i)
     return why
 
 
+def superseded(url: str) -> str:
+    """The comment each constituent gets, linking the train ``url``."""
+    return (
+        f"Superseded by the train {url}: the commits here, cherry-picked "
+        "unchanged onto the current base (patch-id and message verified). "
+        "The branch is kept until it merges."
+    )
+
+
+def finish(n: int, url: str, commented: bool) -> str:
+    """The command that finishes closing constituent ``n`` of train ``url``.
+
+    The one spelling every message prints. ``commented`` says the
+    ``superseded`` comment already landed, so only the close is left;
+    otherwise the close carries the comment.
+
+    >>> finish(2, "U", True).split(" ", 1)[1]
+    'pr close 2'
+    >>> finish(2, "U", False).split(" ", 1)[1][:22]
+    "pr close 2 --comment '"
+    """
+    cmd = [os.environ.get("GH", "gh"), "pr", "close", str(n)]
+    if not commented:
+        cmd += ["--comment", superseded(url)]
+    return shlex.join(cmd)
+
+
 def after_publish(
-    url: str,
-    head: str,
-    branch: str,
-    args: argparse.Namespace,
-    closes: list[tuple[int, list[str]]],
+    url: str, head: str, args: argparse.Namespace, ns: list[int]
 ) -> int:
-    """Closes each constituent once the train PR ``url`` is open.
+    """Closes each constituent in ``ns`` once the train PR ``url`` is open.
 
-    ``closes`` pairs each constituent with the ``gh`` arguments that close
-    it. Each runs through ``gh_retried``. When all succeed, prints the
-    train and how to land it and returns 0. When one still fails, the train
-    is PUBLISHED all the same, so this never says REFUSED: it names the
-    constituents closed and those still open, prints the exact command that
-    closes each open one, and returns ``EXIT_PUBLISHED_PARTIAL``.
+    Each gets the ``superseded`` comment, then is closed, each step through
+    ``gh_retried``. They are two calls because ``gh pr close --comment``
+    posts the comment before it closes, so retrying it would repeat a
+    comment that landed. A constituent whose comment never lands is not
+    closed, so the one ``finish`` command does both. A constituent merged
+    in the meantime (gh says so: ``MERGED``) counts as done.
 
-    It also says not to re-run: a re-run refuses before it changes
-    anything, on the first closed constituent or on ``branch``, which is
-    now the open train, but one given another ``TRAIN_BRANCH`` would open a
-    second train for the same PRs.
+    When all are done, prints the train and how to land it and returns 0.
+    When one is still open, the train is PUBLISHED all the same, so this
+    never says REFUSED: it names the constituents closed and those still
+    open, prints the ``finish`` command for each open one, and returns
+    ``EXIT_PUBLISHED_PARTIAL``. It says not to re-run: a re-run refuses
+    before it changes anything (on the first closed constituent, or on the
+    train branch, which it names as the open train), but one given another
+    ``TRAIN_BRANCH`` could open a second train for the same PRs.
     """
     done: list[int] = []
-    left: list[tuple[int, list[str], str]] = []
-    for n, cmd in closes:
-        why = gh_retried(*cmd)
+    merged: list[int] = []
+    left: list[tuple[int, bool, str]] = []
+    for n in ns:
+        why = gh_retried("pr", "comment", str(n), "--body", superseded(url))
+        if why is not None:
+            left.append((n, False, why))
+            continue
+        why = gh_retried("pr", "close", str(n), stop=MERGED)
         if why is None:
             done.append(n)
+        elif MERGED in why:
+            merged.append(n)
         else:
-            left.append((n, cmd, why))
+            left.append((n, True, why))
     land = (
         f"train: land it with: gh pr merge {url} --rebase "
         f"--match-head-commit {head}"
     )
     if not left:
-        print(f"train: opened {url}; closed " + nums(done))
+        print(f"train: opened {url}; closed {nums(done) or 'none'}")
+        if merged:
+            print(f"train: already merged, so not closed: {nums(merged)}")
         print(land)
         return 0
-    gh_bin = os.environ.get("GH", "gh")
     print(
         f"train: PUBLISHED -- opened {url}, but {nums(n for n, _, _ in left)} "
         f"did not close after {RETRY_TRIES} tries"
     )
     print(f"train: closed: {nums(done) or 'none'}")
+    if merged:
+        print(f"train: already merged, so not closed: {nums(merged)}")
     for n, _, why in left:
         print(f"train: still open: #{n} -- {why}")
     print("train: finish with:")
-    for _, cmd, _ in left:
-        print("  " + shlex.join([gh_bin, *cmd]))
+    for n, commented, _ in left:
+        print("  " + finish(n, url, commented))
     print(
         f"train: do not re-run make train {again(args)} PUSH=1: the train "
         "is already open. A re-run refuses, and one given another "
@@ -851,23 +899,38 @@ def compose_train(args: argparse.Namespace) -> int:
         # A run that published and could not close every constituent left
         # the branch as an open train: that one is to be finished, never
         # deleted, since deleting its branch closes the train.
-        trains = json.loads(
-            gh(
-                "pr",
-                "list",
-                "--head",
-                branch,
-                "--state",
-                "open",
-                "--json",
-                "url",
+        trains = [
+            t
+            for t in json.loads(
+                gh(
+                    "pr",
+                    "list",
+                    "--head",
+                    branch,
+                    "--state",
+                    "open",
+                    "--json",
+                    "number,url,isCrossRepository,baseRefName",
+                )
             )
-        )
+            # ``--head`` matches the bare branch name, so a fork's PR of
+            # that name is not this train; nor is the train being re-cut.
+            if not t["isCrossRepository"]
+            and t["baseRefName"] == args.base
+            and t["number"] != (old["number"] if old else None)
+        ]
         if trains:
+            url = trains[0]["url"]
+            todo = [p["number"] for p in prs if p["state"] == "OPEN"]
             raise RefusedError(
-                f"branch {branch} is already the open train "
-                f"{trains[0]['url']}; close any constituent it left open "
-                "with `gh pr close <n>` instead of re-running"
+                f"branch {branch} is already the open train {url}; do not "
+                "re-run. "
+                + (
+                    "Finish closing its constituents with:\n"
+                    + "\n".join("  " + finish(n, url, False) for n in todo)
+                    if todo
+                    else "Its constituents are closed."
+                )
             )
     if local and local != reuse:
         raise RefusedError(f"branch {branch} already exists locally")
@@ -995,28 +1058,7 @@ def compose_train(args: argparse.Namespace) -> int:
         # Published: from here on nothing may say REFUSED (gh-192 in
         # just-buildit.github.io). ``after_publish`` retries each close and,
         # if one still fails, says what is open and how to finish it.
-        return after_publish(
-            url,
-            head,
-            branch,
-            args,
-            [
-                (
-                    p["number"],
-                    [
-                        "pr",
-                        "close",
-                        str(p["number"]),
-                        "--comment",
-                        f"Superseded by the train {url}: the commits here, "
-                        "cherry-picked unchanged onto the current base "
-                        "(patch-id and message verified). The branch is "
-                        "kept until it merges.",
-                    ],
-                )
-                for p in prs
-            ],
-        )
+        return after_publish(url, head, args, [p["number"] for p in prs])
     finally:
         git("switch", "--quiet", start, check=False)
         if not keep:

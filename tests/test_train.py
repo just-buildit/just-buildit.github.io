@@ -26,6 +26,7 @@ import doctest
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -94,17 +95,23 @@ FAKE_GH = textwrap.dedent(
         with open(os.environ["FAKE_GH_LOG"] + ".body", "w") as f:
             f.write(body)
         state.setdefault("created", []).append(
-            {"url": "https://github.com/o/r/pull/99", "state": "OPEN",
-             "headRefName": a[a.index("--head") + 1]})
+            {"number": 99, "url": "https://github.com/o/r/pull/99",
+             "state": "OPEN", "headRefName": a[a.index("--head") + 1],
+             "baseRefName": a[a.index("--base") + 1]})
         save()
         print("https://github.com/o/r/pull/99")
     elif a[:2] == ["pr", "list"]:
         head = a[a.index("--head") + 1]
         print(json.dumps([
-            {"url": p.get("url", "")}
+            {"number": p["number"], "url": p.get("url", ""),
+             "isCrossRepository": p.get("isCrossRepository", False),
+             "baseRefName": p["baseRefName"]}
             for p in [*state["prs"].values(), *state.get("created", [])]
             if p.get("headRefName") == head and p["state"] == "OPEN"
         ]))
+    elif a[:2] == ["pr", "comment"]:
+        if a[2] in state.get("comment_fail", []):
+            sys.exit("gh: HTTP 502: Bad Gateway")
     elif a[:2] == ["pr", "close"]:
         # A transient GitHub failure: close_fail counts the tries to fail.
         left = state.get("close_fail", {}).get(a[2], 0)
@@ -112,6 +119,9 @@ FAKE_GH = textwrap.dedent(
             state["close_fail"][a[2]] = left - 1
             save()
             sys.exit("GraphQL: Something went wrong (closePullRequest)")
+        if a[2] in state.get("close_merged", []):
+            sys.exit("X Pull request o/r#%s (t) can't be closed because "
+                     "it was already merged" % a[2])
         if a[2] in state["prs"]:
             live(state["prs"][a[2]])["state"] = "CLOSED"
             save()
@@ -287,7 +297,8 @@ class Fixture(unittest.TestCase):
             [
                 c
                 for c in self.calls()
-                if c[:2] in (["pr", "create"], ["pr", "close"])
+                if c[:2]
+                in (["pr", "create"], ["pr", "close"], ["pr", "comment"])
             ]
         )
         self.assertEqual(
@@ -385,9 +396,9 @@ class ClosesAfterPublish(Fixture):
             "wrong (closePullRequest)\n",
             p.stdout,
         )
+        # #2's comment landed, so only the close is left to finish.
         self.assertIn(
-            f"  {self.env['GH']} pr close 2 --comment 'Superseded by the "
-            "train https://github.com/o/r/pull/99:",
+            f"train: finish with:\n  {self.env['GH']} pr close 2\n",
             p.stdout,
         )
         self.assertIn("do not re-run make train PRS='1 2' PUSH=1", p.stdout)
@@ -417,6 +428,16 @@ class ClosesAfterPublish(Fixture):
             "https://github.com/o/r/pull/99",
         )
         self.assertNotIn("delete it", p.stdout)
+        # The same finish command the PUBLISHED path prints.
+        url = "https://github.com/o/r/pull/99"
+        with mock.patch.dict(os.environ, GH=self.env["GH"]):
+            want = [train.finish(n, url, False) for n in (1, 2)]
+        self.assertIn(
+            "do not re-run. Finish closing its constituents with:\n  "
+            + "\n  ".join(want)
+            + "\n",
+            p.stdout,
+        )
 
     def test_a_transient_close_failure_is_retried(self) -> None:
         self.state["close_fail"] = {"2": 1}
@@ -430,6 +451,52 @@ class ClosesAfterPublish(Fixture):
         self.assertEqual(self.state["prs"]["1"]["state"], "CLOSED")
         self.assertEqual(self.state["prs"]["2"]["state"], "CLOSED")
         self.assertEqual(self.closes("2"), 2)
+
+    def test_a_retried_close_posts_its_comment_once(self) -> None:
+        # gh pr close --comment posts before it closes, so a retried
+        # close carrying the comment would post it once per try.
+        self.state["close_fail"] = {"2": 2}
+        p = self.train("--push", "1", "2")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        calls = self.calls()
+        self.assertEqual(
+            [c[2] for c in calls if c[:2] == ["pr", "comment"]], ["1", "2"]
+        )
+        closes = [c for c in calls if c[:2] == ["pr", "close"]]
+        self.assertEqual(len(closes), 4)
+        self.assertFalse([c for c in closes if "--comment" in c], closes)
+
+    def test_a_failed_comment_leaves_the_close_to_the_finish(self) -> None:
+        self.state["comment_fail"] = ["2"]
+        p = self.train("--push", "1", "2")
+        self.assertEqual(p.returncode, 3, p.stdout + p.stderr)
+        self.assertEqual(self.closes("2"), 0)
+        self.assertIn(
+            f"  {self.env['GH']} pr close 2 --comment 'Superseded by the "
+            "train https://github.com/o/r/pull/99:",
+            p.stdout,
+        )
+
+    def test_a_constituent_merged_meanwhile_counts_as_done(self) -> None:
+        self.state["close_merged"] = ["2"]
+        p = self.train("--push", "1", "2")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("train: already merged, so not closed: #2", p.stdout)
+        self.assertEqual(self.closes("2"), 1)
+
+    def test_a_forks_branch_of_that_name_is_not_the_train(self) -> None:
+        # gh pr list --head matches the bare name; a fork's train/1-2 is
+        # someone else's, so this is the ordinary branch-exists refusal.
+        self.state["prs"]["50"] = dict(
+            number=50, state="OPEN", baseRefName="main",
+            headRefName="train/1-2", isCrossRepository=True,
+            url="https://github.com/o/r/pull/50",
+        )
+        sh(self.work, "git", "push", "--quiet", "origin",
+           "main:refs/heads/train/1-2")
+        p = self.train("--push", "1", "2")
+        self.assertRefused(p, "already exists on origin at")
+        self.assertNotIn("open train", p.stdout)
 
 
 class CarriesClosingIssues(Fixture):
@@ -950,6 +1017,23 @@ class Recuts(Fixture):
             "origin :refs/heads/train/1-2",
             p.stdout,
         )
+
+    def test_a_stale_local_train_branch_is_not_another_train(self) -> None:
+        # A fix was pushed onto the red train from another clone; this
+        # clone's train/1-2 still holds the original head. #99 is the
+        # train being re-cut, not an open train left to finish.
+        sh(self.work, "git", "switch", "--quiet", "-c", "tmpfix", self.old)
+        (self.work / "fix.txt").write_text("x\n")
+        new = self.commit("fix on train")
+        for ref in ("refs/heads/train/1-2", "refs/pull/99/head"):
+            sh(self.work, "git", "push", "--quiet", "-f", "origin",
+               f"{new}:{ref}")
+        sh(self.work, "git", "switch", "--quiet", "main")
+        sh(self.work, "git", "branch", "-D", "tmpfix")
+        self.state["prs"]["99"]["headRefOid"] = new
+        p = self.train("--recut", "99", "--push")
+        self.assertRefused(p, "branch train/1-2 already exists locally")
+        self.assertNotIn("open train", p.stdout)
 
     def test_a_dry_run_keeps_a_local_train_branch(self) -> None:
         self.assertEqual(

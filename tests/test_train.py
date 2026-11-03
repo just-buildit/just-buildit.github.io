@@ -4,6 +4,8 @@ A train lands several ready PRs as one, so a strict ruleset charges one CI
 run instead of N. Everything it checks is a way the train could land
 something nobody reviewed, or close an issue nobody declared, so each test
 here is one of those ways, and each must be REFUSED with nothing published.
+``ClosesAfterPublish`` is the exception: once the train PR exists, a
+failure is reported as PUBLISHED, never REFUSED.
 
 The fixture is a throwaway origin (a bare repo) and a clone. Each PR's head
 is pushed to ``refs/pull/<n>/head`` on the origin, as GitHub serves it, and
@@ -91,8 +93,25 @@ FAKE_GH = textwrap.dedent(
         body = open(a[a.index("--body-file") + 1]).read()
         with open(os.environ["FAKE_GH_LOG"] + ".body", "w") as f:
             f.write(body)
+        state.setdefault("created", []).append(
+            {"url": "https://github.com/o/r/pull/99", "state": "OPEN",
+             "headRefName": a[a.index("--head") + 1]})
+        save()
         print("https://github.com/o/r/pull/99")
+    elif a[:2] == ["pr", "list"]:
+        head = a[a.index("--head") + 1]
+        print(json.dumps([
+            {"url": p.get("url", "")}
+            for p in [*state["prs"].values(), *state.get("created", [])]
+            if p.get("headRefName") == head and p["state"] == "OPEN"
+        ]))
     elif a[:2] == ["pr", "close"]:
+        # A transient GitHub failure: close_fail counts the tries to fail.
+        left = state.get("close_fail", {}).get(a[2], 0)
+        if left:
+            state["close_fail"][a[2]] = left - 1
+            save()
+            sys.exit("GraphQL: Something went wrong (closePullRequest)")
         if a[2] in state["prs"]:
             live(state["prs"][a[2]])["state"] = "CLOSED"
             save()
@@ -181,6 +200,7 @@ class Fixture(unittest.TestCase):
             FAKE_GH_STATE=str(self.tmp / "s.json"),
             FAKE_GH_LOG=str(self.log),
             FAKE_GH_ORIGIN=str(self.origin),
+            TRAIN_RETRY_DELAY="0",
         )
 
     def identity(self, **cfg: str) -> None:
@@ -333,6 +353,83 @@ class Composes(Fixture):
         self.assertIn("rebase merge", body)
         self.assertIn("#1", body)
         self.assertIn("#2", body)
+
+
+class ClosesAfterPublish(Fixture):
+    """Once the train PR exists, a failed constituent close is not a
+    refusal: the train is published (just-buildit.github.io#192)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.pr(1, {"a.txt": "a\n"})
+        self.pr(2, {"b.txt": "b\n"})
+
+    def closes(self, n: str) -> int:
+        return [c[:3] for c in self.calls()].count(["pr", "close", n])
+
+    def test_a_close_that_keeps_failing_says_published(self) -> None:
+        self.state["close_fail"] = {"2": 99}
+        p = self.train("--push", "1", "2")
+        out = p.stdout + p.stderr
+        self.assertEqual(p.returncode, train.EXIT_PUBLISHED_PARTIAL, out)
+        self.assertEqual(train.EXIT_PUBLISHED_PARTIAL, 3)
+        self.assertNotIn("REFUSED", out)
+        self.assertIn(
+            "train: PUBLISHED -- opened https://github.com/o/r/pull/99, "
+            "but #2 did not close after 3 tries",
+            p.stdout,
+        )
+        self.assertIn("train: closed: #1\n", p.stdout)
+        self.assertIn(
+            "train: still open: #2 -- exited 1: GraphQL: Something went "
+            "wrong (closePullRequest)\n",
+            p.stdout,
+        )
+        self.assertIn(
+            f"  {self.env['GH']} pr close 2 --comment 'Superseded by the "
+            "train https://github.com/o/r/pull/99:",
+            p.stdout,
+        )
+        self.assertIn("do not re-run make train PRS='1 2' PUSH=1", p.stdout)
+        self.assertIn("gh pr merge https://github.com/o/r/pull/99", p.stdout)
+        # The train exists; #1 closed, #2 tried RETRY_TRIES times and open.
+        self.assertEqual([c[:2] for c in self.calls()].count(
+            ["pr", "create"]), 1)
+        self.assertEqual(self.state["prs"]["1"]["state"], "CLOSED")
+        self.assertEqual(self.state["prs"]["2"]["state"], "OPEN")
+        self.assertEqual(self.closes("2"), train.RETRY_TRIES)
+        # A re-run refuses before it publishes anything: #1 is closed.
+        self.log.unlink()
+        self.assertRefused(self.train("--push", "1", "2"), "#1 is closed")
+
+    def test_a_rerun_after_no_close_finds_the_open_train(self) -> None:
+        # Every close failed, so every constituent reads as open; the
+        # branch is the open train, which must be finished, not deleted.
+        self.state["close_fail"] = {"1": 99, "2": 99}
+        p = self.train("--push", "1", "2")
+        self.assertEqual(p.returncode, 3, p.stdout + p.stderr)
+        self.assertIn("train: closed: none\n", p.stdout)
+        self.log.unlink()
+        p = self.train("--push", "1", "2")
+        self.assertRefused(
+            p,
+            "branch train/1-2 is already the open train "
+            "https://github.com/o/r/pull/99",
+        )
+        self.assertNotIn("delete it", p.stdout)
+
+    def test_a_transient_close_failure_is_retried(self) -> None:
+        self.state["close_fail"] = {"2": 1}
+        p = self.train("--push", "1", "2")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn(
+            "train: opened https://github.com/o/r/pull/99; closed #1, #2",
+            p.stdout,
+        )
+        self.assertNotIn("PUBLISHED", p.stdout)
+        self.assertEqual(self.state["prs"]["1"]["state"], "CLOSED")
+        self.assertEqual(self.state["prs"]["2"]["state"], "CLOSED")
+        self.assertEqual(self.closes("2"), 2)
 
 
 class CarriesClosingIssues(Fixture):
@@ -612,6 +709,8 @@ class Recuts(Fixture):
             headRefOid=self.old,
             body=pathlib.Path(str(self.log) + ".body").read_text(),
         )
+        # prs["99"] now models the train the fake recorded as created.
+        del self.state["created"]
         self.log.unlink()
 
     def fixup(self, n: int) -> str:

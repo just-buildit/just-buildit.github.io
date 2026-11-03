@@ -588,9 +588,16 @@ class Target(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("'--gate', 'make lint'", p.stdout)
 
+    def test_c_without_python_has_no_extension_to_rebuild(self) -> None:
+        self._flags("HAS_C = 1\n")
+        p = self.make("train", "PRS=3")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("'--gate', 'make lint'", p.stdout)
+
     def test_an_explicit_gate_still_wins(self) -> None:
         self._flags("HAS_C = 1\nHAS_PYTHON = 1\n")
         p = self.make("train", "PRS=3", "TRAIN_GATE=true")
+        self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("'--gate', 'true'", p.stdout)
 
     def test_push_reaches_the_script(self) -> None:

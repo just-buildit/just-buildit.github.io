@@ -98,13 +98,20 @@ FAKE_GH = textwrap.dedent(
             save()
     elif a[:2] == ["pr", "reopen"]:
         pr = state["prs"][a[2]]
-        tip = origin("rev-parse", "refs/heads/" + pr["headRefName"])
+        br = "refs/heads/" + pr["headRefName"]
+        tip = origin("rev-parse", br)
         # GitHub refuses when the branch was force-pushed while closed.
-        if origin("merge-base", "--is-ancestor", pr["headRefOid"],
-                  tip.stdout.strip(), check=False).returncode:
+        if a[2] in state.get("reopen_fail", []) or origin(
+            "merge-base", "--is-ancestor", pr["headRefOid"],
+            tip.stdout.strip(), check=False,
+        ).returncode:
             sys.exit("could not reopen: the head branch was force-pushed")
         pr["state"] = "OPEN"
         save()
+        # Someone pushes the moment it reopens: the restore's lease fails.
+        racer = state.get("reopen_then_push", {}).get(a[2])
+        if racer:
+            origin("update-ref", br, racer)
     else:
         sys.exit("fake gh: unexpected " + " ".join(a))
     """
@@ -612,9 +619,122 @@ class Recuts(Fixture):
 
     def test_a_named_head_that_did_not_move_is_refused(self) -> None:
         self.fixup(1)
-        p = self.train("--recut", "99", "--moved", "1", "2", "--push")
+        p = self.train("--recut", "99", "--moved", "1,2", "--push")
         self.assertRefused(p, "named in MOVED but not moved: #2")
         self.assertEqual(self.verbs("reopen"), [])
+
+    def interrupt(self, reopened: int) -> None:
+        """A re-cut that closed the train and reopened one PR, then
+        stopped."""
+        self.state["prs"]["99"]["state"] = "CLOSED"
+        self.state["prs"][str(reopened)]["state"] = "OPEN"
+
+    def origin_head(self, br: str) -> str:
+        return sh(self.work, "git", "ls-remote", "origin",
+                  f"refs/heads/{br}").split()[0]
+
+    def test_an_interrupted_recut_reruns(self) -> None:
+        self.interrupt(1)
+        p = self.train("--recut", "99", "--push")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.verbs("reopen"), ["2"])
+        self.assertEqual(self.verbs("close"), ["1", "2"])
+
+    def test_an_interrupted_recut_still_checks_a_reopened_head(self) -> None:
+        self.interrupt(1)
+        new = self.fixup(1)  # pushed while open: GitHub follows it
+        p = self.train("--recut", "99", "--push")
+        self.assertRefused(p, "moved since the train: #1;")
+        self.assertIn(f"{self.heads[1][:9]} (change 1) -> {new[:9]}",
+                      p.stdout)
+        p = self.train("--recut", "99", "--moved", "1", "--push")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.verbs("reopen"), ["2"])
+        body = pathlib.Path(str(self.log) + ".body").read_text()
+        self.assertEqual(train.constituents(body), {1: new, 2: self.heads[2]})
+
+    def test_an_open_pr_a_pre_source_train_never_recorded(self) -> None:
+        # doppler#2770: reopened by hand, and the train predates `source`,
+        # so nothing says what head was reviewed; only MOVED accepts it.
+        body = self.state["prs"]["99"]["body"]
+        for h in self.heads.values():
+            body = body.replace(f" `{h}` |", "")
+        self.assertEqual(train.constituents(body), {1: None, 2: None})
+        self.state["prs"]["99"]["body"] = body
+        self.state["prs"]["1"]["state"] = "OPEN"
+        p = self.train("--recut", "99")
+        self.assertRefused(p, "moved since the train: #1;")
+        self.assertIn("recorded no head for it", p.stdout)
+        p = self.train("--recut", "99", "--moved", "1")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+
+    def test_the_push_back_lease_holds_a_branch_moved_by_the_gate(
+        self,
+    ) -> None:
+        self.fixup(1)
+        racer = self.heads[2]
+        p = self.train(
+            "--recut", "99", "--moved", "1", "--push",
+            "--gate", f"git push -q -f origin {racer}:refs/heads/pr1",
+        )
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn("stale info", p.stdout)
+        self.assertEqual(self.origin_head("pr1"), racer)
+        self.assertEqual(self.verbs("create"), [])
+
+    def test_a_failed_second_reopen_still_restores_the_head(self) -> None:
+        new = self.fixup(1)
+        self.state["reopen_fail"] = ["1"]
+        p = self.train("--recut", "99", "--moved", "1", "--push")
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn("could not reopen", p.stdout)
+        self.assertEqual(self.verbs("reopen"), ["1", "1"])
+        self.assertEqual(self.origin_head("pr1"), new)
+        self.assertEqual(self.verbs("create"), [])
+
+    def test_a_failed_restore_names_the_way_back(self) -> None:
+        new = self.fixup(1)
+        self.state["reopen_then_push"] = {"1": self.heads[2]}
+        p = self.train("--recut", "99", "--moved", "1", "--push")
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn("may be left at", p.stdout)
+        self.assertIn(
+            f"restore with: git push --force-with-lease=refs/heads/pr1:"
+            f"{self.heads[1]} origin {new}:refs/heads/pr1",
+            p.stdout,
+        )
+        # The reviewed head survives the failed run locally.
+        self.assertEqual(
+            sh(self.work, "git", "rev-parse", "refs/train/closed-1-new"), new
+        )
+
+    def test_a_reused_branch_that_moved_is_refused(self) -> None:
+        # A run that closed the train, pushed the new one's branch and
+        # stopped before its PR: GitHub holds the closed train's head.
+        self.state["prs"]["99"]["state"] = "CLOSED"
+        other = self.heads[1]
+        sh(self.work, "git", "push", "--quiet", "-f", "origin",
+           f"{other}:refs/heads/train/1-2")
+        p = self.train("--recut", "99", "--push")
+        self.assertRefused(p, "already exists on origin at")
+        self.assertIn(
+            f"git push --force-with-lease=refs/heads/train/1-2:{other} "
+            "origin :refs/heads/train/1-2",
+            p.stdout,
+        )
+
+    def test_a_dry_run_keeps_a_local_train_branch(self) -> None:
+        self.assertEqual(
+            sh(self.work, "git", "rev-parse", "train/1-2"), self.old
+        )
+        p = self.train("--recut", "99")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(
+            sh(self.work, "git", "rev-parse", "train/1-2"), self.old
+        )
+        self.assertEqual(
+            sh(self.work, "git", "branch", "--list", "dry-run/*"), ""
+        )
 
     def test_a_merged_train(self) -> None:
         self.state["prs"]["99"]["state"] = "MERGED"
@@ -757,8 +877,17 @@ class Target(unittest.TestCase):
     def test_recut_and_moved_reach_the_script(self) -> None:
         p = self.make("train", "RECUT=9", "MOVED=3 4", "PUSH=1")
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn("'--recut', '9', '--moved', '3', '4', '--push'",
+        self.assertIn("'--recut', '9', '--moved', '3 4', '--push'",
                       p.stdout)
+
+    def test_moved_cannot_swallow_prs(self) -> None:
+        # `--moved` once took every token after it, so MOVED=5 PRS=6 read
+        # as MOVED='5 6' and printed a PUSH=1 line accepting #6 unreviewed.
+        shutil.copy(SCRIPT, self.tmp / "scripts" / "train.py")
+        p = self.make("train", "RECUT=10", "MOVED=5", "PRS=6")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("not both or neither", p.stdout)
+        self.assertNotIn("PUSH=1", p.stdout)
 
     def test_push_reaches_the_script(self) -> None:
         p = self.make("train", "PRS=3", "PUSH=1")

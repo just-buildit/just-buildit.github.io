@@ -150,6 +150,20 @@ CLEAN_CMD      ?=
 # command (a `define` block for anything multi-line). The rules are stamped out
 # below, so adding a tool is one entry plus one variable, in the repo Makefile,
 # with the hook config dispatching inward to the target that results.
+#
+# ruff never touches a vendored file. When LINT_ruff or LINT_ruff-format is
+# set, the end of this file appends $(STD_RUFF_EXCLUDE) to it: the `.py` and
+# `.pyi` entries of VENDORED_FILES as a `--config 'extend-exclude=[...]'`,
+# plus `--force-exclude` so a path named on the command line is excluded
+# too. A vendored file is held verbatim by standard-check, so a local ruff
+# pass over one is a guaranteed drift failure; each adopter kept its own
+# exclude list for this, and the lists drifted (a file added here reached
+# none of them). The CLI value ADDS to a pyproject `extend-exclude` rather
+# than replacing it, and `ruff format` has no `--extend-exclude` flag, which
+# is why it is spelled through `--config`. A multi-line `define` LINT_ruff
+# places $(STD_RUFF_EXCLUDE) itself; nothing is appended to a command that
+# already names it. Other formatters (shfmt, mdformat...) still need the
+# vendored files excluded by hand.
 LINT_TOOLS   ?=
 # Which of those to run, in order, for `format`. Separate from LINT_TOOLS
 # because a checker that cannot fix anything has no business in `format`.
@@ -2086,8 +2100,10 @@ standard-check: ## Verify every vendored file matches canonical
 	        echo "  Vendored files are verbatim. Per-repo variation is"; \
 	        echo "  configuration in the Makefile; change canonical, not this."; \
 	        echo "  Did not edit it? Then one of this repo's formatters rewrote"; \
-	        echo "  it (ruff, shfmt, mdformat, clang-format...). Exclude it from"; \
-	        echo "  that tool, then \`make standard-update\` to restore it (#83)."; \
+	        echo "  it. ruff skips every vendored .py on its own (see"; \
+	        echo "  STD_RUFF_EXCLUDE); any other (shfmt, mdformat,"; \
+	        echo "  clang-format...) must exclude it. Then"; \
+	        echo "  \`make standard-update\` restores it (#83)."; \
 	        fail=1; continue; \
 	    fi; \
 	    rm -f "$$tmp"; \
@@ -2659,6 +2675,26 @@ help: ## Show this message
 # May only ADD targets. Redefining a standard one makes it the fork this file
 # exists to prevent — and make would warn about the override anyway.
 -include local.mk
+
+# ── ruff skips the vendored files ────────────────────────────────────────────
+# Documented at LINT_TOOLS. Here, after every `VENDORED_FILES +=` and after
+# local.mk, so a LINT_ruff set with `:=` still sees the whole list.
+# STD_RUFF_EXCLUDE is recursive for the same reason: VENDORED_FILES
+# accumulates down this file. ONE derivation, from the list standard-check
+# walks, so what ruff skips and what the drift gate holds cannot disagree.
+_std_empty :=
+_std_space := $(_std_empty) $(_std_empty)
+_std_comma := ,
+_std_ruff_vendored = $(sort $(filter %.py %.pyi,$(VENDORED_FILES)))
+STD_RUFF_EXCLUDE = --force-exclude$(if $(_std_ruff_vendored), --config \
+    'extend-exclude=[$(subst $(_std_space),$(_std_comma),$(strip \
+    $(patsubst %,"%",$(_std_ruff_vendored))))]')
+
+# Appended only where the command is set, and not where it already names
+# STD_RUFF_EXCLUDE (a multi-line `define` that placed it itself).
+_std_ruff_append = $(if $(value $(1)),$(if $(findstring \
+    STD_RUFF_EXCLUDE,$(value $(1))),,$(eval $(1) += $$(STD_RUFF_EXCLUDE))))
+$(foreach _v,LINT_ruff LINT_ruff-format,$(call _std_ruff_append,$(_v)))
 
 # Repo-local targets are named in LOCAL_TARGETS (in the Makefile or local.mk),
 # which puts them in `.PHONY` and in `help` — and so under the same gates as

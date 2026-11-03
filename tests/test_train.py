@@ -112,6 +112,14 @@ FAKE_GH = textwrap.dedent(
         racer = state.get("reopen_then_push", {}).get(a[2])
         if racer:
             origin("update-ref", br, racer)
+        # Or the remote refuses every push from then on (an outage).
+        if a[2] in state.get("reopen_then_reject", []):
+            hook = os.path.join(
+                os.environ["FAKE_GH_ORIGIN"], "hooks", "pre-receive"
+            )
+            with open(hook, "w") as f:
+                f.write("#!/bin/sh\\necho remote is down >&2\\nexit 1\\n")
+            os.chmod(hook, 0o755)
     else:
         sys.exit("fake gh: unexpected " + " ".join(a))
     """
@@ -459,6 +467,49 @@ class Refuses(Fixture):
         self.state["prs"]["1"]["headRefOid"] = head
         self.assertRefused(self.train("1"), "merge commit")
 
+    def identity(self, **cfg: str) -> None:
+        """Sets git identity config (``author_email="t@t"`` ->
+        ``author.email``) for the commits made until the test ends."""
+        for k, v in cfg.items():
+            key = k.replace("_", ".")
+            sh(self.work, "git", "config", key, v)
+            self.addCleanup(sh, self.work, "git", "config", "--unset", key)
+
+    def test_a_placeholder_author(self) -> None:
+        # doppler fdde12e7c: `t <t@t>` rode a train onto main.
+        self.identity(author_email="t@t")
+        head = self.pr(1, {"a.txt": "a\n"})
+        p = self.train("1")
+        self.assertRefused(
+            p,
+            f"#1's commit {head[:9]} is authored by `t <t@t>`, a "
+            "placeholder identity",
+        )
+        self.assertIn("--reset-author", p.stdout)
+
+    def test_a_placeholder_committer(self) -> None:
+        self.identity(user_email="t@t", author_email="t@example.com")
+        head = self.pr(1, {"a.txt": "a\n"})
+        self.assertRefused(
+            self.train("1"),
+            f"#1's commit {head[:9]} is committed by `t <t@t>`",
+        )
+
+    def test_bot_and_human_identities_ride(self) -> None:
+        self.pr(1, {"a.txt": "a\n"})
+        self.identity(
+            author_email="41898282+github-actions[bot]"
+            "@users.noreply.github.com",
+            committer_email="noreply@github.com",
+        )
+        self.pr(2, {"b.txt": "b\n"})
+        sh(self.work, "git", "config", "author.email",
+           "noreply@just-buildit.invalid")
+        self.pr(3, {"c.txt": "c\n"})
+        p = self.train("1", "2", "3")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("dry run OK", p.stdout)
+
     def test_a_failing_gate_publishes_nothing(self) -> None:
         self.pr(1, {"a.txt": "a\n"})
         p = self.train("--push", "--gate", "false", "1")
@@ -706,6 +757,58 @@ class Recuts(Fixture):
         # The reviewed head survives the failed run locally.
         self.assertEqual(
             sh(self.work, "git", "rev-parse", "refs/train/closed-1-new"), new
+        )
+
+    def test_a_failed_restore_recovers_by_rerunning(self) -> None:
+        # The restoring push fails and leaves the branch at the closed
+        # head, #1 reopened there and #99 closed: nothing rolled back.
+        new = self.fixup(1)
+        self.state["reopen_then_reject"] = ["1"]
+        p = self.train("--recut", "99", "--moved", "1", "--push")
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn(
+            "Then re-run the same command to recover: make train RECUT=99 "
+            "MOVED='1' PUSH=1. Before the restore it refuses #1 as not "
+            "moved.",
+            p.stdout,
+        )
+        self.assertEqual(self.origin_head("pr1"), self.heads[1])
+        self.assertEqual(self.state["prs"]["1"]["state"], "OPEN")
+        self.assertEqual(self.state["prs"]["99"]["state"], "CLOSED")
+        (self.origin / "hooks" / "pre-receive").unlink()
+        # Re-run before the restore: refused, as the message says.
+        self.log.unlink()
+        p = self.train("--recut", "99", "--moved", "1", "--push")
+        self.assertRefused(p, "named in MOVED but not moved: #1")
+        # The printed restore, then the same command: the train lands the
+        # reviewed head and reopens #2, which the failed run never reached.
+        sh(self.work, "git", "push", "--quiet",
+           f"--force-with-lease=refs/heads/pr1:{self.heads[1]}", "origin",
+           f"{new}:refs/heads/pr1")
+        p = self.train("--recut", "99", "--moved", "1", "--push")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.verbs("reopen"), ["2"])
+        self.assertEqual(self.verbs("create"), ["--base"])
+        body = pathlib.Path(str(self.log) + ".body").read_text()
+        self.assertEqual(train.constituents(body), {1: new, 2: self.heads[2]})
+
+    def test_a_placeholder_author_on_a_moved_head(self) -> None:
+        # A re-cut composes through the same per-PR read as a train.
+        sh(self.work, "git", "config", "author.email", "t@t")
+        self.addCleanup(
+            sh, self.work, "git", "config", "--unset", "author.email"
+        )
+        self.fixup(1)  # --amend keeps the author, so reset it too
+        sh(self.work, "git", "switch", "--quiet", "pr1")
+        sh(self.work, "git", "commit", "--quiet", "--amend", "--no-edit",
+           "--reset-author")
+        sh(self.work, "git", "switch", "--quiet", "main")
+        new = sh(self.work, "git", "rev-parse", "pr1")
+        sh(self.work, "git", "push", "--quiet", "-f", "origin",
+           "pr1:refs/heads/pr1")
+        p = self.train("--recut", "99", "--moved", "1")
+        self.assertRefused(
+            p, f"#1's commit {new[:9]} is authored by `t <t@t>`"
         )
 
     def test_a_reused_branch_that_moved_is_refused(self) -> None:

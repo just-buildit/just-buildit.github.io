@@ -34,15 +34,36 @@ import train  # noqa: E402
 FAKE_GH = textwrap.dedent(
     """\
     #!/usr/bin/env python3
-    import json, os, sys
+    import json, os, subprocess, sys
     state = json.load(open(os.environ["FAKE_GH_STATE"]))
     a = sys.argv[1:]
     with open(os.environ["FAKE_GH_LOG"], "a") as log:
         log.write(json.dumps(a) + "\\n")
+
+    def origin(*args, check=True):
+        return subprocess.run(
+            ["git", "-C", os.environ["FAKE_GH_ORIGIN"], *args],
+            capture_output=True, text=True, check=check,
+        )
+
+    def live(pr):
+        # GitHub follows an OPEN PR's branch (and refs/pull/<n>/head);
+        # a CLOSED one keeps the head it had when it closed.
+        br = pr.get("headRefName")
+        if pr["state"] == "OPEN" and br:
+            tip = origin("rev-parse", "refs/heads/" + br).stdout.strip()
+            pr["headRefOid"] = tip
+            origin("update-ref", "refs/pull/%d/head" % pr["number"], tip)
+        return pr
+
+    def save():
+        json.dump(state, open(os.environ["FAKE_GH_STATE"], "w"))
+
     if a[:2] == ["repo", "view"]:
         print(json.dumps({"nameWithOwner": "o/r"}))
     elif a[:2] == ["pr", "view"]:
-        print(json.dumps(state["prs"][a[2]]))
+        print(json.dumps(live(state["prs"][a[2]])))
+        save()
     elif a[:2] == ["api", "graphql"] and any(
         "closingIssuesReferences" in x for x in a
     ):
@@ -72,7 +93,18 @@ FAKE_GH = textwrap.dedent(
             f.write(body)
         print("https://github.com/o/r/pull/99")
     elif a[:2] == ["pr", "close"]:
-        pass
+        if a[2] in state["prs"]:
+            live(state["prs"][a[2]])["state"] = "CLOSED"
+            save()
+    elif a[:2] == ["pr", "reopen"]:
+        pr = state["prs"][a[2]]
+        tip = origin("rev-parse", "refs/heads/" + pr["headRefName"])
+        # GitHub refuses when the branch was force-pushed while closed.
+        if origin("merge-base", "--is-ancestor", pr["headRefOid"],
+                  tip.stdout.strip(), check=False).returncode:
+            sys.exit("could not reopen: the head branch was force-pushed")
+        pr["state"] = "OPEN"
+        save()
     else:
         sys.exit("fake gh: unexpected " + " ".join(a))
     """
@@ -133,6 +165,7 @@ class Fixture(unittest.TestCase):
             GH=str(fake),
             FAKE_GH_STATE=str(self.tmp / "s.json"),
             FAKE_GH_LOG=str(self.log),
+            FAKE_GH_ORIGIN=str(self.origin),
         )
 
     def commit(self, msg: str) -> str:
@@ -178,14 +211,18 @@ class Fixture(unittest.TestCase):
         return head
 
     def train(self, *args: str) -> subprocess.CompletedProcess:
-        (self.tmp / "s.json").write_text(json.dumps(self.state))
-        return subprocess.run(
+        state = self.tmp / "s.json"
+        state.write_text(json.dumps(self.state))
+        p = subprocess.run(
             [sys.executable, str(SCRIPT), "--gate", "true", *args],
             cwd=self.work,
             env=self.env,
             capture_output=True,
             text=True,
         )
+        # The fake's view of GitHub (closed, reopened) carries forward.
+        self.state = json.loads(state.read_text())
+        return p
 
     def calls(self) -> list[list[str]]:
         if not self.log.exists():
@@ -259,6 +296,11 @@ class Composes(Fixture):
         self.assertIn(["pr", "close", "1"], [c[:3] for c in calls])
         self.assertIn(["pr", "close", "2"], [c[:3] for c in calls])
         body = pathlib.Path(str(self.log) + ".body").read_text()
+        # Each row records the commit it was picked from: a re-cut reads
+        # a constituent's head back from its last row.
+        self.assertIn(f"| #1 | `{h1}` |", body)
+        self.assertIn(f"| #2 | `{h2}` |", body)
+        self.assertEqual(train.constituents(body), {1: h1, 2: h2})
         self.assertIn("rebase merge", body)
         self.assertIn("#1", body)
         self.assertIn("#2", body)
@@ -472,6 +514,118 @@ class Refuses(Fixture):
         )
 
 
+class Recuts(Fixture):
+    """``--recut T``: a red train's constituents are closed, and GitHub
+    refuses to reopen one whose branch was force-pushed while closed
+    (doppler#2770). The fake models that refusal and the frozen head."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.heads = {}
+        for n, f in ((1, "a.txt"), (2, "b.txt")):
+            self.heads[n] = self.pr(n, {f: f"{n}\n"}, headRefName=f"pr{n}")
+            sh(self.work, "git", "push", "--quiet", "origin",
+               f"pr{n}:refs/heads/pr{n}")
+        p = self.train("--push", "1", "2")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.state["prs"]["1"]["state"], "CLOSED")
+        self.old = sh(self.work, "git", "rev-parse", "origin/train/1-2")
+        sh(self.work, "git", "push", "--quiet", "origin",
+           f"{self.old}:refs/pull/99/head")
+        self.state["prs"]["99"] = dict(
+            number=99,
+            state="OPEN",
+            baseRefName="main",
+            headRefName="train/1-2",
+            headRefOid=self.old,
+            body=pathlib.Path(str(self.log) + ".body").read_text(),
+        )
+        self.log.unlink()
+
+    def fixup(self, n: int) -> str:
+        """Force-pushes a reworked commit to PR n's branch, as after a red
+        train, while the PR is closed."""
+        sh(self.work, "git", "switch", "--quiet", f"pr{n}")
+        (self.work / "fix.txt").write_text(f"fix {n}\n")
+        sh(self.work, "git", "add", "-A")
+        sh(self.work, "git", "commit", "--quiet", "--amend", "-m",
+           f"change {n}, fixed")
+        sh(self.work, "git", "push", "--quiet", "-f", "origin",
+           f"pr{n}:refs/heads/pr{n}")
+        sh(self.work, "git", "switch", "--quiet", "main")
+        return sh(self.work, "git", "rev-parse", f"pr{n}")
+
+    def refs(self) -> str:
+        return sh(self.work, "git", "ls-remote", str(self.origin))
+
+    def verbs(self, verb: str) -> list[str]:
+        return [c[2] for c in self.calls() if c[:2] == ["pr", verb]]
+
+    def test_a_dry_run_changes_nothing_on_github(self) -> None:
+        before = self.refs()
+        p = self.train("--recut", "99")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("would close #99 and reopen #1, #2", p.stdout)
+        self.assertIn("make train RECUT=99 PUSH=1", p.stdout)
+        self.assertEqual(self.refs(), before)
+        for verb in ("close", "reopen", "create"):
+            self.assertEqual(self.verbs(verb), [], verb)
+
+    def test_an_unmoved_recut_reopens_and_publishes(self) -> None:
+        p = self.train("--recut", "99", "--push")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.verbs("reopen"), ["1", "2"])
+        self.assertEqual(self.verbs("close"), ["99", "1", "2"])
+        self.assertEqual(self.verbs("create"), ["--base"])
+        self.assertNotIn("restoring", p.stdout)
+        body = pathlib.Path(str(self.log) + ".body").read_text()
+        self.assertIn("re-cuts the train #99", body)
+        self.assertEqual(train.constituents(body), self.heads)
+
+    def test_a_moved_head_is_refused(self) -> None:
+        new = self.fixup(1)
+        before = self.refs()
+        p = self.train("--recut", "99", "--push")
+        self.assertRefused(p, "moved since the train: #1;")
+        self.assertIn(
+            f"#1 moved: {self.heads[1][:9]} (change 1) -> "
+            f"{new[:9]} (change 1, fixed)",
+            p.stdout,
+        )
+        self.assertEqual(self.verbs("reopen"), [])
+        self.assertEqual(self.refs(), before)
+
+    def test_a_named_move_reopens_around_the_force_push(self) -> None:
+        new = self.fixup(1)
+        p = self.train("--recut", "99", "--moved", "1", "--push")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("#1 refused to reopen; restoring", p.stdout)
+        # Refused once, reopened once with the closed head put back.
+        self.assertEqual(self.verbs("reopen"), ["1", "1", "2"])
+        self.assertEqual(
+            sh(self.work, "git", "ls-remote", "origin", "refs/heads/pr1")
+            .split()[0],
+            new,
+        )
+        body = pathlib.Path(str(self.log) + ".body").read_text()
+        self.assertEqual(train.constituents(body), {1: new, 2: self.heads[2]})
+
+    def test_a_named_head_that_did_not_move_is_refused(self) -> None:
+        self.fixup(1)
+        p = self.train("--recut", "99", "--moved", "1", "2", "--push")
+        self.assertRefused(p, "named in MOVED but not moved: #2")
+        self.assertEqual(self.verbs("reopen"), [])
+
+    def test_a_merged_train(self) -> None:
+        self.state["prs"]["99"]["state"] = "MERGED"
+        self.assertRefused(self.train("--recut", "99"), "is merged")
+
+    def test_prs_and_recut_together(self) -> None:
+        p = self.train("--recut", "99", "1")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("not both or neither", p.stdout)
+
+
 def load_tests(
     loader: unittest.TestLoader, tests: unittest.TestSuite, _: object
 ) -> unittest.TestSuite:
@@ -546,7 +700,7 @@ class Target(unittest.TestCase):
         env = {
             k: v
             for k, v in os.environ.items()
-            if k not in ("PRS", "PUSH", "MAKEFLAGS")
+            if k not in ("PRS", "PUSH", "RECUT", "MOVED", "MAKEFLAGS")
         }
         return subprocess.run(
             ["make", "--no-print-directory", "-C", str(self.tmp), *args],
@@ -599,6 +753,12 @@ class Target(unittest.TestCase):
         p = self.make("train", "PRS=3", "TRAIN_GATE=true")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("'--gate', 'true'", p.stdout)
+
+    def test_recut_and_moved_reach_the_script(self) -> None:
+        p = self.make("train", "RECUT=9", "MOVED=3 4", "PUSH=1")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("'--recut', '9', '--moved', '3', '4', '--push'",
+                      p.stdout)
 
     def test_push_reaches_the_script(self) -> None:
         p = self.make("train", "PRS=3", "PUSH=1")

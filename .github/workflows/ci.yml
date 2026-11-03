@@ -1303,6 +1303,11 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Doctests
         run: python -m doctest scripts/changelog.py
+      # tests/test_ruff_vendored.py runs a real ruff to show standard.mk's
+      # STD_RUFF_EXCLUDE leaves vendored files alone; without one it fails,
+      # naming ruff, rather than skipping.
+      - name: ruff, for the vendored-exclude tests
+        run: python -m pip install ruff==0.15.18
       - name: Behaviour, over real git repos
         run: python -m unittest discover -s tests -v
 

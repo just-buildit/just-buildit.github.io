@@ -925,8 +925,9 @@ endif
 # train and reopens each constituent, restoring a force-pushed branch
 # around the reopen with leases that pin exact shas; GitHub refuses to
 # reopen a PR whose branch was force-pushed while it was closed. If the
-# restore fails it prints the command that puts the branch back; then the
-# same `make train RECUT=...` recovers.
+# restore fails it prints the command that puts the branch back and the
+# same re-cut as a dry run; add PUSH=1 once its `#n moved:` line ends at
+# the reviewed head.
 #
 #   PRS           the PR numbers, in the order their commits should land
 #   RECUT         instead of PRS: the train PR to re-cut

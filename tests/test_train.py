@@ -183,6 +183,20 @@ class Fixture(unittest.TestCase):
             FAKE_GH_ORIGIN=str(self.origin),
         )
 
+    def identity(self, **cfg: str) -> None:
+        """Sets git identity config (``author_email="t@t"`` ->
+        ``author.email``) for the commits made until the test ends. Setting
+        a key twice is fine: the cleanup unsets every value it holds."""
+        for k, v in cfg.items():
+            key = k.replace("_", ".")
+            sh(self.work, "git", "config", key, v)
+            self.addCleanup(
+                subprocess.run,
+                ["git", "config", "--unset-all", key],
+                cwd=self.work,
+                capture_output=True,
+            )
+
     def commit(self, msg: str) -> str:
         sh(self.work, "git", "add", "-A")
         sh(self.work, "git", "commit", "--quiet", "-m", msg)
@@ -467,14 +481,6 @@ class Refuses(Fixture):
         self.state["prs"]["1"]["headRefOid"] = head
         self.assertRefused(self.train("1"), "merge commit")
 
-    def identity(self, **cfg: str) -> None:
-        """Sets git identity config (``author_email="t@t"`` ->
-        ``author.email``) for the commits made until the test ends."""
-        for k, v in cfg.items():
-            key = k.replace("_", ".")
-            sh(self.work, "git", "config", key, v)
-            self.addCleanup(sh, self.work, "git", "config", "--unset", key)
-
     def test_a_placeholder_author(self) -> None:
         # doppler fdde12e7c: `t <t@t>` rode a train onto main.
         self.identity(author_email="t@t")
@@ -495,6 +501,15 @@ class Refuses(Fixture):
             f"#1's commit {head[:9]} is committed by `t <t@t>`",
         )
 
+    def test_an_email_with_no_at(self) -> None:
+        # A dot is not enough: `t.t` has no domain at all.
+        self.identity(author_email="t.t")
+        head = self.pr(1, {"a.txt": "a\n"})
+        self.assertRefused(
+            self.train("1"),
+            f"#1's commit {head[:9]} is authored by `t <t.t>`",
+        )
+
     def test_bot_and_human_identities_ride(self) -> None:
         self.pr(1, {"a.txt": "a\n"})
         self.identity(
@@ -503,8 +518,7 @@ class Refuses(Fixture):
             committer_email="noreply@github.com",
         )
         self.pr(2, {"b.txt": "b\n"})
-        sh(self.work, "git", "config", "author.email",
-           "noreply@just-buildit.invalid")
+        self.identity(author_email="noreply@just-buildit.invalid")
         self.pr(3, {"c.txt": "c\n"})
         p = self.train("1", "2", "3")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
@@ -750,10 +764,20 @@ class Recuts(Fixture):
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
         self.assertIn("may be left at", p.stdout)
         self.assertIn(
-            f"restore with: git push --force-with-lease=refs/heads/pr1:"
+            f"Restore with: git push --force-with-lease=refs/heads/pr1:"
             f"{self.heads[1]} origin {new}:refs/heads/pr1",
             p.stdout,
         )
+        # The branch holds the racer's head, which MOVED would accept (it
+        # names a PR, not a sha): never tell the reader to push blind.
+        self.assertIn("Someone pushed to pr1 after the reopen", p.stdout)
+        self.assertIn(
+            "with any TRAIN_* overrides you gave: make train RECUT=99 "
+            f"MOVED='1'\nAdd PUSH=1 only once its `#1 moved:` line ends at "
+            f"the reviewed head {new[:9]}.",
+            p.stdout,
+        )
+        self.assertNotRegex(p.stdout, r"make train [^\n]*PUSH=1")
         # The reviewed head survives the failed run locally.
         self.assertEqual(
             sh(self.work, "git", "rev-parse", "refs/train/closed-1-new"), new
@@ -767,24 +791,29 @@ class Recuts(Fixture):
         p = self.train("--recut", "99", "--moved", "1", "--push")
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
         self.assertIn(
-            "Then re-run the same command to recover: make train RECUT=99 "
-            "MOVED='1' PUSH=1. Before the restore it refuses #1 as not "
-            "moved.",
+            "Then dry-run the same re-cut, with any TRAIN_* overrides you "
+            "gave: make train RECUT=99 MOVED='1'\n",
             p.stdout,
         )
+        self.assertNotIn("Someone pushed", p.stdout)
         self.assertEqual(self.origin_head("pr1"), self.heads[1])
         self.assertEqual(self.state["prs"]["1"]["state"], "OPEN")
         self.assertEqual(self.state["prs"]["99"]["state"], "CLOSED")
         (self.origin / "hooks" / "pre-receive").unlink()
-        # Re-run before the restore: refused, as the message says.
+        # Re-run before the restore: refused, failing closed.
         self.log.unlink()
         p = self.train("--recut", "99", "--moved", "1", "--push")
         self.assertRefused(p, "named in MOVED but not moved: #1")
-        # The printed restore, then the same command: the train lands the
-        # reviewed head and reopens #2, which the failed run never reached.
+        # The printed restore, then the dry run: it shows the move ending
+        # at the reviewed head, and only then the push lands it and
+        # reopens #2, which the failed run never reached.
         sh(self.work, "git", "push", "--quiet",
            f"--force-with-lease=refs/heads/pr1:{self.heads[1]}", "origin",
            f"{new}:refs/heads/pr1")
+        p = self.train("--recut", "99", "--moved", "1")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn(f"#1 moved: {self.heads[1][:9]} (change 1) -> "
+                      f"{new[:9]} (change 1, fixed)", p.stdout)
         p = self.train("--recut", "99", "--moved", "1", "--push")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertEqual(self.verbs("reopen"), ["2"])
@@ -794,10 +823,7 @@ class Recuts(Fixture):
 
     def test_a_placeholder_author_on_a_moved_head(self) -> None:
         # A re-cut composes through the same per-PR read as a train.
-        sh(self.work, "git", "config", "author.email", "t@t")
-        self.addCleanup(
-            sh, self.work, "git", "config", "--unset", "author.email"
-        )
+        self.identity(author_email="t@t")
         self.fixup(1)  # --amend keeps the author, so reset it too
         sh(self.work, "git", "switch", "--quiet", "pr1")
         sh(self.work, "git", "commit", "--quiet", "--amend", "--no-edit",

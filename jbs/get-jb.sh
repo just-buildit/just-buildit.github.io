@@ -12,6 +12,24 @@
 #   JB_REINSTALL=1 . <(curl -sSL https://just-buildit.github.io/get-jb.sh)
 # ############################################################################
 
+# _curl_tls_init -- the TLS options every curl fetch passes, in _CURL_TLS:
+# --ssl-revoke-best-effort on a Schannel curl (Git for Windows), so an
+# unreachable OCSP/CRL endpoint is not a failed install. A COPY of pkg.sh's,
+# which is canonical and says why; this script installs jbx, so no library
+# exists yet. Unset again at the end, with the array.
+# test/curl-tls.bats holds this body byte-identical to it.
+_curl_tls_init() {
+	local v=''
+	if [[ -n ${_CURL_TLS_SET-} ]]; then
+		return 0
+	fi
+	_CURL_TLS_SET=1
+	read -r v < <(curl -V 2>/dev/null) || :
+	if [[ ${v} =~ Schannel ]]; then
+		_CURL_TLS+=(--ssl-revoke-best-effort)
+	fi
+}
+
 # Wrapped in a function so locals don't leak and we can clean up afterward.
 _jb_install() {
 
@@ -62,7 +80,9 @@ _jb_install() {
 	trap "rm -f '${tmp_runit}'" RETURN
 
 	_jb_say "fetching jb from ${RUNIT_URL}"
-	if ! curl -sSL --fail --proto '=https' --tlsv1.2 -o "${tmp_runit}" "${RUNIT_URL}"; then
+	_curl_tls_init
+	if ! curl -sSL --fail --proto '=https' --tlsv1.2 "${_CURL_TLS[@]+"${_CURL_TLS[@]}"}" \
+		-o "${tmp_runit}" "${RUNIT_URL}"; then
 		printf "\033[1;31m  !!  \033[0mfailed to download jb\n" >&2
 		return 1
 	fi
@@ -152,7 +172,7 @@ _jb_install() {
 	local jb_conf="${JB_CONFIG_DIR:-${XDG_CONFIG_HOME:-${HOME}/.config}/just-bashit}"
 	local jbx_sh="${jb_conf}/jbx-shell.sh"
 	mkdir -p "${jb_conf}"
-	if curl -sSL --fail --proto '=https' --tlsv1.2 \
+	if curl -sSL --fail --proto '=https' --tlsv1.2 "${_CURL_TLS[@]+"${_CURL_TLS[@]}"}" \
 		-o "${jbx_sh}.new" "${RAW_BASE}/jbx-shell.sh"; then
 		mv -f "${jbx_sh}.new" "${jbx_sh}"
 		# shellcheck source=/dev/null
@@ -206,4 +226,5 @@ _jb_install() {
 }
 
 _jb_install "$@"
-unset -f _jb_install _jb_say _jb_ok _jb_warn
+unset -f _jb_install _jb_say _jb_ok _jb_warn _curl_tls_init
+unset _CURL_TLS _CURL_TLS_SET

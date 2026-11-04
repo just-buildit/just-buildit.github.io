@@ -276,6 +276,24 @@ _curl_retry_opts_init() {
 	fi
 }
 
+# _curl_tls_init -- the TLS options every curl fetch passes, in _CURL_TLS:
+# --ssl-revoke-best-effort on a Schannel curl (Git for Windows), so an
+# unreachable OCSP/CRL endpoint is not a failed install. A COPY of pkg.sh's,
+# which is canonical and says why; _asset below fetches pkg.sh, so it runs
+# before pkg.sh is sourced.
+# test/curl-tls.bats holds this body byte-identical to it.
+_curl_tls_init() {
+	local v=''
+	if [[ -n ${_CURL_TLS_SET-} ]]; then
+		return 0
+	fi
+	_CURL_TLS_SET=1
+	read -r v < <(curl -V 2>/dev/null) || :
+	if [[ ${v} =~ Schannel ]]; then
+		_CURL_TLS+=(--ssl-revoke-best-effort)
+	fi
+}
+
 _asset() {
 	local name="$1" dest
 	if [[ -r "${_SCRIPT_DIR}/${name}" ]]; then
@@ -289,6 +307,7 @@ _asset() {
 	fi
 	_log "fetching ${_JBS_BASE}/${name}"
 	_curl_retry_opts_init
+	_curl_tls_init
 	# With MSYS path conversion on, whatever the caller turned off: the sshd
 	# step sets MSYS2_ARG_CONV_EXCL='*' for its Windows programs, and Git for
 	# Windows' curl is one too -- handed `-o /tmp/...` unconverted, it could
@@ -296,7 +315,7 @@ _asset() {
 	# "windows-sshd.ps1 unavailable" (measured 2026-10-31, #190).
 	if ! env -u MSYS2_ARG_CONV_EXCL -u MSYS_NO_PATHCONV \
 		curl -sSL --fail "${_CURL_RETRY_OPTS[@]}" --connect-timeout 30 \
-		-o "${dest}" "${_JBS_BASE}/${name}"; then
+		"${_CURL_TLS[@]+"${_CURL_TLS[@]}"}" -o "${dest}" "${_JBS_BASE}/${name}"; then
 		rm -f "${dest}"
 		echo "error: cannot obtain ${name} (no sibling copy, fetch failed)" >&2
 		return 1
@@ -2061,8 +2080,9 @@ _pwsh_install_linux() {
 
 	_info "installing PowerShell ${_PS_VER} (linux-${arch}) into ${_PWSH_DIR}"
 	_curl_retry_opts_init
+	_curl_tls_init
 	if ! _run curl -sSL --fail "${_CURL_RETRY_OPTS[@]}" --connect-timeout 30 \
-		-o "${tarball}" "${url}"; then
+		"${_CURL_TLS[@]+"${_CURL_TLS[@]}"}" -o "${tarball}" "${url}"; then
 		_warn "could not download ${url}"
 		return 1
 	fi
@@ -2369,7 +2389,8 @@ step_claude() {
 		_result "claude:  ok (dry run)"
 		return 0
 	fi
-	if curl -fsSL "${_CLAUDE_INSTALL_SH}" | bash; then
+	_curl_tls_init
+	if curl -fsSL "${_CURL_TLS[@]+"${_CURL_TLS[@]}"}" "${_CLAUDE_INSTALL_SH}" | bash; then
 		_info "run 'claude' to sign in"
 		_result "claude:  ok (installed)"
 	else

@@ -623,11 +623,21 @@ function Install-JustBashit {
     # -- jbx, through get-jb.sh ------------------------------------------------
     # The URL travels in the environment so the command line carries no
     # quote for MSYS to re-parse (see the script's help).
+    #
+    # Git for Windows' curl is Schannel, which refuses the connection when
+    # the CA's revocation endpoints cannot be reached (VPN, proxy, firewall:
+    # "curl: (35) schannel: ... CRYPT_E_NO_REVOCATION_CHECK") where irm, which
+    # fetched this script, soft-fails. So a Schannel curl gets
+    # --ssl-revoke-best-effort: a revoked certificate is still refused. A
+    # one-line copy of pkg.sh's _curl_tls_init, the canonical decision; no
+    # library exists yet, and test/curl-tls.bats holds this line to it. Still
+    # no double quote on the line. The whole line is one quoted argument, so
+    # MSYS globs nothing in it, `[[` included; =~ keeps out a `*` anyway.
     $urlWasSet = Test-Path Env:JB_GET_JB_URL
     if (-not $urlWasSet) { $env:JB_GET_JB_URL = $JbDefaultUrl }
     try {
         Write-Information "  ->  running $env:JB_GET_JB_URL in bash"
-        & $bash -l -c '. <(curl -fsSL $JB_GET_JB_URL)'
+        & $bash -l -c 'o=; read -r v < <(curl -V 2>/dev/null); [[ $v =~ Schannel ]] && o=--ssl-revoke-best-effort; . <(curl -fsSL $o $JB_GET_JB_URL)'
         # get-jb.sh is sourced, so its status is that of its last line, not
         # of the install; whether jbx is there is the answer.
         & $bash -l -c 'test -x ~/.local/bin/jbx'

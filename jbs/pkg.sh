@@ -152,6 +152,50 @@ _vswhere() {
 }
 
 # ---------------------------------------------------------------------------
+# _curl_tls_init -- add, once, the TLS options every just-bashit curl fetch
+# passes to the _CURL_TLS array. Every fetch expands
+# "${_CURL_TLS[@]+"${_CURL_TLS[@]}"}"; nothing builds the decision itself.
+#
+# THIS is the canonical copy. just-runit, setup-system.sh and get-jb.sh each
+# carry a byte-identical one, because each runs before any library can be
+# sourced (get-jb.ps1 carries a one-line equivalent); test/curl-tls.bats
+# holds every copy equal to this one and every curl call to the array.
+#
+# On Schannel it adds --ssl-revoke-best-effort. Git for Windows' curl is
+# built on Schannel (`curl -V`: "libcurl/8.21.0 Schannel ..."), which by
+# default refuses the whole connection when the CA's OCSP/CRL endpoints
+# cannot be reached -- a VPN, a proxy, a firewall -- with "curl: (35)
+# schannel: ... CRYPT_E_NO_REVOCATION_CHECK" (0x80092012). PowerShell's irm
+# soft-fails the same check, so `irm get-jb.ps1 | iex` downloaded and then
+# died at its first curl. Best effort still refuses a certificate that IS
+# revoked and proceeds only when revocation cannot be determined, as a
+# browser does. It is NOT --ssl-no-revoke, and never --insecure.
+#
+# Decided from the first line of `curl -V`, the backend list. Any other
+# curl -- Linux, macOS, an OpenSSL MSYS2 curl -- gets nothing, which also
+# keeps the flag (curl >= 7.70) away from an old macOS curl that would
+# reject it. A multi-backend build naming "(Schannel)" gets it too; curl
+# accepts it there and the OpenSSL backend ignores it. `read < <(...)`, not
+# a pipe into head/grep: under `set -o pipefail` (just-runit) a grep -q that
+# exits on its match can SIGPIPE the writer and fail the test it passed.
+#
+# Appends rather than assigns, so just-runit's --no-verify (--insecure) set
+# before it survives. Memoised by _CURL_TLS_SET; it is not exported, so each
+# process decides for the curl on its own PATH.
+# ---------------------------------------------------------------------------
+_curl_tls_init() {
+	local v=''
+	if [[ -n ${_CURL_TLS_SET-} ]]; then
+		return 0
+	fi
+	_CURL_TLS_SET=1
+	read -r v < <(curl -V 2>/dev/null) || :
+	if [[ ${v} =~ Schannel ]]; then
+		_CURL_TLS+=(--ssl-revoke-best-effort)
+	fi
+}
+
+# ---------------------------------------------------------------------------
 # install-uv [-n]
 #
 # Install uv, the ONE way every just-bashit entry point does it: get-jb.sh,
@@ -298,8 +342,10 @@ install-uv() {
 	# documents covering the nested uv install, and this is that download.
 	local tls=()
 	[ "${JB_NO_VERIFY:-0}" = 1 ] && tls=(--insecure)
+	_curl_tls_init
 	tmp="$(mktemp "${TMPDIR:-/tmp}/uv-install.XXXXXX")" || return 1
-	if ! curl -LsSf --proto '=https' --tlsv1.2 "${tls[@]+"${tls[@]}"}" \
+	if ! curl -LsSf --proto '=https' --tlsv1.2 \
+		"${_CURL_TLS[@]+"${_CURL_TLS[@]}"}" "${tls[@]+"${tls[@]}"}" \
 		-o "${tmp}" "${_UV_INSTALL_SH}" ||
 		! sh "${tmp}" >&2; then
 		rm -f "${tmp}"

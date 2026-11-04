@@ -561,6 +561,7 @@ _is_aliases_file() {
 _head_ok() {
 	local url="${1}"
 	local code
+	_curl_tls_init
 	code=$(curl -sSL "${_CURL_TLS[@]+"${_CURL_TLS[@]}"}" --proto '=https' --tlsv1.2 --max-time 5 \
 		-o /dev/null -w '%{http_code}' --head "${url}" 2>/dev/null)
 	[[ ${code} == "200" || ${code} == "301" || ${code} == "302" ]]
@@ -816,6 +817,23 @@ _curl_retry_opts_init() {
 	fi
 }
 
+# _curl_tls_init -- the TLS options every curl fetch passes, in _CURL_TLS:
+# --ssl-revoke-best-effort on a Schannel curl (Git for Windows), so an
+# unreachable OCSP/CRL endpoint is not a failed install. A COPY of pkg.sh's,
+# which is canonical and says why; jbx sources no library of its own.
+# test/curl-tls.bats holds this body byte-identical to it.
+_curl_tls_init() {
+	local v=''
+	if [[ -n ${_CURL_TLS_SET-} ]]; then
+		return 0
+	fi
+	_CURL_TLS_SET=1
+	read -r v < <(curl -V 2>/dev/null) || :
+	if [[ ${v} =~ Schannel ]]; then
+		_CURL_TLS+=(--ssl-revoke-best-effort)
+	fi
+}
+
 # _curl_get URL DEST -- the one bounded, fail-closed download every fetch
 # makes: --fail, so an HTTP error is a failure and no error body reaches DEST,
 # and the probed retry flags above, so a transient blip is retried a bounded
@@ -823,6 +841,7 @@ _curl_retry_opts_init() {
 # to stderr. A caller decides what a failure means.
 _curl_get() {
 	_curl_retry_opts_init
+	_curl_tls_init
 	curl -sSL --fail --proto '=https' --tlsv1.2 "${_CURL_TLS[@]+"${_CURL_TLS[@]}"}" \
 		"${_CURL_RETRY_OPTS[@]}" --connect-timeout 30 \
 		-o "${2}" "${1}"

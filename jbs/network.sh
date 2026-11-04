@@ -15,6 +15,9 @@
 source "${NETWORK_SCRIPTPATH}/format.sh"
 # shellcheck source=/dev/null
 source "${NETWORK_SCRIPTPATH}/environment.sh"
+# For _curl_tls_init, the one TLS decision every curl call makes.
+# shellcheck source=/dev/null
+source "${NETWORK_SCRIPTPATH}/pkg.sh"
 
 test-internet-access() {
 
@@ -146,7 +149,11 @@ test-internet-access() {
 			case "${COMMAND}" in
 			ping) ARGS+=(ping -W "${REM}" "${PING_ARGS[@]}") ;;
 			wget) ARGS+=(wget --timeout "${REM}" "${WGET_ARGS[@]}") ;;
-			curl) ARGS+=(curl --max-time "${REM}" "${CURL_ARGS[@]}") ;;
+			curl)
+				_curl_tls_init
+				# shellcheck disable=SC2154  # set by pkg.sh's _curl_tls_init
+				ARGS+=(curl --max-time "${REM}" "${_CURL_TLS[@]+"${_CURL_TLS[@]}"}" "${CURL_ARGS[@]}")
+				;;
 			esac
 
 			# Get outta here if we establish connectivity

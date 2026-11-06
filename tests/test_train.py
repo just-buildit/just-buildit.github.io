@@ -10,7 +10,8 @@ failure is reported as PUBLISHED, never REFUSED.
 The fixture is a throwaway origin (a bare repo) and a clone. Each PR's head
 is pushed to ``refs/pull/<n>/head`` on the origin, as GitHub serves it, and
 ``GH`` points the script at a fake that answers ``pr view``, ``repo view``,
-the review-thread query and the closing-issues query from a JSON state file and logs every call, so
+the review-thread query, the closing-issues query and ``run list`` /
+``run cancel`` from a JSON state file and logs every call, so
 a test can assert what was (and was not) created or closed. Stdlib only.
 """
 
@@ -94,10 +95,18 @@ FAKE_GH = textwrap.dedent(
         body = open(a[a.index("--body-file") + 1]).read()
         with open(os.environ["FAKE_GH_LOG"] + ".body", "w") as f:
             f.write(body)
+        head = a[a.index("--head") + 1]
         state.setdefault("created", []).append(
             {"number": 99, "url": "https://github.com/o/r/pull/99",
-             "state": "OPEN", "headRefName": a[a.index("--head") + 1],
+             "state": "OPEN", "headRefName": head,
              "baseRefName": a[a.index("--base") + 1]})
+        # GitHub starts the train's own CI the moment its PR opens.
+        rid = 9900 + len(state.setdefault("runs", []))
+        state["runs"].append(
+            {"databaseId": rid, "headBranch": head, "status": "queued",
+             "name": "ci", "url": "u/%d" % rid,
+             "headSha": origin("rev-parse", "refs/heads/" + head)
+             .stdout.strip()})
         save()
         print("https://github.com/o/r/pull/99")
     elif a[:2] == ["pr", "list"]:
@@ -109,6 +118,23 @@ FAKE_GH = textwrap.dedent(
             for p in [*state["prs"].values(), *state.get("created", [])]
             if p.get("headRefName") == head and p["state"] == "OPEN"
         ]))
+    elif a[:2] == ["run", "list"]:
+        # Without --branch, gh lists every branch's runs.
+        br = a[a.index("--branch") + 1] if "--branch" in a else None
+        st = a[a.index("--status") + 1]
+        if br in state.get("run_list_fail", []):
+            sys.exit("gh: HTTP 502: Bad Gateway")
+        print(json.dumps([
+            r for r in state.get("runs", [])
+            if br in (None, r["headBranch"]) and r["status"] == st
+        ]))
+    elif a[:2] == ["run", "cancel"]:
+        if a[2] in state.get("cancel_fail", []):
+            sys.exit("gh: HTTP 502: Bad Gateway")
+        for r in state.get("runs", []):
+            if str(r["databaseId"]) == a[2]:
+                r["status"] = "cancelled"
+        save()
     elif a[:2] == ["pr", "comment"]:
         if a[2] in state.get("comment_fail", []):
             sys.exit("gh: HTTP 502: Bad Gateway")
@@ -499,6 +525,84 @@ class ClosesAfterPublish(Fixture):
         self.assertNotIn("open train", p.stdout)
 
 
+class CancelsClosedCI(Fixture):
+    """A closed constituent's CI gates nothing once the train runs on the
+    combined tree, and closing a PR does not cancel it: left running, it
+    held the org's macOS runners for 40 minutes while a release queued
+    behind it (just-buildit.github.io#200)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.h = {}
+        for n, f in ((1, "a.txt"), (2, "b.txt")):
+            self.h[n] = self.pr(n, {f: f"{n}\n"}, headRefName=f"pr{n}")
+            sh(self.work, "git", "push", "--quiet", "origin",
+               f"pr{n}:refs/heads/pr{n}")
+
+    def run_(self, rid: int, br: str, sha: str, status: str) -> None:
+        self.state.setdefault("runs", []).append(
+            dict(databaseId=rid, headBranch=br, headSha=sha, status=status,
+                 name="ci", url=f"u/{rid}")
+        )
+
+    def cancelled(self) -> list[str]:
+        return [c[2] for c in self.calls() if c[:2] == ["run", "cancel"]]
+
+    def test_publish_cancels_each_constituents_active_runs(self) -> None:
+        self.run_(11, "pr1", self.h[1], "in_progress")
+        self.run_(12, "pr1", self.h[1], "queued")
+        self.run_(13, "pr1", "0" * 40, "in_progress")  # not the head taken
+        self.run_(21, "pr2", self.h[2], "queued")
+        self.run_(22, "pr2", self.h[2], "completed")
+        # A run on another branch at a constituent's head is not its CI.
+        self.run_(31, "main", self.h[1], "in_progress")
+        p = self.train("--push", "1", "2")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.cancelled(), ["11", "12", "21"])
+        self.assertIn("train: cancelled #1's run 11 (ci, u/11)", p.stdout)
+        # Each is cancelled only once its PR is closed.
+        verbs = [c[:3] for c in self.calls()]
+        self.assertLess(
+            verbs.index(["pr", "close", "2"]),
+            verbs.index(["run", "cancel", "21"]),
+        )
+        status = {r["databaseId"]: r["status"] for r in self.state["runs"]}
+        self.assertEqual(status[13], "in_progress")
+        self.assertEqual(status[31], "in_progress")
+
+    def test_the_trains_own_runs_are_never_cancelled(self) -> None:
+        self.run_(11, "pr1", self.h[1], "queued")
+        p = self.train("--push", "1", "2")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        head = sh(self.work, "git", "rev-parse", "origin/train/1-2")
+        own = [r for r in self.state["runs"] if r["headBranch"] == "train/1-2"]
+        self.assertEqual([r["headSha"] for r in own], [head])
+        self.assertEqual(own[0]["status"], "queued")
+        self.assertNotIn(str(own[0]["databaseId"]), self.cancelled())
+        self.assertFalse(
+            [c for c in self.calls() if c[:2] == ["run", "list"]
+             and "train/1-2" in c]
+        )
+
+    def test_a_failed_cancel_warns_and_still_publishes(self) -> None:
+        self.run_(11, "pr1", self.h[1], "queued")
+        self.run_(21, "pr2", self.h[2], "queued")
+        self.state["cancel_fail"] = ["11"]
+        self.state["run_list_fail"] = ["pr2"]
+        p = self.train("--push", "1", "2")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn("REFUSED", p.stdout)
+        self.assertIn(
+            "train: warning: cannot cancel #1's run 11 (ci, u/11): "
+            "exited 1: gh: HTTP 502: Bad Gateway",
+            p.stdout,
+        )
+        self.assertIn("train: warning: cannot list #2's queued runs on pr2",
+                      p.stdout)
+        self.assertEqual(self.cancelled(), ["11"] * train.RETRY_TRIES)
+        self.assertIn("closed #1, #2", p.stdout)
+
+
 class CarriesClosingIssues(Fixture):
     """A constituent is closed unmerged, and a PR closed unmerged closes
     nothing, so the issues each one links must be declared by the train
@@ -819,6 +923,44 @@ class Recuts(Fixture):
         body = pathlib.Path(str(self.log) + ".body").read_text()
         self.assertIn("re-cuts the train #99", body)
         self.assertEqual(train.constituents(body), self.heads)
+
+    def test_a_recut_cancels_the_old_trains_runs_not_its_own(self) -> None:
+        # The first train's CI, queued when it opened, is on the branch the
+        # re-cut reuses; only its sha tells it from the new train's.
+        old = [r for r in self.state["runs"] if r["headSha"] == self.old]
+        self.assertEqual([r["status"] for r in old], ["queued"])
+        # A later committer date: picks made within the same second as
+        # the first train's would reproduce its very commits.
+        self.env["GIT_COMMITTER_DATE"] = "1893456000 +0000"
+        p = self.train("--recut", "99", "--push")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        new = sh(self.work, "git", "rev-parse", "origin/train/1-2")
+        self.assertNotEqual(new, self.old)
+        status = {r["headSha"]: r["status"] for r in self.state["runs"]}
+        self.assertEqual(status[self.old], "cancelled")
+        self.assertEqual(status[new], "queued")
+        self.assertEqual(
+            [c[2] for c in self.calls() if c[:2] == ["run", "cancel"]],
+            [str(old[0]["databaseId"])],
+        )
+
+    def test_a_recut_to_the_same_head_keeps_its_run(self) -> None:
+        # Re-cut onto an unchanged base with the first train's committer
+        # date, the picks are its very commits: the run queued for the old
+        # head is the new train's own CI, and must not be cancelled.
+        self.env["GIT_COMMITTER_DATE"] = sh(
+            self.work, "git", "log", "-1", "--format=%cd", "--date=raw",
+            self.old,
+        )
+        p = self.train("--recut", "99", "--push")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        new = sh(self.work, "git", "rev-parse", "origin/train/1-2")
+        self.assertEqual(new, self.old)
+        self.assertEqual(
+            [c for c in self.calls() if c[:2] == ["run", "cancel"]], []
+        )
+        old = [r for r in self.state["runs"] if r["headSha"] == self.old]
+        self.assertEqual({r["status"] for r in old}, {"queued"})
 
     def test_a_moved_head_is_refused(self) -> None:
         new = self.fixup(1)

@@ -59,8 +59,9 @@ Once the train PR exists nothing is REFUSED, because something was
 published. Each constituent gets its comment (``gh pr comment``), then is
 closed (``gh pr close``): two calls, so a retry never repeats a comment
 that landed. A run that cannot be listed or cancelled (step 9) is a
-``train: warning`` naming it, never a failure. Each is tried ``RETRY_TRIES`` times, waiting
-``TRAIN_RETRY_DELAY`` seconds (default 2), doubling, between tries: a
+``train: warning`` naming it, never a failure. Each is tried
+``RETRY_TRIES`` times, waiting ``TRAIN_RETRY_DELAY`` seconds (default 2),
+doubling, between tries: a
 GitHub API failure there is usually transient. A constituent merged in
 the meantime counts as done. If one still fails, the run
 prints ``train: PUBLISHED`` with the train's URL, the constituents closed

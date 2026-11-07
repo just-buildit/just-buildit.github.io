@@ -79,9 +79,10 @@ read -r -d '' HELP <<-'EOF' || true
 	          host; print the public key to register with GitHub.
 	  sshd    Windows only (WSL or native MSYS2 / Git Bash): run Windows'
 	          OpenSSH server as a boot-time service -- key-only, keys
-	          from github.com/<user>.keys, pwsh.exe as the login shell --
-	          so the machine is reachable over ssh even when WSL is not
-	          running. Raises one UAC prompt on the Windows desktop. On
+	          from github.com/<user>.keys (re-read every 4 h by a task),
+	          pwsh.exe as the login shell -- so the machine is reachable
+	          over ssh even when WSL is not running. A task as the user
+	          keeps the WSL distro running from boot. Raises one UAC prompt on the Windows desktop. On
 	          native Windows it is a default step, and also starts the
 	          ssh-agent service at boot and adds the box key to it; from
 	          WSL only when asked for (-s sshd).

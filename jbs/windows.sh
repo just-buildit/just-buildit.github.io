@@ -31,6 +31,7 @@
 #   System32                          cmd.exe, icacls.exe, wsl.exe, ...
 #   System32/WindowsPowerShell/v1.0   powershell.exe (Windows PowerShell 5.1)
 #   Program Files/PowerShell/7        pwsh.exe (PowerShell 7, when installed)
+#   Program Files/Tailscale           tailscale.exe (when installed)
 #
 # Example:
 #   . windows.sh
@@ -46,7 +47,8 @@ win-exe() {
 	[[ -n ${root} ]] || return 1
 	for p in "${root}/Windows/System32/${name}" \
 		"${root}/Windows/System32/WindowsPowerShell/v1.0/${name}" \
-		"${root}/Program Files/PowerShell/7/${name}"; do
+		"${root}/Program Files/PowerShell/7/${name}" \
+		"${root}/Program Files/Tailscale/${name}"; do
 		if [[ -x ${p} ]]; then
 			printf '%s\n' "${p}"
 			return 0
@@ -89,10 +91,17 @@ win-home() {
 # Mandatory Level) token, with no UAC prompt -- nobody has to be at the
 # desktop (measured on yoga-x2p and zen-x2elite, 2026-09-28).
 #
-# The host is WSL's default gateway (NAT networking), overridable with
-# JB_WIN_HOST. It is trusted only after one round trip proves two things:
-# the far end's %COMPUTERNAME% is this machine's -- so a gateway that is some
-# other box is never mistaken for the host -- and the session is elevated.
+# The host is WSL's default gateway (NAT networking), then, if that does not
+# answer, this machine's Windows tailnet address (`tailscale.exe ip -4`).
+# JB_WIN_HOST names the one host to try instead. The gateway is reached
+# through jb-sshd-wsl, a rule pinned to WSL's adapter; on a box set up before
+# the task that re-pins it existed, the first reboot strands it, and the
+# step that would register the task could not reach Windows through the rule
+# it repairs (#218, measured on yoga-x2p 2026-11-07). The tailnet route is
+# what `ssh <box>-win` uses. Each host is trusted only after one round trip
+# proves two things: the far end's %COMPUTERNAME% is this machine's -- so a
+# gateway or address that is some other box is never mistaken for the host
+# -- and the session is elevated.
 # The key is the one named after this host (~/.ssh/<hostname>) when present,
 # the ssh step's convention; otherwise ssh's defaults.
 #
@@ -166,10 +175,9 @@ win-elevated() {
 }
 
 win-admin-channel() {
-	local cmd host user name out
+	local cmd ts host user name out
+	local -a hosts=()
 	cmd="$(win-exe cmd.exe)" || return 1
-	host="${JB_WIN_HOST:-$(ip route show default 2>/dev/null | awk '{ print $3; exit }')}"
-	[[ -n ${host} ]] || return 1
 	user="$( (
 		cd /mnt/c 2>/dev/null || true
 		"${cmd}" /c 'echo %USERNAME%' 2>/dev/null
@@ -179,13 +187,35 @@ win-admin-channel() {
 		"${cmd}" /c 'echo %COMPUTERNAME%' 2>/dev/null
 	) | tr -d '\r\n')"
 	[[ -n ${user} && -n ${name} ]] || return 1
-	# WIN_ELEVATED_PS (above): is the far end's session elevated?
-	# shellcheck disable=SC2016  # the far end's PowerShell expands it
-	out="$(ssh "${WIN_SSH_OPTS[@]}" "${user}@${host}" \
-		'$env:COMPUTERNAME; '"${WIN_ELEVATED_PS}" \
-		2>/dev/null | tr -d '\r')" || return 1
-	[[ ${out} == "${name}"$'\n'True ]] || return 1
-	printf '%s\n' "${user}@${host}"
+	if [[ -n ${JB_WIN_HOST:-} ]]; then
+		hosts=("${JB_WIN_HOST}")
+	else
+		host="$(ip route show default 2>/dev/null | awk '{ print $3; exit }')"
+		[[ -z ${host} ]] || hosts+=("${host}")
+		# Asked only now, so a box without Tailscale pays nothing for it.
+		if ts="$(win-exe tailscale.exe)"; then
+			host="$( (
+				cd /mnt/c 2>/dev/null || true
+				"${ts}" ip -4 2>/dev/null
+			) | tr -d '\r' | head -n 1)" || host="" # not running: no address
+			[[ ! ${host} =~ ^[0-9]+(\.[0-9]+){3}$ ]] || hosts+=("${host}")
+		fi
+	fi
+	# Callers run under `set -euo pipefail` (setup-system, install-deps), so
+	# a host that does not answer fails the assignment below: `|| continue`
+	# is what moves on to the next one, rather than ending the search.
+	for host in "${hosts[@]}"; do
+		# WIN_ELEVATED_PS (above): is the far end's session elevated?
+		# shellcheck disable=SC2016  # the far end's PowerShell expands it
+		out="$(ssh "${WIN_SSH_OPTS[@]}" "${user}@${host}" \
+			'$env:COMPUTERNAME; '"${WIN_ELEVATED_PS}" \
+			2>/dev/null | tr -d '\r')" || continue
+		if [[ ${out} == "${name}"$'\n'True ]]; then
+			printf '%s\n' "${user}@${host}"
+			return 0
+		fi
+	done
+	return 1
 }
 
 # WIN_NEEDS_ADMIN -- the reason a step that needs admin was skipped: the

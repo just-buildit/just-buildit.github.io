@@ -38,6 +38,14 @@
          so later runs can come over an admin ssh session with no prompt.
          WSL rebuilds that interface on every boot, so a SYSTEM scheduled
          task re-scopes the second rule each time WSL's switch comes up.
+         With -GitHubUser, a second SYSTEM task re-runs step 2 at startup
+         and every few hours (-RefreshKeys), so a key registered on GitHub
+         later reaches this box with no visit (#215). A fetch that fails or
+         comes back empty leaves the file as it was.
+         When the user has a WSL distro, a task running as that user (S4U,
+         no logon needed) keeps one `wsl.exe` client alive from boot, so
+         the distro and everything in it -- tailscaled, a CI runner --
+         stays up instead of stopping when idle.
       6. The sshd service is set to start automatically, and restarted so
          the new configuration is live.
       7. With -SshAgent, the OpenSSH Authentication Agent service
@@ -129,7 +137,8 @@ param(
     [string]$User = $env:USERNAME,
     [switch]$SshAgent,
     [switch]$RescopeWslRule,
-    [switch]$CheckWslRule
+    [switch]$CheckWslRule,
+    [switch]$RefreshKeys
 )
 
 Set-StrictMode -Version Latest
@@ -400,6 +409,33 @@ function Test-WslRuleScope {
     }
 }
 
+function Install-TaskScript {
+    <#
+    .SYNOPSIS
+        Copy this script to %ProgramData%\just-bashit, where only
+        Administrators and SYSTEM can write it, and return the copy's path.
+    .DESCRIPTION
+        A SYSTEM task must never run a file the user can rewrite, and
+        setup-system leaves its copy in the user's %TEMP%. Every SYSTEM task
+        here runs this copy. The directory's ACL is reset to Administrators
+        and SYSTEM in full, Users read-only (the unelevated -CheckWslRule
+        reads it).
+    #>
+    param([string]$Source)
+    $dir = Join-Path $env:ProgramData 'just-bashit'
+    $target = Join-Path $dir 'windows-sshd.ps1'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    & icacls.exe $dir /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' `
+        '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "icacls failed on $dir" }
+    if ($Source -ne $target) { Copy-Item -LiteralPath $Source -Destination $target -Force }
+    # A file that existed before the directory's ACL was reset keeps its own;
+    # /reset makes it take the directory's.
+    & icacls.exe $target /reset | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "icacls failed on $target" }
+    $target
+}
+
 function Register-WslRescopeTask {
     <#
     .SYNOPSIS
@@ -421,18 +457,7 @@ function Register-WslRescopeTask {
         for the adapter and then exits.
     #>
     param([string]$Source)
-    $dir = Join-Path $env:ProgramData 'just-bashit'
-    $target = Join-Path $dir 'windows-sshd.ps1'
-    New-Item -ItemType Directory -Force -Path $dir | Out-Null
-    & icacls.exe $dir /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' `
-        '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "icacls failed on $dir" }
-    if ($Source -ne $target) { Copy-Item -LiteralPath $Source -Destination $target -Force }
-    # A file that existed before the directory's ACL was reset keeps its own;
-    # /reset makes it take the directory's.
-    & icacls.exe $target /reset | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "icacls failed on $target" }
-
+    $target = Install-TaskScript -Source $Source
     $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $action = New-ScheduledTaskAction -Execute $ps -Argument (
         "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$target`" -RescopeWslRule")
@@ -448,6 +473,96 @@ function Register-WslRescopeTask {
         -Trigger $triggers -Principal $principal -Settings $settings -Force | Out-Null
     Write-Information ("  ok    task $RescopeTaskPath$RescopeTaskName re-scopes $WslRuleName " +
         'whenever WSL rebuilds its adapter')
+}
+
+$KeyRefreshTaskName = 'jb-sshd-key-refresh'
+$KeepAliveTaskName = 'jb-wsl-keepalive'
+#: How often the key list is re-read from GitHub, after the startup run.
+$KeyRefreshEvery = New-TimeSpan -Hours 4
+#: How often the keep-alive is re-asserted. A running instance makes the
+#: repeat a no-op (IgnoreNew); one that died -- `wsl --shutdown`, a WSL
+#: update -- is back within this.
+$KeepAliveEvery = New-TimeSpan -Minutes 5
+
+function Register-KeyRefreshTask {
+    <#
+    .SYNOPSIS
+        Register (or replace) the SYSTEM task that re-mirrors the GitHub key
+        list at startup and every $KeyRefreshEvery (#215).
+    .DESCRIPTION
+        Without it the "mirror" is a snapshot: a machine whose key reaches
+        GitHub after this box was set up is refused here until someone
+        re-runs setup by hand, at the box. The task runs the protected copy
+        (Install-TaskScript) with -RefreshKeys, which writes only on a
+        successful, non-empty fetch.
+    #>
+    param([string]$Source, [string]$GitHubUser, [string]$User)
+    $target = Install-TaskScript -Source $Source
+    $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $action = New-ScheduledTaskAction -Execute $ps -Argument (
+        "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$target`" " +
+        "-RefreshKeys -GitHubUser $GitHubUser -User $User")
+    $triggers = @(
+        (New-ScheduledTaskTrigger -AtStartup),
+        (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval $KeyRefreshEvery))
+    $principal = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -MultipleInstances IgnoreNew
+    Register-ScheduledTask -TaskName $KeyRefreshTaskName -TaskPath $RescopeTaskPath -Action $action `
+        -Trigger $triggers -Principal $principal -Settings $settings -Force | Out-Null
+    Write-Information ("  ok    task $RescopeTaskPath$KeyRefreshTaskName re-reads " +
+        "github.com/$GitHubUser.keys at startup and every $($KeyRefreshEvery.TotalHours) h")
+}
+
+function Test-WslDistro {
+    <#
+    .SYNOPSIS
+        Whether this user has a WSL distro to keep alive.
+    .DESCRIPTION
+        `wsl.exe -l -q` prints the distro names, UTF-16, so NULs are dropped
+        before reading it. No wsl.exe, a failure, or an empty list is False.
+    #>
+    $wsl = Join-Path $env:SystemRoot 'System32\wsl.exe'
+    if (-not (Test-Path -LiteralPath $wsl)) { return $false }
+    $names = @(& $wsl -l -q 2>$null | ForEach-Object { ($_ -replace "`0", '').Trim() } |
+            Where-Object { $_ })
+    ($LASTEXITCODE -eq 0) -and ($names.Count -gt 0)
+}
+
+function Register-WslKeepAliveTask {
+    <#
+    .SYNOPSIS
+        Register (or replace) the task that keeps the user's default WSL
+        distro running: one `wsl.exe` client running `sleep infinity`.
+    .DESCRIPTION
+        WSL stops a distro once no Windows process is attached to it, which
+        takes down everything inside -- tailscaled, so the box's Linux node
+        drops off the tailnet, and any service such as a CI runner. Nothing
+        else on a headless box holds it open (on a desktop it is often VS
+        Code that does).
+
+        The task runs AS THE USER, because a distro belongs to the user who
+        registered it: SYSTEM sees none. S4U runs it with nobody logged on
+        (measured on zen-x2elite-x, 2026-11-07: an S4U task's wsl.exe ran
+        in the user's distro). Triggers: startup, the user's logon, and
+        every $KeepAliveEvery; IgnoreNew makes a repeat a no-op while the
+        client lives, so one that died is restarted within that interval.
+        No time limit: the client is meant to run forever.
+    #>
+    param([string]$User)
+    $wsl = Join-Path $env:SystemRoot 'System32\wsl.exe'
+    $action = New-ScheduledTaskAction -Execute $wsl -Argument '--exec /bin/sleep infinity'
+    $triggers = @(
+        (New-ScheduledTaskTrigger -AtStartup),
+        (New-ScheduledTaskTrigger -AtLogOn -User "$env:COMPUTERNAME\$User"),
+        (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval $KeepAliveEvery))
+    $principal = New-ScheduledTaskPrincipal -UserId "$env:COMPUTERNAME\$User" -LogonType S4U -RunLevel Limited
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+    Register-ScheduledTask -TaskName $KeepAliveTaskName -TaskPath $RescopeTaskPath -Action $action `
+        -Trigger $triggers -Principal $principal -Settings $settings -Force | Out-Null
+    Write-Information ("  ok    task $RescopeTaskPath$KeepAliveTaskName keeps $User's default WSL " +
+        "distro running from boot")
 }
 
 # ---------------------------------------------------------------------------
@@ -587,10 +702,8 @@ function Enable-SshAgentService {
 
 # The test suite dot-sources this file for the functions above and must not
 # fall through into the part that changes the machine.
-if ($MyInvocation.InvocationName -eq '.') { return }
-
 # ---------------------------------------------------------------------------
-# Main: everything below changes the machine.
+# The authorized keys: where they come from, and the file sshd reads.
 # ---------------------------------------------------------------------------
 
 function Write-Utf8NoBom {
@@ -601,6 +714,120 @@ function Write-Utf8NoBom {
     $enc = New-Object System.Text.UTF8Encoding($false)
     [IO.File]::WriteAllText($Path, (($Lines -join "`n") + "`n"), $enc)
 }
+
+function Get-SourceKey {
+    <#
+    .SYNOPSIS
+        The key lines from -KeysFile, else github.com/<GitHubUser>.keys, and
+        where they came from, as @{ Keys; Source }. A failed fetch throws.
+    #>
+    param([string]$GitHubUser, [string]$KeysFile)
+    if ($KeysFile) {
+        return @{ Keys = @(Get-KeyLine (Get-Content -Raw -LiteralPath $KeysFile)); Source = $KeysFile }
+    }
+    # TLS 1.2 by hand: Windows PowerShell 5.1 still defaults to protocols
+    # GitHub refuses.
+    [Net.ServicePointManager]::SecurityProtocol =
+    [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $url = "https://github.com/$GitHubUser.keys"
+    @{ Keys = @(Get-KeyLine (Invoke-RestMethod -Uri $url -UseBasicParsing)); Source = $url }
+}
+
+function Get-UserProfileDir {
+    <#
+    .SYNOPSIS
+        *User*'s profile directory, from the registry's ProfileList by SID.
+    .DESCRIPTION
+        Not $env:USERPROFILE: the key-refresh task runs as SYSTEM, whose
+        profile is under System32, and a sibling of it is nobody's.
+    #>
+    param([string]$User)
+    $sid = (New-Object Security.Principal.NTAccount($User)).Translate(
+        [Security.Principal.SecurityIdentifier]).Value
+    (Get-ItemProperty -LiteralPath (
+        "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid")).ProfileImagePath
+}
+
+function Write-AuthorizedKey {
+    <#
+    .SYNOPSIS
+        Write *Keys* into the managed block of the file sshd reads for
+        *User*, set its ACL, and return its path.
+    .DESCRIPTION
+        Administrators are special-cased by the stock sshd_config
+        (`Match Group administrators`): their ~/.ssh/authorized_keys is
+        IGNORED in favour of one machine-wide file. Writing the per-user
+        file for an admin is the classic "the key is right there and it
+        still asks for a password".
+
+        Get-LocalGroupMember throws on a group holding an orphaned SID (a
+        deleted account, a machine that left a domain) -- a long-standing
+        Windows bug. A throw there must not quietly become "not an admin",
+        which would write the file sshd ignores, so `net localgroup` is
+        asked instead. It is resolved by SID because the group's NAME is
+        localised.
+
+        The ACL is re-asserted every run: the bytes are not what rots, the
+        ACL is. sshd skips a key file writable by anyone but its owner,
+        SYSTEM and Administrators, and says so only in its own log.
+    #>
+    param([string]$User, [string[]]$Keys)
+    $sshDir = Join-Path $env:ProgramData 'ssh'
+    $adminSid = 'S-1-5-32-544'
+    $userPattern = "(^|\\)$([regex]::Escape($User))$"
+    try {
+        $members = @(Get-LocalGroupMember -SID $adminSid | ForEach-Object { $_.Name })
+    }
+    catch {
+        $group = (New-Object Security.Principal.SecurityIdentifier($adminSid)).Translate(
+            [Security.Principal.NTAccount]).Value.Split('\')[-1]
+        $members = @(& net.exe localgroup $group | ForEach-Object { $_.Trim() })
+    }
+    $isAdmin = [bool]($members | Where-Object { $_ -match $userPattern })
+    if ($isAdmin) {
+        $keyFile = Join-Path $sshDir 'administrators_authorized_keys'
+    }
+    else {
+        $keyFile = Join-Path (Get-UserProfileDir -User $User) '.ssh\authorized_keys'
+        New-Item -ItemType Directory -Force -Path (Split-Path $keyFile) | Out-Null
+    }
+    $existing = @()
+    if (Test-Path -LiteralPath $keyFile) { $existing = @(Get-Content -LiteralPath $keyFile) }
+    Write-Utf8NoBom -Path $keyFile -Lines (Merge-ManagedBlock -Existing $existing -Body $Keys)
+    if ($isAdmin) {
+        & icacls.exe $keyFile /inheritance:r /grant:r '*S-1-5-32-544:F' '*S-1-5-18:F' | Out-Null
+    }
+    else {
+        & icacls.exe $keyFile /inheritance:r /grant:r "${User}:F" '*S-1-5-18:F' | Out-Null
+    }
+    if ($LASTEXITCODE -ne 0) { throw "icacls failed on $keyFile" }
+    $keyFile
+}
+
+function Invoke-KeyRefresh {
+    <#
+    .SYNOPSIS
+        The key-refresh task's run (-RefreshKeys): re-mirror the GitHub key
+        list, or change nothing.
+    .DESCRIPTION
+        A fetch that throws (no network at boot, GitHub down) or returns no
+        key leaves the file exactly as it was: an empty list written here
+        would lock every machine out of a box that answers only to keys.
+        Returns what it did, for the task's history and the tests.
+    #>
+    param([string]$GitHubUser, [string]$User)
+    try { $got = Get-SourceKey -GitHubUser $GitHubUser }
+    catch { return "unchanged: fetch failed ($($_.Exception.Message))" }
+    if ($got.Keys.Count -eq 0) { return "unchanged: no keys at $($got.Source)" }
+    $file = Write-AuthorizedKey -User $User -Keys $got.Keys
+    "refreshed: $($got.Keys.Count) key(s) from $($got.Source) into $file"
+}
+
+if ($MyInvocation.InvocationName -eq '.') { return }
+
+# ---------------------------------------------------------------------------
+# Main: everything below changes the machine.
+# ---------------------------------------------------------------------------
 
 # -CheckWslRule needs no elevation: the firewall's persistent store is
 # readable by any user, where Get-NetFirewallInterfaceFilter is not.
@@ -635,24 +862,18 @@ if ($RescopeWslRule) {
     Write-Information "  note  no WSL adapter yet; $WslRuleName is re-scoped when WSL starts"
     exit 0
 }
+if ($RefreshKeys) {
+    Write-Information (Invoke-KeyRefresh -GitHubUser $GitHubUser -User $User)
+    exit 0
+}
 if (-not $GitHubUser -and -not $KeysFile) {
     throw 'no key source: pass -GitHubUser or -KeysFile'
 }
 
 # -- 1. keys first: nothing is changed unless there is someone to let in ----
-if ($KeysFile) {
-    $keys = Get-KeyLine (Get-Content -Raw -LiteralPath $KeysFile)
-    $source = $KeysFile
-}
-else {
-    # TLS 1.2 by hand: Windows PowerShell 5.1 still defaults to protocols
-    # GitHub refuses.
-    [Net.ServicePointManager]::SecurityProtocol =
-    [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    $url = "https://github.com/$GitHubUser.keys"
-    $keys = Get-KeyLine (Invoke-RestMethod -Uri $url -UseBasicParsing)
-    $source = $url
-}
+$got = Get-SourceKey -GitHubUser $GitHubUser -KeysFile $KeysFile
+$keys = $got.Keys
+$source = $got.Source
 if ($keys.Count -eq 0) {
     throw "no keys found at $source; refusing to turn off passwords with nothing to log in with"
 }
@@ -671,49 +892,9 @@ if (-not (Test-Path -LiteralPath $config)) {
 }
 
 # -- 3. authorized keys, in the file sshd reads for this user ---------------
-# Administrators are special-cased by the stock sshd_config
-# (`Match Group administrators`): their ~/.ssh/authorized_keys is IGNORED in
-# favour of one machine-wide file. Writing the per-user file for an admin
-# is the classic "the key is right there and it still asks for a password".
-#
-# Get-LocalGroupMember throws on a group holding an orphaned SID (a deleted
-# account, a machine that left a domain) -- a long-standing Windows bug. A
-# throw there must not quietly become "not an admin", which would write the
-# file sshd ignores, so `net localgroup` is asked instead. It is resolved by
-# SID because the group's NAME is localised.
-$adminSid = 'S-1-5-32-544'
-$userPattern = "(^|\\)$([regex]::Escape($User))$"
-try {
-    $members = @(Get-LocalGroupMember -SID $adminSid | ForEach-Object { $_.Name })
-}
-catch {
-    $group = (New-Object Security.Principal.SecurityIdentifier($adminSid)).Translate(
-        [Security.Principal.NTAccount]).Value.Split('\')[-1]
-    $members = @(& net.exe localgroup $group | ForEach-Object { $_.Trim() })
-}
-$isAdmin = [bool]($members | Where-Object { $_ -match $userPattern })
-if ($isAdmin) {
-    $keyFile = Join-Path $sshDir 'administrators_authorized_keys'
-}
-else {
-    $keyFile = Join-Path (Join-Path (Split-Path $env:USERPROFILE) $User) '.ssh\authorized_keys'
-    New-Item -ItemType Directory -Force -Path (Split-Path $keyFile) | Out-Null
-}
-$existing = @()
-if (Test-Path -LiteralPath $keyFile) { $existing = @(Get-Content -LiteralPath $keyFile) }
-Write-Utf8NoBom -Path $keyFile -Lines (Merge-ManagedBlock -Existing $existing -Body $keys)
-
-# Re-asserted every run: the bytes are not what rots, the ACL is. sshd skips
-# a key file writable by anyone but its owner, SYSTEM and Administrators,
-# and says so only in its own log.
-if ($isAdmin) {
-    & icacls.exe $keyFile /inheritance:r /grant:r '*S-1-5-32-544:F' '*S-1-5-18:F' | Out-Null
-}
-else {
-    & icacls.exe $keyFile /inheritance:r /grant:r "${User}:F" '*S-1-5-18:F' | Out-Null
-}
-if ($LASTEXITCODE -ne 0) { throw "icacls failed on $keyFile" }
+$keyFile = Write-AuthorizedKey -User $User -Keys $keys
 Write-Information "  ok    $keyFile"
+if ($GitHubUser) { Register-KeyRefreshTask -Source $PSCommandPath -GitHubUser $GitHubUser -User $User }
 
 # -- 4. key-only authentication, validated before it goes live --------------
 $before = @(Get-Content -LiteralPath $config)
@@ -802,6 +983,8 @@ if (-not (Sync-WslSshdRule)) {
     Write-Information "  note  no WSL adapter yet; the task adds $WslRuleName when WSL starts"
 }
 Register-WslRescopeTask -Source $PSCommandPath
+if (Test-WslDistro) { Register-WslKeepAliveTask -User $User }
+else { Write-Information "  note  $User has no WSL distro; no keep-alive task" }
 
 # -- 7. the service ------------------------------------------------------------
 Set-Service -Name sshd -StartupType Automatic

@@ -79,9 +79,11 @@
 
 .PARAMETER RemoteAddress
     Addresses allowed through the firewall to port 22, in the forms
-    New-NetFirewallRule accepts. Default: Any. For a machine reached over
-    Tailscale, '100.64.0.0/10','fd7a:115c:a1e0::/48' admits the tailnet
-    and nothing else.
+    New-NetFirewallRule accepts. For a machine reached over Tailscale,
+    '100.64.0.0/10','fd7a:115c:a1e0::/48' admits the tailnet and nothing
+    else; Any admits every address. Omitted, an existing rule keeps the
+    addresses it has (a re-run never widens it, #219), and a new one
+    admits any address.
 
 .PARAMETER PwshVersion
     The PowerShell 7 release to install when pwsh.exe is missing, e.g.
@@ -132,7 +134,7 @@
 param(
     [string]$GitHubUser,
     [string]$KeysFile,
-    [string[]]$RemoteAddress = @('Any'),
+    [string[]]$RemoteAddress,
     [string]$PwshVersion,
     [string]$User = $env:USERNAME,
     [switch]$SshAgent,
@@ -341,6 +343,36 @@ function Select-WslInterface {
     #>
     param([AllowEmptyCollection()][object[]]$Adapter)
     @($Adapter | Where-Object { $_.Name -like $WslAdapterPattern })
+}
+
+function Sync-SshdPortRule {
+    <#
+    .SYNOPSIS
+        Enable the port-22 rule on every profile, and limit it to
+        -RemoteAddress when one is given; return the line to report.
+    .DESCRIPTION
+        With no -RemoteAddress, an existing rule keeps the addresses it
+        admits. A re-run is how a box gets a newer step's tasks, so a
+        re-run that forgot the original --sshd-allow must not widen a
+        tailnet-only rule to every address (#219). Widening is asked for
+        by name: -RemoteAddress Any. A rule this creates, with no
+        -RemoteAddress, admits any address -- what the OpenSSH capability
+        creates it with anyway.
+    .EXAMPLE
+        Sync-SshdPortRule -RemoteAddress '100.64.0.0/10','fd7a:115c:a1e0::/48'
+    #>
+    param([string]$Name = 'OpenSSH-Server-In-TCP', [string[]]$RemoteAddress)
+    if (-not (Get-NetFirewallRule -Name $Name -ErrorAction SilentlyContinue)) {
+        New-NetFirewallRule -Name $Name -DisplayName 'OpenSSH SSH Server (sshd)' `
+            -Direction Inbound -Protocol TCP -LocalPort 22 -Action Allow | Out-Null
+    }
+    if (-not $RemoteAddress) {
+        Set-NetFirewallRule -Name $Name -Enabled True -Profile Any
+        $kept = @((Get-NetFirewallRule -Name $Name | Get-NetFirewallAddressFilter).RemoteAddress)
+        return "  kept  firewall: port 22 from $($kept -join ', ') (--sshd-allow to change it)"
+    }
+    Set-NetFirewallRule -Name $Name -Enabled True -Profile Any -RemoteAddress $RemoteAddress
+    "  ok    firewall: port 22 from $($RemoteAddress -join ', ')"
 }
 
 function Sync-WslSshdRule {
@@ -964,13 +996,7 @@ Write-Information "  ok    login shell $pwsh"
 
 # -- 6. firewall --------------------------------------------------------------
 # The capability creates this rule open to every address on every profile.
-$ruleName = 'OpenSSH-Server-In-TCP'
-if (-not (Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue)) {
-    New-NetFirewallRule -Name $ruleName -DisplayName 'OpenSSH SSH Server (sshd)' `
-        -Direction Inbound -Protocol TCP -LocalPort 22 -Action Allow | Out-Null
-}
-Set-NetFirewallRule -Name $ruleName -Enabled True -Profile Any -RemoteAddress $RemoteAddress
-Write-Information "  ok    firewall: port 22 from $($RemoteAddress -join ', ')"
+Write-Information (Sync-SshdPortRule -RemoteAddress $RemoteAddress)
 
 # And from this machine's own WSL, whatever -RemoteAddress says. setup-system
 # runs this script -- and a box's later provisioning -- over an admin ssh

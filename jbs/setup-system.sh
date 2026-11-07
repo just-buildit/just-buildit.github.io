@@ -113,9 +113,11 @@ read -r -d '' HELP <<-'EOF' || true
 	       --github-user NAME    sshd: authorize github.com/NAME.keys
 	                             (default: the account gh is signed in to).
 	       --sshd-allow ADDRS    sshd: comma-separated addresses the
-	                             firewall admits to port 22 (default: any),
-	                             e.g. 100.64.0.0/10,fd7a:115c:a1e0::/48
-	                             for a Tailscale tailnet only.
+	                             firewall admits to port 22, e.g.
+	                             100.64.0.0/10,fd7a:115c:a1e0::/48 for a
+	                             Tailscale tailnet only, or any. Omitted,
+	                             an existing rule keeps its addresses and
+	                             a new one admits any.
 	       --template [PATH]     Write the bashrc template to PATH (or stdout).
 	       --template-profile [PATH]
 	                             Write the profile template to PATH (or stdout).

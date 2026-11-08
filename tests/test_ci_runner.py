@@ -238,6 +238,25 @@ class Gate(Adopter):
         ic = job("self-hosted", "if: '!github.event.issue.pull_request'\n")
         self.assertPasses(ic.replace("[push, pull_request]", "issue_comment"))
 
+    def test_workflow_run_guards_are_tried_for_every_pr_cause(
+        self,
+    ) -> None:
+        cause = "github.event.workflow_run.event"
+        for cond, ok in (
+            (f"{cause} != 'pull_request'", False),
+            (f"{cause} == 'pull_request_review'", False),
+            (f"{cause} == 'pull_request_target'", False),
+            (f"{cause} == 'push'", True),
+        ):
+            with self.subTest(cond=cond):
+                text = job("self-hosted", f"if: {cond}\n").replace(
+                    "[push, pull_request]", "workflow_run"
+                )
+                if ok:
+                    self.assertPasses(text)
+                else:
+                    self.assertRefused(text, "workflow_run (via")
+
     def test_a_null_guard_is_read_not_crashed_on(self) -> None:
         # SHOULD-FIX 3: Python cannot order None; GitHub's `<` can.
         cond = (
@@ -312,13 +331,20 @@ class Gate(Adopter):
             runs-on: ubuntu-latest
             timeout-minutes: 5
             outputs:
-              matrix: ${{ steps.legs.outputs.matrix }}
+              matrix: ${{ steps.runners.outputs.matrix }}
             steps:
+              - uses: actions/checkout@v7
               - id: legs
+                run: make -s plan >> "$GITHUB_OUTPUT"
+              - id: runners
+                env:
+                  LEGS: ${{ steps.legs.outputs.matrix }}
                 run: |
-                  legs=$(make -s plan)
-                  printf '%s\\n' "$legs" > legs.txt
-                  make -s ci-runner < legs.txt >> "$GITHUB_OUTPUT"
+                  # Comments and blank lines are allowed.
+
+                  printf 'matrix=%s\\n' "$LEGS" \\
+                    | make -s ci-runner CI_RUNNER_WORKFLOW=w.yml \\
+                    >> "$GITHUB_OUTPUT"
           j:
             needs: plan
             runs-on: ${{ matrix.runs_on }}
@@ -339,25 +365,96 @@ class Gate(Adopter):
             text.replace("make -s ci-runner", "make -s ci-runner-x")
         )
         self.assertRefused(
-            text.replace("steps.legs.outputs", "steps.other.outputs")
+            text.replace("steps.runners.outputs", "steps.other.outputs")
+        )
+        # The planner's own step is not ci-runner's.
+        self.assertRefused(
+            text.replace(
+                "matrix: ${{ steps.runners.outputs.matrix }}",
+                "matrix: ${{ steps.legs.outputs.matrix }}",
+            )
         )
 
     def test_only_a_real_ci_runner_command_counts(self) -> None:
         # NIT 6: a mention in an echo, a heredoc or a comment is not the
         # command, and another writer of $GITHUB_OUTPUT is not ci-runner.
         text = textwrap.dedent(self.PLAN)
-        real = 'make -s ci-runner < legs.txt >> "$GITHUB_OUTPUT"'
+        real = (
+            "| make -s ci-runner CI_RUNNER_WORKFLOW=w.yml \\\n"
+            '            >> "$GITHUB_OUTPUT"'
+        )
         self.assertIn(real, text)
+        out = '"$GITHUB_OUTPUT"'
         for fake in (
-            'echo "make -s ci-runner" >> "$GITHUB_OUTPUT"',
-            "echo make ci-runner >> $GITHUB_OUTPUT",
-            "cat >> $GITHUB_OUTPUT <<EOF\n"
+            f'| echo "make -s ci-runner" >> {out}',
+            "| echo make ci-runner >> $GITHUB_OUTPUT",
+            "| cat >> $GITHUB_OUTPUT <<EOF\n"
             "              make -s ci-runner\n              EOF",
             real + "\n              echo 'matrix={}' >> $GITHUB_OUTPUT",
             "# make -s ci-runner >> $GITHUB_OUTPUT",
+            # SHOULD-FIX 3: second writers a deny-list does not see.
+            real + "\n              python3 -c 'import os; "
+            'open(os.environ["GITHUB_OUTPUT"], "a")\'',
+            '| make -s ci-runner >> "$(printenv GITHUB_OUTPUT)"',
+            real + '\n              v=GITHUB_; echo m=x >> "${!v}OUTPUT"',
+            real + "\n              eval 'echo m=x >> $GITHUB'\"_OUTPUT\"",
+            real + " && ./scripts/write-more.sh",
+            '| make -s ci-runner X="$(id)" >> ' + out,
         ):
             with self.subTest(fake=fake):
                 self.assertRefused(text.replace(real, fake))
+
+    def test_nothing_may_change_the_trusted_steps_world(self) -> None:
+        # SHOULD-FIX 3: a startup file, a shell, a directory, a checkout of
+        # other code, or an earlier step writing the environment.
+        text = textwrap.dedent(self.PLAN)
+        env = "          LEGS: ${{ steps.legs.outputs.matrix }}\n"
+        step = "      - id: runners\n"
+        co = "      - uses: actions/checkout@v7\n"
+        for name, fake in (
+            ("BASH_ENV", (env, env + "          BASH_ENV: x.sh\n")),
+            ("MAKEFLAGS", (env, env + "          MAKEFLAGS: -f x\n")),
+            ("shell", (step, step + "        shell: python\n")),
+            ("dir", (step, step + "        working-directory: sub\n")),
+            ("checkout", (co, co + "        with: {ref: evil}\n")),
+            ("action", (co, "      - uses: actions/setup-python@v6\n")),
+            (
+                "GITHUB_ENV",
+                (
+                    "        run: make -s plan",
+                    "        run: echo P=1 >> $GITHUB_ENV; make -s plan",
+                ),
+            ),
+            (
+                "job env",
+                (
+                    "    outputs:\n",
+                    "    env: {BASH_ENV: x.sh}\n    outputs:\n",
+                ),
+            ),
+        ):
+            with self.subTest(name=name):
+                bad = text.replace(*fake, 1)
+                self.assertNotEqual(bad, text)
+                self.assertRefused(bad)
+
+    def test_ci_runner_output_inside_a_matrix_is_refused(self) -> None:
+        # MUST-FIX 1(a): only the whole matrix may come from ci-runner.
+        text = textwrap.dedent(self.PLAN)
+        whole = "      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}"
+        self.assertIn(whole, text)
+        for inner in (
+            "      matrix:\n        include: "
+            "${{ fromJSON(needs.plan.outputs.matrix) }}",
+            "      matrix:\n        runs_on: "
+            "${{ fromJSON(needs.plan.outputs.matrix) }}",
+            "      matrix:\n        include:\n"
+            "          - ${{ fromJSON(needs.plan.outputs.matrix) }}",
+        ):
+            with self.subTest(inner=inner):
+                self.assertRefused(
+                    text.replace(whole, inner), "inside a matrix"
+                )
 
     def test_only_runs_on_of_a_ci_runner_matrix_is_trusted(self) -> None:
         text = textwrap.dedent(self.PLAN).replace(
@@ -507,10 +604,17 @@ class Pick(unittest.TestCase):
         self.api = FakeApi([runner()])
 
     def run_pick(
-        self, lines: "list[str] | None" = None, keys=("runs_on", "os")
+        self,
+        lines: "list[str] | None" = None,
+        keys=("runs_on", "os"),
+        workflow: str = "",
     ) -> "tuple[list[Any], list[str]]":
         out, log = cr.pick(
-            lines or ["matrix=" + json.dumps(MATRIX)], keys, self.env, self.api
+            lines or ["matrix=" + json.dumps(MATRIX)],
+            keys,
+            self.env,
+            self.api,
+            workflow=workflow,
         )
         legs = []
         for line in out:
@@ -642,15 +746,24 @@ class Pick(unittest.TestCase):
                 "refs/heads/main",
                 False,
             ),
-            ("org/repo/.github/workflows/*@main", "refs/heads/main", True),
+            # NIT 4: no wildcards; GitHub documents none.
+            ("org/repo/.github/workflows/*@main", "refs/heads/main", False),
         ):
             with self.subTest(listed=listed, ref=ref):
                 self.api.groups = [dict(g, selected_workflows=[listed])]
                 self.env["GITHUB_WORKFLOW_REF"] = f"{wf}@{ref}"
-                got = self.run_pick()[0][1]
+                got = self.run_pick(workflow=".github/workflows/ci.yml")[0][1]
                 self.assertEqual(got, MAC if ok else "macos-latest")
-        self.env.pop("GITHUB_WORKFLOW_REF")
+        self.api.groups = [dict(g, selected_workflows=[f"{wf}@main"])]
+        self.env["GITHUB_WORKFLOW_REF"] = f"{wf}@refs/heads/main"
+        # No --workflow: a restricted group never counts.
         self.assertEqual(self.run_pick()[0][1], "macos-latest")
+        # A reusable workflow's run: the ref names its caller.
+        got = self.run_pick(workflow=".github/workflows/artifact.yml")[0][1]
+        self.assertEqual(got, "macos-latest")
+        self.env.pop("GITHUB_WORKFLOW_REF")
+        got = self.run_pick(workflow=".github/workflows/ci.yml")[0][1]
+        self.assertEqual(got, "macos-latest")
 
     def test_outside_actions_stays_hosted(self) -> None:
         del self.env["GITHUB_EVENT_NAME"]
@@ -760,9 +873,9 @@ class Pick(unittest.TestCase):
 
     def test_other_lines_pass_through(self) -> None:
         out, _ = cr.pick(
-            ["tag=x", "matrix=", "n=[1]"], ("os",), self.env, self.api
+            ["tag=x", "matrix=", "ref=v1.2"], ("os",), self.env, self.api
         )
-        self.assertEqual(out, ["tag=x", "matrix=", "n=[1]"])
+        self.assertEqual(out, ["tag=x", "matrix=", "ref=v1.2"])
 
     def test_input_that_is_not_a_plan_is_refused(self) -> None:
         bad = [
@@ -776,6 +889,11 @@ class Pick(unittest.TestCase):
             # NIT 6: a multi-line output would pass through unread.
             ["m<<EOF", '{"include": [{"os": "macOS"}]}', "EOF"],
             ["just text"],
+            # MUST-FIX 1(b): JSON a job could read with fromJSON.
+            ['m=[{"runs_on": "self-hosted"}]'],
+            ['m="self-hosted"'],
+            ["m=[1]"],
+            ["m=3"],
         ]
         for lines in bad:
             with self.subTest(lines=lines), self.assertRaises(ValueError):

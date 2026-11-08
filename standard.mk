@@ -2684,11 +2684,18 @@ close-keywords-check: ## A PR's commits, title and body close only the issues it
 #         printf 'matrix=%s\n' "$LEGS"
 #         | make -s ci-runner >> "$GITHUB_OUTPUT"
 #
-# printf cannot fail, so the pipe needs no pipefail; ci-runner must be the
-# only command in the step that writes $GITHUB_OUTPUT.
+# printf cannot fail, so the pipe needs no pipefail. self-hosted-check
+# trusts that step only in exactly this shape -- printf of literals and
+# "$VARS", piped into `make ci-runner [NAME=value...] >> "$GITHUB_OUTPUT"`
+# -- with no earlier step that can change its environment.
 #
 #   CI_RUNNER_KEY           the leg keys naming its hosted label, first one
 #                           present wins.
+#   CI_RUNNER_WORKFLOW      the workflow file whose jobs the plan feeds
+#                           (`.github/workflows/ci.yml`). A runner group
+#                           restricted to selected workflows counts only for
+#                           it, and only when it is the run's own workflow;
+#                           empty, such a group never counts.
 #   SELF_HOSTED_CHECK_DIRS  where self-hosted-check reads workflows.
 #
 # `self-hosted-check` is in `lint`, on in every repo: it refuses a job whose
@@ -2700,6 +2707,7 @@ close-keywords-check: ## A PR's commits, title and body close only the issues it
 # fork's copy of the workflows, so the runner group's repository access and
 # the fork-PR approval policy are what stop a hostile one.
 CI_RUNNER_KEY          ?= runs_on os
+CI_RUNNER_WORKFLOW     ?=
 SELF_HOSTED_CHECK_DIRS ?= .github/workflows
 STD_TARGETS    += self-hosted-check ci-runner
 VENDORED_FILES += scripts/ci-runner.py
@@ -2710,7 +2718,8 @@ self-hosted-check: ## Verify no fork can reach a self-hosted runner
 	@python3 scripts/ci-runner.py check $(SELF_HOSTED_CHECK_DIRS)
 
 ci-runner: ## Give each matrix leg on stdin a runs_on, self-hosted when free
-	@python3 scripts/ci-runner.py pick --key '$(CI_RUNNER_KEY)'
+	@python3 scripts/ci-runner.py pick --key '$(CI_RUNNER_KEY)' \
+	    --workflow '$(CI_RUNNER_WORKFLOW)'
 
 # ── Help ─────────────────────────────────────────────────────────────────────
 # Generated from the `## description` on each active target's rule line. Never

@@ -49,6 +49,20 @@ these hold:
    ``GITHUB_TOKEN``, ``actions: read``) leave an idle runner over: each
    will take the next one, so they are counted against the idle ones.
 
+A runner group restricted to selected workflows counts only for the
+workflow named by ``--workflow`` (``CI_RUNNER_WORKFLOW``), and only when
+that is the run's own workflow: GitHub grants such a group to jobs defined
+directly in a listed workflow, and in a reusable workflow
+``GITHUB_WORKFLOW_REF`` names the CALLER, so a callee's jobs never match.
+Entries are matched exactly, in full (``@refs/heads/main``) or ``@main``
+form; GitHub documents no wildcards there.
+
+:data:`HOSTED` trusts runner LABELS: a self-hosted runner registered with
+a hosted-looking label (``macos-latest``) would satisfy a "hosted" leg.
+Only org admins register runners, and the org's Mac host registers only
+``self-hosted, macOS, ARM64``; that registration is the control, not this
+script.
+
 Anything else -- no token, an API error, a busy or offline runner, a group
 this repository cannot use -- keeps the hosted label. It fails toward a
 hosted leg, never toward one queued for a runner that will not take it. One
@@ -109,7 +123,6 @@ True
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import json
 import math
 import os
@@ -275,10 +288,12 @@ def idle(
 ) -> "dict[Pool, int]":
     """Idle runners of each pool in a group *repo* may use.
 
-    A group restricted to selected workflows is usable only by a workflow
-    it lists: *workflow_ref*, ``GITHUB_WORKFLOW_REF``, matched as a glob
-    (on a pull request that ref is ``refs/pull/N/merge``, so a group pinned
-    to ``main`` is not counted there). Raises on any API failure.
+    A group restricted to selected workflows is usable only when it lists
+    *workflow_ref* exactly, in full or ``@branch`` form; an empty
+    *workflow_ref* (no ``--workflow``, or a reusable workflow's run) matches
+    no such group. On a pull request the ref is ``refs/pull/N/merge``, so a
+    group pinned to ``main`` is not counted there. Raises on any API
+    failure.
     """
     usable = set()
     for g in _paged(
@@ -289,9 +304,7 @@ def idle(
             allowed = [
                 str(w).lower() for w in g.get("selected_workflows") or []
             ]
-            if not any(
-                fnmatch.fnmatchcase(r, w) for r in mine for w in allowed
-            ):
+            if not set(mine) & set(allowed):
                 continue
         if not private and not g.get("allows_public_repositories"):
             continue
@@ -388,11 +401,22 @@ def allocate(
     return out
 
 
+def own_workflow_ref(env: "dict[str, str]", workflow: str) -> str:
+    """``GITHUB_WORKFLOW_REF`` if it names *workflow* in this repository,
+    else ``""``: a reusable workflow's run carries its caller's ref."""
+    ref = env.get("GITHUB_WORKFLOW_REF", "")
+    want = f"{env.get('GITHUB_REPOSITORY', '')}/{workflow}".lower()
+    if not workflow or ref.partition("@")[0].lower() != want:
+        return ""
+    return ref
+
+
 def pick(
     lines: "list[str]",
     keys: "tuple[str, ...]",
     env: "dict[str, str]",
     fetch: "Fetch | None" = None,
+    workflow: str = "",
 ) -> "tuple[list[str], list[str]]":
     """The planner lines with every matrix leg given a ``runs_on``.
 
@@ -411,11 +435,21 @@ def pick(
         if not sep or not re.fullmatch(r"[A-Za-z_][\w-]*", name):
             raise ValueError(f"not a name=value output line: {line[:60]}")
         m = None
-        if sep and value.strip().startswith("{"):
-            m = json.loads(value)
-            if set(m) != {"include"} or not isinstance(m["include"], list):
+        try:
+            m = json.loads(value) if value.strip() else None
+        except ValueError:
+            m = None  # plain text: passes through, as GitHub reads it
+        if m is not None:
+            # Any JSON value -- an array, a string, a number -- could be
+            # read with fromJSON somewhere; only a matrix is decided here.
+            if (
+                not isinstance(m, dict)
+                or set(m) != {"include"}
+                or not isinstance(m["include"], list)
+            ):
                 raise ValueError(
-                    f"{name}: not a matrix in include form ({value[:60]})"
+                    f"{name}: JSON that is not a matrix in include form "
+                    f"({value[:60]})"
                 )
             for leg in m["include"]:
                 for k in keys:
@@ -453,7 +487,7 @@ def pick(
                 repo.split("/")[0],
                 repo,
                 _private(env),
-                env.get("GITHUB_WORKFLOW_REF", ""),
+                own_workflow_ref(env, workflow),
             )
             waiting = queued(repo_fetch, repo)
         except Exception as e:  # noqa: BLE001 -- any failure means hosted
@@ -472,7 +506,7 @@ def pick(
     out = []
     total = {p: [0, 0] for p in asking}
     for line, m in parsed:
-        if m is None:
+        if not isinstance(m, dict):
             out.append(line)
             continue
         name = line.partition("=")[0]
@@ -1085,11 +1119,14 @@ def truth(node: tuple, ctx: "dict[str, Any]") -> Any:
 REPO, FORK = "owner/repo", "stranger/repo"
 
 
-def scenario(event: str, deleted: bool) -> "dict[str, Any]":
+def scenario(
+    event: str, deleted: bool, cause: str = "pull_request"
+) -> "dict[str, Any]":
     """What a fork-driven run of *event* knows: the event, the repository,
     which of the payload's ``pull_request`` / ``workflow_run`` / ``issue``
-    it carries, and a head repository that is a fork (or gone). Everything
-    else is UNKNOWN."""
+    it carries, and a head repository that is a fork (or gone). For a
+    ``workflow_run``, *cause* is the event that started the triggering run.
+    Everything else is UNKNOWN."""
     head = None if deleted else {"full_name": FORK, "fork": True}
     payload: "dict[str, Any]" = {
         "pull_request": None,
@@ -1101,7 +1138,7 @@ def scenario(event: str, deleted: bool) -> "dict[str, Any]":
     elif event == "workflow_run":
         payload["workflow_run"] = {
             "head_repository": head,
-            "event": "pull_request",
+            "event": cause,
         }
     elif event == "issue_comment":
         payload["issue"] = {"pull_request": {"url": "pr"}}
@@ -1133,10 +1170,15 @@ def fork_safe_if(cond: Any, events: "Iterable[str]") -> "tuple[bool, str]":
     except ValueError as e:
         return False, f"if: cannot be read ({e})"
     for ev in events:
-        for deleted in (False, True):
-            if truth(tree, scenario(ev, deleted)) is not False:
-                who = "a deleted fork" if deleted else "a fork"
-                return False, f"if: can be true for {ev} from {who}"
+        # A fork can start the triggering run through any pull request
+        # event, so a workflow_run is tried as each of them.
+        causes = PR_EVENTS if ev == "workflow_run" else ("",)
+        for cause in causes:
+            for deleted in (False, True):
+                if truth(tree, scenario(ev, deleted, cause)) is not False:
+                    who = "a deleted fork" if deleted else "a fork"
+                    via = f" (via {cause})" if cause else ""
+                    return False, f"if: can be true for {ev}{via} from {who}"
     return True, ""
 
 
@@ -1165,7 +1207,7 @@ class Workflow:
     def __init__(self, path: str, doc: Any) -> None:
         if not isinstance(doc, dict) or not isinstance(doc.get("jobs"), dict):
             raise YamlError("no jobs: mapping")
-        self.path, self.jobs = path, doc["jobs"]
+        self.path, self.jobs, self.doc = path, doc["jobs"], doc
         on = doc.get("on", doc.get("true"))
         trig = _triggers(on)
         if "workflow_call" in trig:
@@ -1188,9 +1230,10 @@ class Workflow:
         root, sid, outputs, _ = tree[1]
         if root != "steps" or outputs != "outputs":
             return False
-        for step in j.get("steps") or []:
-            if isinstance(step, dict) and step.get("id") == sid:
-                return writes_only_ci_runner(str(step.get("run") or ""))
+        steps = [x for x in j.get("steps") or [] if isinstance(x, dict)]
+        for i, step in enumerate(steps):
+            if step.get("id") == sid:
+                return trusted_step(step, steps[:i], j, self.doc)
         return False
 
     def values(self, node: tuple, job: dict) -> "list[Any]":
@@ -1231,7 +1274,21 @@ class Workflow:
         raise Dynamic("an expression it cannot resolve")
 
     def resolve(self, raw: Any, job: dict) -> "list[Any]":
-        """Every value *raw* (a YAML value) can take."""
+        """Every value *raw* (a YAML value) can take.
+
+        ci-runner's output is trusted only as a WHOLE matrix (``matrix:
+        ${{ fromJSON(...) }}``); read into a list or a mapping -- an
+        ``include:``, an axis -- its legs' other keys are a planner's, so it
+        is unresolvable there.
+        """
+        if isinstance(raw, (list, dict)):
+            items = raw if isinstance(raw, list) else list(raw.values())
+            for x in items:
+                if _has_canon(self.resolve(x, job)):
+                    raise Dynamic(
+                        "a ci-runner output inside a matrix, not the whole "
+                        "matrix"
+                    )
         if isinstance(raw, list):
             return [v for x in raw for v in self.resolve(x, job)]
         if isinstance(raw, dict):
@@ -1325,81 +1382,101 @@ class Workflow:
         return ""
 
 
-_OUT = re.compile(r'"?\$(?:GITHUB_OUTPUT|\{GITHUB_OUTPUT\})"?')
+def _has_canon(x: Any) -> bool:
+    if isinstance(x, _Canon):
+        return True
+    if isinstance(x, dict):
+        return any(_has_canon(v) for v in x.values())
+    if isinstance(x, list):
+        return any(_has_canon(v) for v in x)
+    return False
 
 
-def _shell_lines(run: str) -> "list[str]":
-    """*run*'s command text: continuations joined, heredoc bodies and
-    comments dropped, quoted text blanked but for ``$( )`` inside double
-    quotes, and ``$GITHUB_OUTPUT`` (any spelling) as the word ``@OUT@``."""
-    out: "list[str]" = []
-    lines = _OUT.sub("@OUT@", run.replace("\\\n", " ")).split("\n")
-    delim = None
-    for line in lines:
-        if delim is not None:
-            if line.strip() == delim:
-                delim = None
-            continue
-        kept, quote, depth, i = "", "", 0, 0
-        while i < len(line):
-            c = line[i]
-            if quote == "'":
-                quote = "" if c == "'" else quote
-            elif quote == '"' and not depth:
-                if c == '"':
-                    quote = ""
-                elif line.startswith("$(", i):
-                    depth, kept = 1, kept + " $("
-                    i += 1
-            elif c in "'\"" and not depth:
-                quote = c
-            elif c == "#" and (not kept or kept[-1] in " \t;&|("):
-                break
-            else:
-                if depth:
-                    depth += {"(": 1, ")": -1}.get(c, 0)
-                kept += c
-            i += 1
-        m = re.search(r"(?<!<)<<-?(?!<)\s*\\?(\w+)", kept) or re.search(
-            r"(?<!<)<<-?(?!<)\s*['\"](\w+)['\"]", line
-        )
-        if m:
-            delim = m.group(1)
-        out.append(kept)
-    return out
+_PRINTF_ARG = r"""(?:'[^']*'|"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?")"""
+
+#: The ONE shape a trusted step's script may have: optionally ``printf``
+#: of literals and plain variables, piped into ``make ci-runner`` (with
+#: plain ``NAME=value`` make variables), appended to ``$GITHUB_OUTPUT``.
+TRUSTED_RUN = re.compile(
+    r"^(?:printf(?:\s+" + _PRINTF_ARG + r")+\s*\|\s*)?"
+    r"make(?:\s+-s)?\s+ci-runner(?:\s+[A-Z_][A-Z0-9_]*=[\w./-]+)*"
+    r'\s*>>\s*(?:"\$GITHUB_OUTPUT"|"\$\{GITHUB_OUTPUT\}"|\$GITHUB_OUTPUT)$'
+)
+
+#: Variables that change what that one command does: a startup file bash
+#: sources, make flags or makefiles, where the output goes, what runs.
+UNSAFE_ENV = frozenset(
+    "BASH_ENV ENV SHELLOPTS BASHOPTS PS4 PATH MAKEFLAGS MFLAGS GNUMAKEFLAGS "
+    "MAKEFILES GITHUB_OUTPUT".split()
+)
+
+#: actions/checkout inputs that keep the checkout this repository's own
+#: commit, in the workspace root.
+CHECKOUT_OK = frozenset(
+    "fetch-depth fetch-tags persist-credentials submodules lfs clean "
+    "filter show-progress sparse-checkout sparse-checkout-cone-mode".split()
+)
 
 
-def writes_only_ci_runner(run: str) -> bool:
-    """Whether a ``run:`` script's outputs are all ``make ci-runner``'s.
+def run_shape_ok(run: str) -> bool:
+    """Whether a ``run:`` script is exactly the trusted shape, comments
+    and blank lines aside.
 
-    True when exactly one command writes ``$GITHUB_OUTPUT``, and it is
-    ``make`` running ``ci-runner`` with its stdout appended there. A
-    mention in a heredoc, a quoted string or a comment is not a command.
-
-    >>> writes_only_ci_runner('x | make -s ci-runner >> "$GITHUB_OUTPUT"')
+    >>> run_shape_ok("printf 'm=%s' | make -s ci-runner >> $GITHUB_OUTPUT")
     True
-    >>> writes_only_ci_runner('echo "make ci-runner" >> "$GITHUB_OUTPUT"')
+    >>> run_shape_ok("printf $(cat x) | make -s ci-runner >> $GITHUB_OUTPUT")
+    False
+    >>> run_shape_ok('make -s ci-runner >> "$GITHUB_OUTPUT" && ./more.sh')
     False
     """
-    cmds = [
-        c.strip()
-        for line in _shell_lines(run)
-        for c in re.split(r"&&|\|\||[;|()]|\$\(|`", line)
+    lines = [
+        ln.strip()
+        for ln in run.replace("\\\n", " ").split("\n")
+        if ln.strip() and not ln.strip().startswith("#")
     ]
-    writers = [c for c in cmds if "@OUT@" in c]
-    # Every mention counts, read or not: one hidden from the reader above
-    # (a misread heredoc) must not leave a second writer unseen.
-    if len(writers) != 1 or _OUT.sub("@OUT@", run).count("@OUT@") != 1:
-        return False
-    words = re.sub(r">>\s*", " >> ", writers[0]).split()
-    while words and re.fullmatch(r"\w+=\S*", words[0]):
-        words.pop(0)
-    return (
-        len(words) >= 3
-        and words[0] == "make"
-        and "ci-runner" in words
-        and words[-2:] == [">>", "@OUT@"]
+    return len(lines) == 1 and bool(
+        TRUSTED_RUN.match(" ".join(lines[0].split()))
     )
+
+
+def trusted_step(
+    step: dict, before: "list[dict]", job: dict, doc: dict
+) -> bool:
+    """Whether *step*'s outputs can only be what ``make ci-runner`` wrote.
+
+    Its script is :func:`run_shape_ok`; it runs under the default shell,
+    in the workspace root, with no :data:`UNSAFE_ENV` variable set by the
+    workflow, the job or the step; and nothing before it in the job can
+    change its environment or what it runs: each earlier step is a plain
+    ``actions/checkout`` (:data:`CHECKOUT_OK` inputs only) or a ``run:``
+    that does not write ``$GITHUB_ENV`` or ``$GITHUB_PATH``. It trusts the
+    repository's own Makefile at the checked-out commit.
+    """
+    if not run_shape_ok(str(step.get("run") or "")):
+        return False
+    for where in (doc, job, step):
+        env = where.get("env") or {}
+        if not isinstance(env, dict) or set(env) & UNSAFE_ENV:
+            return False
+    for where in (doc, job):
+        run = ((where.get("defaults") or {}).get("run")) or {}
+        if run.get("shell") not in (None, "bash") or run.get(
+            "working-directory"
+        ):
+            return False
+    if step.get("shell") not in (None, "bash") or step.get(
+        "working-directory"
+    ):
+        return False
+    for b in before:
+        if "uses" in b:
+            if not str(b["uses"]).startswith("actions/checkout@"):
+                return False
+            if set(b.get("with") or {}) - CHECKOUT_OK:
+                return False
+        elif re.search(r"GITHUB_(ENV|PATH)", str(b.get("run") or "")):
+            return False
+    return True
 
 
 def _flatten(vals: "Iterable[Any]") -> "Iterable[Any]":
@@ -1446,6 +1523,12 @@ def main(argv: "list[str] | None" = None) -> int:
         default="runs_on os",
         help="leg keys naming the hosted label, first match wins",
     )
+    p.add_argument(
+        "--workflow",
+        default="",
+        help="the workflow file whose jobs the plan feeds, for a runner "
+        "group restricted to selected workflows",
+    )
     c = sub.add_parser("check", help="refuse a fork-reachable self-hosted job")
     c.add_argument("paths", nargs="+")
     args = ap.parse_args(argv)
@@ -1453,7 +1536,12 @@ def main(argv: "list[str] | None" = None) -> int:
     if args.cmd == "pick":
         lines = [ln for ln in sys.stdin.read().splitlines() if ln.strip()]
         try:
-            out, log = pick(lines, tuple(args.key.split()), dict(os.environ))
+            out, log = pick(
+                lines,
+                tuple(args.key.split()),
+                dict(os.environ),
+                workflow=args.workflow,
+            )
         except ValueError as e:
             print(f"ci-runner: {e}", file=sys.stderr)
             return 1

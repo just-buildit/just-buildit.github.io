@@ -168,6 +168,17 @@ jobs:
           make -f standard.mk workflow-timeout-check \
               TEST_CMD=x TEST_FAST_CMD=x CLEAN_PATHS=x
 
+      - name: self-hosted-check holds this repo's and the published workflows
+        # just-buildit.github.io#203: no fork pull request reaches a
+        # self-hosted runner. Its cases and sabotage are in
+        # tests/test_ci_runner.py (the changelog job's unittest run); this
+        # holds the workflows this repo runs AND the ones it publishes for
+        # adopters to vendor, which no adopter's lint sees before they land.
+        run: |
+          make -f standard.mk self-hosted-check \
+              TEST_CMD=x TEST_FAST_CMD=x CLEAN_PATHS=x \
+              SELF_HOSTED_CHECK_DIRS=".github/workflows github/workflows"
+
       - name: workflow-dispatch-check refuses a self-triggered workflow with no way back in
         # Moved here from just-makeit#1799 (just-makeit#1801): a run that
         # fails at startup cannot be re-run, so a workflow that runs on its

@@ -1233,7 +1233,9 @@ class Workflow:
         steps = [x for x in j.get("steps") or [] if isinstance(x, dict)]
         for i, step in enumerate(steps):
             if step.get("id") == sid:
-                return trusted_step(step, steps[:i], j, self.doc)
+                return trusted_step(
+                    step, steps[:i], j, self.doc, self.pr_events
+                )
         return False
 
     def values(self, node: tuple, job: dict) -> "list[Any]":
@@ -1410,6 +1412,26 @@ UNSAFE_ENV = frozenset(
     "MAKEFILES GITHUB_OUTPUT".split()
 )
 
+#: Prefixes of variables that also change what runs or what ``pick``
+#: reads: Python's startup and path, the loader's preloads, and every
+#: ``GITHUB_*`` / ``RUNNER_*`` variable Actions sets (``GITHUB_EVENT_NAME``
+#: would tell ``pick`` it is a push). ``GITHUB_TOKEN`` is the one name it
+#: may set: ``pick`` reads the queue with it, and a wrong one is an API
+#: error, which keeps every leg hosted.
+UNSAFE_ENV_PREFIXES = ("PYTHON", "LD_", "DYLD_", "GITHUB_", "RUNNER_")
+
+
+def unsafe_env(name: str) -> bool:
+    """Whether a workflow may not set *name* around the trusted step.
+
+    >>> [unsafe_env(x) for x in ("LEGS", "GITHUB_TOKEN", "PYTHONPATH")]
+    [False, False, True]
+    """
+    if name == "GITHUB_TOKEN":
+        return False
+    return name in UNSAFE_ENV or name.startswith(UNSAFE_ENV_PREFIXES)
+
+
 #: actions/checkout inputs that keep the checkout this repository's own
 #: commit, in the workspace root.
 CHECKOUT_OK = frozenset(
@@ -1428,7 +1450,17 @@ def run_shape_ok(run: str) -> bool:
     False
     >>> run_shape_ok('make -s ci-runner >> "$GITHUB_OUTPUT" && ./more.sh')
     False
+
+    No ``${{ }}`` anywhere, not even in a comment or a quoted literal:
+    GitHub substitutes it into the script before bash reads it, so a
+    fork's ``'`` in a title or branch name would end the quote.
+
+    >>> run_shape_ok("printf 'm=${{ github.head_ref }}' | make -s ci-runner"
+    ...              " >> $GITHUB_OUTPUT")
+    False
     """
+    if "${{" in run:
+        return False
     lines = [
         ln.strip()
         for ln in run.replace("\\\n", " ").split("\n")
@@ -1440,7 +1472,11 @@ def run_shape_ok(run: str) -> bool:
 
 
 def trusted_step(
-    step: dict, before: "list[dict]", job: dict, doc: dict
+    step: dict,
+    before: "list[dict]",
+    job: dict,
+    doc: dict,
+    events: "Iterable[str]" = (),
 ) -> bool:
     """Whether *step*'s outputs can only be what ``make ci-runner`` wrote.
 
@@ -1451,12 +1487,22 @@ def trusted_step(
     ``actions/checkout`` (:data:`CHECKOUT_OK` inputs only) or a ``run:``
     that does not write ``$GITHUB_ENV`` or ``$GITHUB_PATH``. It trusts the
     repository's own Makefile at the checked-out commit.
+
+    When the workflow can run on a fork-driven *event* other than plain
+    ``pull_request`` -- ``pull_request_target``, ``workflow_run``,
+    ``issue_comment``, a review event, or ``workflow_call``, whose
+    caller's event is unknown -- the workflow is this repository's but
+    the code an earlier ``run:`` fetches can be a fork's (``gh pr
+    checkout``, ``git fetch`` of a head SHA), and the trusted step would
+    then run the fork's Makefile. There only plain checkouts may come
+    first. (Under ``pull_request`` the workflow file itself is the fork's,
+    so nothing in it can be trusted more than that.)
     """
     if not run_shape_ok(str(step.get("run") or "")):
         return False
     for where in (doc, job, step):
         env = where.get("env") or {}
-        if not isinstance(env, dict) or set(env) & UNSAFE_ENV:
+        if not isinstance(env, dict) or any(unsafe_env(k) for k in env):
             return False
     for where in (doc, job):
         run = ((where.get("defaults") or {}).get("run")) or {}
@@ -1468,7 +1514,10 @@ def trusted_step(
         "working-directory"
     ):
         return False
+    strict = any(e != "pull_request" for e in events)
     for b in before:
+        if strict and "uses" not in b:
+            return False
         if "uses" in b:
             if not str(b["uses"]).startswith("actions/checkout@"):
                 return False

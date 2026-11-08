@@ -2687,7 +2687,12 @@ close-keywords-check: ## A PR's commits, title and body close only the issues it
 # printf cannot fail, so the pipe needs no pipefail. self-hosted-check
 # trusts that step only in exactly this shape -- printf of literals and
 # "$VARS", piped into `make ci-runner [NAME=value...] >> "$GITHUB_OUTPUT"`
-# -- with no earlier step that can change its environment.
+# -- with no earlier step that can change its environment, no `${{ }}` in
+# the script (GitHub pastes it in before bash reads it), and no PYTHON*,
+# LD_*, DYLD_*, GITHUB_* (but GITHUB_TOKEN) or RUNNER_* variable set. On a
+# workflow a fork can drive other than by plain pull_request (pull_request
+# _target, workflow_run, issue_comment, a review, or workflow_call), only
+# plain checkouts may come before it: declare the legs in the step's env.
 #
 #   CI_RUNNER_KEY           the leg keys naming its hosted label, first one
 #                           present wins.

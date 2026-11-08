@@ -59,7 +59,8 @@ read -r -d '' HELP <<-'EOF' || true
 
 	Steps:
 	  deps    Install a baseline toolchain (C compiler, make, cmake,
-	          pkg-config, git, curl, ssh), then the packages of any
+	          pkg-config, git, curl, ssh, and gpg and age for
+	          just-runit secret), then the packages of any
 	          bootstrap.toml in the current directory (delegates to
 	          install-deps).
 	  certs   WSL only, and only when asked for (-s certs): install
@@ -454,7 +455,11 @@ _find_bootstrap_toml() {
 #
 # Deliberately a toolchain and nothing more. Language runtimes and project
 # libraries (python3-dev, numpy, rust) are a project's to declare, in its
-# own bootstrap.toml, which this step still installs afterwards.
+# own bootstrap.toml, which this step still installs afterwards. gpg and age
+# are the one exception, and are here because jbx itself needs them: they are
+# the two backends of `just-runit secret` (#229). On MSYS2 age comes from
+# winget, whose section runs there too: MSYS2 has no msys build of it, and a
+# ucrt64 one would sit off an msys shell's PATH.
 #
 # It is also what the installed report at the end of a run lists (#180), so
 # the two are one declaration read both ways: a package reports as the
@@ -465,7 +470,7 @@ _find_bootstrap_toml() {
 # reads none of `provides`; it is the report's alone.
 read -r -d '' _BASELINE_TOML <<-'EOF' || true
 	[baseline.apt]
-	packages = ["build-essential", "cmake", "pkg-config", "git", "curl", "ca-certificates", "openssh-client", "tar", "mawk"]
+	packages = ["build-essential", "cmake", "pkg-config", "git", "curl", "ca-certificates", "openssh-client", "tar", "mawk", "gnupg", "age"]
 
 	[baseline.apt."build-essential"]
 	provides = ["cc", "make"]
@@ -478,8 +483,11 @@ read -r -d '' _BASELINE_TOML <<-'EOF' || true
 	[baseline.apt."mawk"]
 	provides = ["awk"]
 
+	[baseline.apt."gnupg"]
+	provides = ["gpg"]
+
 	[baseline.pacman]
-	packages = ["base-devel", "cmake", "pkgconf", "git", "curl", "openssh", "tar", "gawk"]
+	packages = ["base-devel", "cmake", "pkgconf", "git", "curl", "openssh", "tar", "gawk", "gnupg", "age"]
 
 	[baseline.pacman."base-devel"]
 	provides = ["cc", "make"]
@@ -493,8 +501,11 @@ read -r -d '' _BASELINE_TOML <<-'EOF' || true
 	[baseline.pacman."gawk"]
 	provides = ["awk"]
 
+	[baseline.pacman."gnupg"]
+	provides = ["gpg"]
+
 	[baseline.dnf]
-	packages = ["gcc", "make", "cmake", "pkgconf-pkg-config", "diffutils", "git", "curl", "openssh-clients", "tar", "gawk"]
+	packages = ["gcc", "make", "cmake", "pkgconf-pkg-config", "diffutils", "git", "curl", "openssh-clients", "tar", "gawk", "gnupg2", "age"]
 
 	[baseline.dnf."gcc"]
 	provides = ["cc"]
@@ -511,8 +522,11 @@ read -r -d '' _BASELINE_TOML <<-'EOF' || true
 	[baseline.dnf."gawk"]
 	provides = ["awk"]
 
+	[baseline.dnf."gnupg2"]
+	provides = ["gpg"]
+
 	[baseline.zypper]
-	packages = ["gcc", "make", "cmake", "pkg-config", "diffutils", "git", "curl", "openssh", "tar", "gawk"]
+	packages = ["gcc", "make", "cmake", "pkg-config", "diffutils", "git", "curl", "openssh", "tar", "gawk", "gpg2", "age"]
 
 	[baseline.zypper."gcc"]
 	provides = ["cc"]
@@ -526,8 +540,11 @@ read -r -d '' _BASELINE_TOML <<-'EOF' || true
 	[baseline.zypper."gawk"]
 	provides = ["awk"]
 
+	[baseline.zypper."gpg2"]
+	provides = ["gpg"]
+
 	[baseline.apk]
-	packages = ["build-base", "cmake", "pkgconf", "bash", "git", "curl", "openssh-keygen", "tar"]
+	packages = ["build-base", "cmake", "pkgconf", "bash", "git", "curl", "openssh-keygen", "tar", "gnupg", "age"]
 
 	[baseline.apk."build-base"]
 	provides = ["cc", "make"]
@@ -538,10 +555,16 @@ read -r -d '' _BASELINE_TOML <<-'EOF' || true
 	[baseline.apk."openssh-keygen"]
 	provides = ["ssh-keygen"]
 
+	[baseline.apk."gnupg"]
+	provides = ["gpg"]
+
 	# The compiler on macOS is the Xcode Command Line Tools, which brew itself
 	# requires, so brew has only the build tools to add.
 	[baseline.brew]
-	packages = ["cmake", "pkg-config"]
+	packages = ["cmake", "pkg-config", "gnupg", "age"]
+
+	[baseline.brew."gnupg"]
+	provides = ["gpg"]
 
 	# Native Windows: clang-cl, the toolchain just-makeit and doppler build
 	# Windows with, plus CMake, Git (Git Bash, the bash host), PowerShell 7
@@ -561,7 +584,7 @@ read -r -d '' _BASELINE_TOML <<-'EOF' || true
 	# directly, and from MSYS2 too: step_deps runs this section there as
 	# well, since msys2's own section no longer carries a compiler.
 	[baseline.winget]
-	packages = ["Kitware.CMake", "Git.Git", "Microsoft.PowerShell", "GitHub.cli", "Microsoft.VisualStudio.BuildTools"]
+	packages = ["Kitware.CMake", "Git.Git", "Microsoft.PowerShell", "GitHub.cli", "Microsoft.VisualStudio.BuildTools", "FiloSottile.age"]
 
 	[baseline.winget."Microsoft.VisualStudio.BuildTools"]
 	vs_requires = ["Microsoft.VisualStudio.Workload.VCTools", "Microsoft.VisualStudio.Component.VC.Llvm.Clang"]
@@ -578,15 +601,22 @@ read -r -d '' _BASELINE_TOML <<-'EOF' || true
 	[baseline.winget."GitHub.cli"]
 	provides = ["gh"]
 
+	# gpg needs no package of its own: Git for Windows ships it.
+	[baseline.winget."FiloSottile.age"]
+	provides = ["age"]
+
 	# MSYS2 as the BASH HOST only. Its MinGW gcc toolchain is gone
 	# (2026-10-03): just-makeit and doppler build native Windows with
 	# clang-cl, and a second compiler that nothing builds with is one more
 	# thing to keep working. These are the tools the scripts themselves use.
 	[baseline.msys2]
-	packages = ["make", "pkg-config", "git", "curl", "openssh"]
+	packages = ["make", "pkg-config", "git", "curl", "openssh", "gnupg"]
 
 	[baseline.msys2."openssh"]
 	provides = ["ssh"]
+
+	[baseline.msys2."gnupg"]
+	provides = ["gpg"]
 EOF
 
 # _install_manifest INSTALLER FILE LABEL [ARGS...] — one install-deps run

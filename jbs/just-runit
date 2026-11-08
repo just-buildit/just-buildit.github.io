@@ -90,6 +90,578 @@ _md5() {
 	fi
 }
 
+# ---- secret: encrypted secrets, gpg or age (#229) ----------------------------
+#
+# `just-runit secret` stores a secret encrypted under
+# ${XDG_DATA_HOME:-~/.local/share}/jb/secrets/NAME.gpg or NAME.age, and hands
+# it to one command. Everything here is shared by both backends -- prompting,
+# the terminal refusal, env injection, file modes, listing -- except the four
+# functions _secret_{enc,dec}_{gpg,age}. A file's extension is its backend:
+# every command after `set` reads it off the file, never off the config, so a
+# store holding both kinds works whatever default_backend says now.
+#
+# No secret value ever reaches an argv, a log, an error message or a file
+# other than the ciphertext. It travels on stdin into the encrypting tool and
+# on a pipe out of the decrypting one, and `run` decrypts into shell variables
+# it exports only after every decryption is done, then execs CMD -- so no
+# gpg or age process sees a secret in its environment either.
+
+_SECRET_HELP="Usage: just-runit secret <command> [ARGS...]
+
+  Store a secret encrypted with gpg or age, and use it in one command.
+
+Commands:
+  set NAME [--backend gpg|age]
+                 Encrypt the value on stdin, or typed at a no-echo prompt
+                 on a terminal. Never from an argument. An empty value
+                 is refused, and an existing secret is left as it was.
+  get NAME [--show]
+                 Write the value to stdout. Refuses a terminal unless --show.
+  run NAME[=VAR]... -- CMD [ARGS...]
+                 Exec CMD with each secret in its environment, as VAR
+                 (default: NAME). Trailing newlines are dropped, as \$(...)
+                 drops them.
+  list           Names and backends, never values.
+  rm NAME...     Delete secrets.
+  migrate NAME --to gpg|age
+                 Re-encrypt NAME with the other backend.
+  rekey [NAME...]
+                 Re-encrypt to the current recipients (default: all).
+
+Files:
+  \${XDG_DATA_HOME:-~/.local/share}/jb/secrets/NAME.gpg or NAME.age
+                 The store: directory 700, files 600. The extension is
+                 the backend.
+  \${XDG_CONFIG_HOME:-~/.config}/jb/secrets/recipients
+                 One 'KEY VALUE' per line; '#' starts a comment line:
+                   gpg FINGERPRINT      a gpg recipient, its full 40-hex
+                                        fingerprint (gpg --fingerprint)
+                   age RECIPIENT        age1..., an ssh public key line, or
+                                        the absolute path of a recipients
+                                        file (~/ counts)
+                   identity PATH        an age identity file, absolute
+                                        (age-keygen's output, or an ssh
+                                        private key)
+                   default_backend gpg|age
+                 It must be yours and not writable by others, and an
+                 identity file not readable by others (not checked on
+                 Windows, which has no Unix modes).
+                 With no gpg recipients, gpg encrypts to your own key.
+                 With no default_backend: gpg when you have a gpg secret
+                 key, else age.
+
+Examples:
+  printf '%s' \"\$TOKEN\" | just-runit secret set GH_TOKEN
+  just-runit secret set NPM_TOKEN --backend age   # prompts on a terminal
+  just-runit secret run GH_TOKEN=GITHUB_TOKEN -- gh auth status
+  just-runit secret get GH_TOKEN | wl-copy"
+
+_secret_err() {
+	echo "${_ME}: error: $*" >&2
+	exit 1
+}
+
+_secret_dir() { printf '%s\n' "${XDG_DATA_HOME:-${HOME}/.local/share}/jb/secrets"; }
+_secret_config() {
+	printf '%s\n' "${XDG_CONFIG_HOME:-${HOME}/.config}/jb/secrets/recipients"
+}
+
+# _secret_conf KEY -- every value the config gives KEY, one per line, with a
+# leading ~/ expanded. An unknown key is refused rather than ignored: a typo
+# in a recipient line would otherwise encrypt to one recipient fewer, and say
+# nothing.
+_secret_conf() {
+	local want="$1" file line n=0
+	local re='^[[:space:]]*([A-Za-z_]+)[[:space:]]+(.*[^[:space:]])[[:space:]]*$'
+	file="$(_secret_config)"
+	[[ -f ${file} ]] || return 0
+	# Whoever can write this file -- or replace it, through its directory
+	# -- chooses who the secrets are encrypted to.
+	_secret_private "${file%/*}" 022 "writable by others" 700
+	_secret_private "${file}" 022 "writable by others" 600
+	while IFS= read -r line || [[ -n ${line} ]]; do
+		n=$((n + 1))
+		line="${line%$'\r'}"
+		[[ ${line} =~ ^[[:space:]]*(#.*)?$ ]] && continue
+		[[ ${line} =~ ${re} ]] ||
+			_secret_err "${file}:${n}: expected 'KEY VALUE'"
+		case "${BASH_REMATCH[1]}" in
+		gpg | age | identity | default_backend) ;;
+		*) _secret_err "${file}:${n}: unknown key '${BASH_REMATCH[1]}' (gpg, age, identity, default_backend)" ;;
+		esac
+		[[ ${BASH_REMATCH[1]} == "${want}" ]] || continue
+		case "${BASH_REMATCH[2]}" in
+		\~/*) printf '%s\n' "${HOME}/${BASH_REMATCH[2]:2}" ;;
+		*) printf '%s\n' "${BASH_REMATCH[2]}" ;;
+		esac
+	done <"${file}"
+}
+
+# _secret_private PATH MASK WHAT FIX -- refuse PATH when it is not the
+# user's own, or when its mode has any bit of MASK (022: group or world
+# may write; 077: anyone else may read); FIX is the mode the message tells
+# them to set. A symlink (a stow-style dotfile) is judged by its target:
+# -O follows it, and so does stat -L, or a 600 file behind a 777 link
+# was refused. Skipped on MSYS2 and Cygwin, where NTFS has no Unix modes
+# for this to read (the windows runner reports 644 after chmod 600) and
+# ownership is not a uid.
+_secret_private() {
+	local path="$1" mask="$2" what="$3" fix="$4" mode
+	case "${OSTYPE:-}" in msys* | cygwin*) return 0 ;; esac
+	[[ -O ${path} ]] ||
+		_secret_err "${path} is not owned by you; nothing in it is trusted: replace it with your own, mode ${fix}"
+	mode="$(stat -L -c %a "${path}" 2>/dev/null || stat -L -f %Lp "${path}")"
+	if ((8#${mode} & 8#${mask})); then
+		_secret_err "${path} is ${what} (mode ${mode}): chmod ${fix} ${path}"
+	fi
+	return 0
+}
+
+# _secret_abs PATH -- PATH is absolute (after the config's ~/ expansion):
+# /..., or a Windows drive path on MSYS2. A relative one would be read from
+# whatever directory jbx runs in, so it is never taken as a file.
+_secret_abs() { [[ $1 == /* || $1 =~ ^[A-Za-z]:[\\/] ]]; }
+
+# _secret_need BACKEND -- the backend's tool is installed, or one error line
+# saying what to install.
+_secret_need() {
+	command -v "$1" >/dev/null 2>&1 && return 0
+	local pkg="$1"
+	[[ $1 == gpg ]] && pkg="gnupg"
+	_secret_err "$1 is not installed: install ${pkg} (jbx setup-system -s deps)"
+}
+
+_secret_gpg_has_key() {
+	command -v gpg >/dev/null 2>&1 &&
+		gpg --batch --list-secret-keys --with-colons 2>/dev/null | grep -q '^sec'
+}
+
+# ---- the backends: the only code that differs between gpg and age ----------
+# _secret_enc_<backend> OUT encrypts stdin to OUT; _secret_dec_<backend> FILE
+# decrypts FILE to stdout. Nothing else names a backend's tool.
+
+_secret_enc_gpg() {
+	local r list args=()
+	# Read whole before use: a config error inside < <(...) would only
+	# shorten the list, and encrypt to one recipient fewer.
+	list="$(_secret_conf gpg)" || exit 1
+	while IFS= read -r r; do
+		[[ -n ${r} ]] || continue
+		# A short key id is a 32- or 64-bit guess at a key, and short ids
+		# collide on purpose: only the whole fingerprint names one key.
+		[[ ${r} =~ ^(0x)?([0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})$ ]] ||
+			_secret_err "gpg recipient '${r}' in $(_secret_config) is not a full fingerprint (40 hex digits): gpg --fingerprint '${r}'"
+		args+=(--recipient "${r}")
+	done <<<"${list}"
+	if [[ ${#args[@]} -eq 0 ]]; then
+		_secret_gpg_has_key ||
+			_secret_err "no gpg recipients: add 'gpg FINGERPRINT' to $(_secret_config), or create a key: gpg --quick-gen-key 'NAME <EMAIL>'"
+		args=(--default-recipient-self)
+	fi
+	# The recipients file is the statement of trust, so gpg's web of trust
+	# is not asked again: in --batch it refuses any key not marked trusted.
+	gpg --batch --yes --quiet --trust-model always --encrypt \
+		"${args[@]}" --output "$1"
+}
+
+_secret_dec_gpg() { gpg --batch --yes --quiet --decrypt "$1"; }
+
+_secret_enc_age() {
+	local r list args=()
+	list="$(_secret_conf age)" || exit 1
+	while IFS= read -r r; do
+		[[ -n ${r} ]] || continue
+		# An absolute path is a recipients file (an ssh .pub among them),
+		# -R. Anything else is the recipient itself, -r, and is never
+		# looked up as a file: a file named like a recipient, planted in
+		# the directory jbx runs from, would otherwise choose the key. A
+		# single word that is not an age1 recipient is a relative path,
+		# refused for the same reason.
+		if _secret_abs "${r}"; then
+			args+=(-R "${r}")
+		elif [[ ${r} == age1* || ${r} == *[[:space:]]* ]]; then
+			args+=(-r "${r}")
+		else
+			_secret_err "age recipient '${r}' in $(_secret_config) is neither a recipient (age1..., an ssh public key) nor an absolute path: write ~/ or / in front of a file"
+		fi
+	done <<<"${list}"
+	[[ ${#args[@]} -gt 0 ]] ||
+		_secret_err "no age recipients: add 'age RECIPIENT' (age-keygen's public key, or an ssh public key) to $(_secret_config)"
+	age --encrypt "${args[@]}" --output "$1"
+}
+
+_secret_dec_age() {
+	local i list args=()
+	list="$(_secret_conf identity)" || exit 1
+	while IFS= read -r i; do
+		[[ -n ${i} ]] || continue
+		_secret_abs "${i}" ||
+			_secret_err "identity '${i}' in $(_secret_config) is not an absolute path: write ~/ or / in front of it"
+		# Unreadable is age's own error to give; readable by others is a
+		# private key handed round, refused here.
+		[[ -f ${i} ]] && _secret_private "${i}" 077 "readable by others" 600
+		args+=(-i "${i}")
+	done <<<"${list}"
+	[[ ${#args[@]} -gt 0 ]] ||
+		_secret_err "no age identity: add 'identity PATH' (an age-keygen key file, or an ssh private key) to $(_secret_config)"
+	age --decrypt "${args[@]}" "$1"
+}
+
+# ---- shared -----------------------------------------------------------------
+
+# _secret_call enc|dec BACKEND ARG -- run the backend function with its
+# stderr held back, so a failure is one error line, not a gpg or age dump.
+# stdin and stdout pass straight through (stdout by fd 3, around the
+# capture), so the value is never in a variable here.
+_secret_call() {
+	local op="$1" backend="$2" arg="$3" err line why=""
+	_secret_need "${backend}"
+	if { err="$("_secret_${op}_${backend}" "${arg}" 2>&1 >&3 3>&-)"; } 3>&1; then
+		return 0
+	fi
+	# A refusal of our own (no recipients, a bad config line) is already
+	# one error line: pass it on as it is.
+	if [[ ${err} == "${_ME}: error: "* ]]; then
+		printf '%s\n' "${err}" >&2
+		exit 1
+	fi
+	# The tool's own reason, not its banner: the first line saying what
+	# failed, else the last line.
+	while IFS= read -r line; do
+		[[ -n ${line} ]] || continue
+		why="${line}"
+		[[ ${line} == *[Ee]rror* || ${line} == *failed* ]] && break
+	done <<<"${err}"
+	why="${why#gpg: }"
+	why="${why#age: }"
+	why="${why#error: }"
+	[[ ${op} == enc ]] && op="encrypt" || op="decrypt"
+	_secret_err "${backend} could not ${op} '${arg##*/}'${why:+: ${why}}"
+}
+
+_secret_name_ok() {
+	[[ $1 =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] ||
+		_secret_err "bad secret name '$1': letters, digits, _ . - only, not starting with . or -"
+}
+
+_secret_backend_ok() {
+	case "$1" in
+	gpg | age) ;;
+	*) _secret_err "unknown backend '$1' (gpg or age)" ;;
+	esac
+}
+
+# _secret_file NAME -- the one stored file for NAME. Its extension is the
+# backend: ${file##*.}.
+_secret_file() {
+	local dir found=()
+	_secret_name_ok "$1"
+	dir="$(_secret_dir)"
+	[[ -f "${dir}/$1.gpg" ]] && found+=("${dir}/$1.gpg")
+	[[ -f "${dir}/$1.age" ]] && found+=("${dir}/$1.age")
+	case ${#found[@]} in
+	0) _secret_err "no secret '$1' (see: just-runit secret list)" ;;
+	1) printf '%s\n' "${found[0]}" ;;
+	*) _secret_err "'$1' is stored twice, as $1.gpg and $1.age: remove one file" ;;
+	esac
+}
+
+# _secret_default_backend -- default_backend from the config, else gpg when
+# there is a gpg secret key to encrypt to, else age.
+_secret_default_backend() {
+	local b
+	b="$(_secret_conf default_backend)" || exit 1
+	b="${b##*$'\n'}"
+	if [[ -n ${b} ]]; then
+		_secret_backend_ok "${b}"
+		printf '%s\n' "${b}"
+	elif _secret_gpg_has_key; then
+		printf 'gpg\n'
+	else
+		printf 'age\n'
+	fi
+}
+
+# _secret_store NAME BACKEND -- encrypt stdin into NAME.BACKEND, through a
+# temporary file beside it (ciphertext only), so a failure leaves the old
+# value in place. NAME under the other backend goes once this one is in.
+_secret_store() {
+	local name="$1" backend="$2" dir tmp other=age
+	[[ ${backend} == age ]] && other=gpg
+	dir="$(_secret_dir)"
+	mkdir -p "${dir}"
+	chmod 700 "${dir}"
+	tmp="${dir}/.${name}.${backend}.$$"
+	if ! _secret_call enc "${backend}" "${tmp}"; then
+		rm -f "${tmp:?}"
+		exit 1
+	fi
+	chmod 600 "${tmp}"
+	mv -f "${tmp}" "${dir}/${name}.${backend}"
+	rm -f "${dir:?}/${name:?}.${other}"
+}
+
+_secret_set() {
+	local name="" backend="" value file
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--backend)
+			[[ $# -ge 2 ]] || _secret_err "--backend needs gpg or age"
+			backend="$2"
+			shift 2
+			;;
+		--backend=*)
+			backend="${1#--backend=}"
+			shift
+			;;
+		-*) _secret_err "set: unknown option '$1'" ;;
+		*)
+			[[ -z ${name} ]] ||
+				_secret_err "set takes one NAME; the value comes from stdin, never an argument"
+			name="$1"
+			shift
+			;;
+		esac
+	done
+	[[ -n ${name} ]] ||
+		_secret_err "usage: just-runit secret set NAME [--backend gpg|age]"
+	_secret_name_ok "${name}"
+	if [[ -z ${backend} ]]; then
+		# A secret already stored keeps its backend.
+		for file in "$(_secret_dir)/${name}".{gpg,age}; do
+			[[ -f ${file} ]] && backend="${file##*.}"
+		done
+		[[ -n ${backend} ]] || backend="$(_secret_default_backend)"
+	fi
+	_secret_backend_ok "${backend}"
+	_secret_need "${backend}"
+	if [[ -t 0 ]]; then
+		IFS= read -r -s -p "${name}: " value
+		echo >&2
+		[[ -n ${value} ]] || _secret_err "empty value for '${name}'; nothing stored"
+		# printf is a builtin: the value goes into the pipe without ever
+		# being an argv.
+		printf '%s' "${value}" | _secret_store "${name}" "${backend}"
+	else
+		# Empty stdin is refused as an empty prompt is, before anything is
+		# written, so a stored secret survives a mistaken `</dev/null`. One
+		# byte is read to tell; it goes back in front of the rest. A NUL
+		# first byte reads as "" with status 0, so the status, not the
+		# byte, says whether stdin was empty.
+		local first="" rc=0
+		IFS= read -r -d '' -n 1 first || rc=$?
+		[[ ${rc} -eq 0 || -n ${first} ]] ||
+			_secret_err "empty value for '${name}'; nothing stored"
+		{
+			if [[ ${rc} -eq 0 && -z ${first} ]]; then
+				printf '\0'
+			else
+				printf '%s' "${first}"
+			fi
+			cat
+		} | _secret_store "${name}" "${backend}"
+	fi
+	echo "stored ${name} (${backend})" >&2
+}
+
+_secret_get() {
+	local name="" show=0 file
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--show) show=1 ;;
+		-*) _secret_err "get: unknown option '$1'" ;;
+		*)
+			[[ -z ${name} ]] || _secret_err "get takes one NAME"
+			name="$1"
+			;;
+		esac
+		shift
+	done
+	[[ -n ${name} ]] || _secret_err "usage: just-runit secret get NAME [--show]"
+	file="$(_secret_file "${name}")" || exit 1
+	if [[ -t 1 && ${show} -eq 0 ]]; then
+		_secret_err "refusing to print secret '${name}' to a terminal: pipe or redirect it, or pass --show"
+	fi
+	_secret_call dec "${file##*.}" "${file}"
+}
+
+_secret_run() {
+	local spec name var file i
+	local -a names=() vars=() values=()
+	while [[ $# -gt 0 && $1 != -- ]]; do
+		spec="$1"
+		shift
+		name="${spec%%=*}"
+		var="${name}"
+		[[ ${spec} == *=* ]] && var="${spec#*=}"
+		_secret_name_ok "${name}"
+		[[ ${var} =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
+			_secret_err "'${var}' is not an environment variable name; use NAME=VAR"
+		# A variable that changes how CMD runs, or what it loads, is not a
+		# place to put a secret.
+		case "${var}" in
+		PATH | LD_* | DYLD_* | BASH_ENV | ENV | SHELLOPTS | BASHOPTS | IFS | PS4 | BASH_XTRACEFD)
+			_secret_err "'${var}' changes how CMD runs; it cannot hold a secret: use NAME=VAR with another VAR"
+			;;
+		esac
+		names+=("${name}")
+		vars+=("${var}")
+	done
+	[[ ${1:-} == -- && $# -ge 2 && ${#names[@]} -gt 0 ]] ||
+		_secret_err "usage: just-runit secret run NAME[=VAR]... -- CMD [ARGS...]"
+	shift
+	# Every value is decrypted before any is exported, so no gpg or age
+	# run here sees another secret in its environment: only CMD does.
+	for i in "${!names[@]}"; do
+		file="$(_secret_file "${names[i]}")" || exit 1
+		values[i]="$(_secret_call dec "${file##*.}" "${file}")" || exit 1
+	done
+	for i in "${!names[@]}"; do
+		export "${vars[i]}=${values[i]}"
+	done
+	exec "$@"
+}
+
+_secret_list() {
+	local dir file name
+	dir="$(_secret_dir)"
+	[[ -d ${dir} ]] || return 0
+	for file in "${dir}"/*.gpg "${dir}"/*.age; do
+		[[ -f ${file} ]] || continue
+		name="${file##*/}"
+		printf '%s %s\n' "${name%.*}" "${file##*.}"
+	done | sort
+}
+
+_secret_rm() {
+	local name file dir removed
+	[[ $# -gt 0 ]] || _secret_err "usage: just-runit secret rm NAME..."
+	dir="$(_secret_dir)"
+	for name in "$@"; do
+		_secret_name_ok "${name}"
+		removed=0
+		for file in "${dir:?}/${name:?}".{gpg,age}; do
+			if [[ -f ${file} ]]; then
+				rm -f "${file:?}"
+				removed=1
+			fi
+		done
+		[[ ${removed} -eq 1 ]] || _secret_err "no secret '${name}'"
+		echo "removed ${name}" >&2
+	done
+}
+
+# _secret_reencrypt NAME BACKEND -- decrypt NAME and encrypt it again with
+# BACKEND, plaintext over a pipe only.
+#
+# The new ciphertext goes to a temporary file in the store, and replaces
+# the old only once both halves of the pipe succeeded AND it decrypts to
+# the same bytes as the old one (compared by digest, so no value is held
+# anywhere). A decryption that fails would otherwise feed the encrypter an
+# empty stream, and its output would replace the secret with nothing.
+_secret_reencrypt() {
+	local name="$1" to="$2" file from dir tmp want got other=age
+	local -a st=(0 0)
+	file="$(_secret_file "${name}")" || exit 1
+	from="${file##*.}"
+	_secret_need "${from}"
+	_secret_need "${to}"
+	[[ ${to} == age ]] && other=gpg
+	dir="$(_secret_dir)"
+	tmp="${dir}/.${name}.${to}.$$"
+	_secret_call dec "${from}" "${file}" | _secret_call enc "${to}" "${tmp}" ||
+		st=("${PIPESTATUS[@]}")
+	if [[ ${st[0]} -ne 0 || ${st[1]} -ne 0 ]]; then
+		rm -f "${tmp:?}"
+		_secret_err "'${name}' is unchanged: it could not be re-encrypted"
+	fi
+	if ! want="$(_secret_call dec "${from}" "${file}" | _sha256)" ||
+		! got="$(_secret_call dec "${to}" "${tmp}" | _sha256)" ||
+		[[ ${want} != "${got}" ]]; then
+		rm -f "${tmp:?}"
+		_secret_err "'${name}' is unchanged: the re-encrypted copy does not decrypt to the same value with your keys (keep one of your own among the recipients)"
+	fi
+	chmod 600 "${tmp}"
+	mv -f "${tmp}" "${dir}/${name}.${to}"
+	[[ ${to} == "${from}" ]] || rm -f "${dir:?}/${name:?}.${other}"
+}
+
+_secret_migrate() {
+	local name="" to="" file
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--to)
+			[[ $# -ge 2 ]] || _secret_err "--to needs gpg or age"
+			to="$2"
+			shift 2
+			;;
+		--to=*)
+			to="${1#--to=}"
+			shift
+			;;
+		-*) _secret_err "migrate: unknown option '$1'" ;;
+		*)
+			[[ -z ${name} ]] || _secret_err "migrate takes one NAME"
+			name="$1"
+			shift
+			;;
+		esac
+	done
+	[[ -n ${name} && -n ${to} ]] ||
+		_secret_err "usage: just-runit secret migrate NAME --to gpg|age"
+	_secret_backend_ok "${to}"
+	file="$(_secret_file "${name}")" || exit 1
+	if [[ ${file##*.} == "${to}" ]]; then
+		echo "${name} is already ${to}" >&2
+		return 0
+	fi
+	_secret_reencrypt "${name}" "${to}"
+	echo "migrated ${name}: ${file##*.} -> ${to}" >&2
+}
+
+_secret_rekey() {
+	local name file
+	local -a names=("$@")
+	if [[ ${#names[@]} -eq 0 ]]; then
+		while IFS=' ' read -r name _; do names+=("${name}"); done < <(_secret_list)
+	fi
+	for name in "${names[@]+"${names[@]}"}"; do
+		file="$(_secret_file "${name}")" || exit 1
+		_secret_reencrypt "${name}" "${file##*.}"
+		echo "rekeyed ${name} (${file##*.})" >&2
+	done
+}
+
+_secret_main() {
+	# Tracing would print every value: `+ export A=...`, `+ printf %s ...`.
+	# SHELLOPTS=xtrace and a BASH_ENV running `set -x` both turn it on
+	# before this line, so it is turned off here, first. Subshells inherit
+	# that, and a child bash (CMD) is handed SHELLOPTS without xtrace.
+	# BASH_XTRACEFD is left alone: unsetting it when it names fd 2 closes
+	# stderr (bash(1), measured with 5.3), and with tracing off it carries
+	# nothing.
+	set +x
+	local cmd="${1:-}"
+	# Every file this makes is the user's alone, the temporary ones too.
+	umask 077
+	[[ $# -gt 0 ]] && shift
+	case "${cmd}" in
+	set) _secret_set "$@" ;;
+	get) _secret_get "$@" ;;
+	run) _secret_run "$@" ;;
+	list) _secret_list ;;
+	rm) _secret_rm "$@" ;;
+	migrate) _secret_migrate "$@" ;;
+	rekey) _secret_rekey "$@" ;;
+	"" | -h | --help | help) printf '%s\n' "${_SECRET_HELP}" ;;
+	*)
+		echo "${_ME}: unknown command '${cmd}'" >&2
+		echo "Run '${_ME} -h' for usage." >&2
+		exit 1
+		;;
+	esac
+}
+
 # ---- top-level dispatch (when called by the full name, "just-runit") --------
 #
 # This triggered on "jb" and "just-buildit" until 0.5.0, and that was the root
@@ -231,6 +803,12 @@ if [[ ${_ME} == "just-runit" ]]; then
 		printf '\n'
 		[[ ${_fail} -gt 0 ]] && exit 1 || exit 0
 		;;
+	secret)
+		shift
+		_ME="${_ME} secret"
+		_secret_main "$@"
+		exit 0
+		;;
 	version | -V | --version)
 		echo "${_ME} v${_VERSION}"
 		exit 0
@@ -243,6 +821,7 @@ if [[ ${_ME} == "just-runit" ]]; then
 			  run      Ephemeral script runner (alias: jbx)
 			  install  Pre-fetch all tools declared in bootstrap.toml
 			  cache    Manage the local script cache
+			  secret   Store, get and use secrets encrypted with gpg or age
 			  version  Print version and exit
 
 			Run '${_ME} <command> -h' for details.

@@ -438,6 +438,108 @@ class Gate(Adopter):
                 self.assertNotEqual(bad, text)
                 self.assertRefused(bad)
 
+    #: A planner that is safe on any event: a plain checkout, then the one
+    #: trusted step.
+    LONE = """\
+        on: @ON@
+        jobs:
+          plan:
+            runs-on: ubuntu-latest
+            timeout-minutes: 5
+            outputs:
+              matrix: ${{ steps.runners.outputs.matrix }}
+            steps:
+              - uses: actions/checkout@v7
+        @PRE@
+              - id: runners
+                env:
+                  LEGS: '{"include": [{"os": "macos-latest"}]}'
+                  GITHUB_TOKEN: ${{ github.token }}
+                run: @RUN@
+          j:
+            needs: plan
+            runs-on: ${{ matrix.runs_on }}
+            timeout-minutes: 5
+            strategy:
+              matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+        """
+    RUN = (
+        "printf 'matrix=%s\\n' \"$LEGS\""
+        ' | make -s ci-runner >> "$GITHUB_OUTPUT"'
+    )
+
+    def lone(self, on: str, run: str = "", pre: str = "") -> str:
+        return (
+            textwrap.dedent(self.LONE)
+            .replace("@ON@", on)
+            .replace("@RUN@", run or self.RUN)
+            .replace("@PRE@\n", pre)
+        )
+
+    def test_no_expression_in_the_trusted_script(self) -> None:
+        # MUST-FIX: GitHub pastes ${{ }} into the script before bash runs.
+        for on, expr in (
+            ("pull_request_target", "github.event.pull_request.title"),
+            ("workflow_run", "github.event.workflow_run.head_branch"),
+            ("issue_comment", "github.event.comment.body"),
+        ):
+            with self.subTest(on=on):
+                self.assertPasses(self.lone(on))
+                bad = self.RUN.replace(
+                    "'matrix=%s\\n'", f"'m=${{{{ {expr} }}}}'"
+                )
+                self.assertNotEqual(bad, self.RUN)
+                self.assertRefused(self.lone(on, bad), "can name any runner")
+
+    def test_only_checkouts_before_it_on_fork_driven_events(self) -> None:
+        # SHOULD-FIX: an earlier step can fetch the fork's Makefile.
+        pre = "      - run: gh pr checkout ${{ github.event.number }}\n"
+        pre2 = (
+            "      - run: git fetch origin "
+            "${{ github.event.workflow_run.head_sha }}"
+            " && git checkout FETCH_HEAD\n"
+        )
+        plain = "      - id: legs\n        run: make -s plan\n"
+        for on, step in (
+            ("pull_request_target", pre),
+            ("workflow_run", pre2),
+            ("workflow_call", plain),
+            ("issue_comment", plain),
+            ("[push, pull_request_review]", plain),
+        ):
+            with self.subTest(on=on, step=step):
+                self.assertRefused(self.lone(on, pre=step))
+        # Plain pull_request, push and schedule keep the earlier rule.
+        for on in ("[push, pull_request]", "[push, schedule]"):
+            with self.subTest(on=on):
+                self.assertPasses(self.lone(on, pre=plain))
+        # A second plain checkout is still fine anywhere.
+        co = "      - uses: actions/checkout@v7\n"
+        self.assertPasses(self.lone("pull_request_target", pre=co))
+
+    def test_no_interpreter_loader_or_actions_variables(self) -> None:
+        # NIT: PYTHON*, LD_*, DYLD_*, GITHUB_*, RUNNER_* change what runs
+        # or what pick reads; GITHUB_TOKEN is the one allowed name.
+        base = self.lone("[push, pull_request]")
+        self.assertPasses(base)
+        tok = "          GITHUB_TOKEN: ${{ github.token }}\n"
+        self.assertIn(tok, base)
+        for name in (
+            "PYTHONPATH",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "GITHUB_EVENT_NAME",
+            "RUNNER_TEMP",
+        ):
+            with self.subTest(name=name):
+                self.assertRefused(
+                    base.replace(tok, tok + f"          {name}: x\n")
+                )
+        job_env = base.replace(
+            "    outputs:\n", "    env: {PYTHONPATH: .}\n    outputs:\n", 1
+        )
+        self.assertRefused(job_env)
+
     def test_ci_runner_output_inside_a_matrix_is_refused(self) -> None:
         # MUST-FIX 1(a): only the whole matrix may come from ci-runner.
         text = textwrap.dedent(self.PLAN)

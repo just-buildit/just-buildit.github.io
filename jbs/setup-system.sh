@@ -1458,6 +1458,113 @@ _ssh_github_check() {
 	fi
 }
 
+# _macos_box_name -- macOS: set _MAC_NAME to this box's name, pinning it
+# first when nothing has (#225); return 1 when macOS will not say. A
+# variable, not printed: the step's own messages go to stdout.
+#
+# A Mac with no HostName set takes its hostname from the network: one read
+# `mac-mini.lan` during setup and `Matthews-Mac-mini.local` hours later. The
+# box key is named after it, and ssh's %l (sync-ssh-hosts.sh's
+# `IdentityFile ~/.ssh/%l`) expands to it, so the key stopped matching.
+# Both read HostName once it is set, so it is set to LocalHostName -- the
+# Bonjour name, from the Computer Name, which no network changes --
+# lowercased, which is how Tailscale names the node too. A HostName already
+# set is the owner's and is left alone. Setting it needs sudo.
+_MAC_NAME=""
+_macos_box_name() {
+	local name
+	if name="$(scutil --get HostName 2>/dev/null)" && [[ -n ${name} ]]; then
+		_MAC_NAME="${name%%.*}"
+		return 0
+	fi
+	name="$(scutil --get LocalHostName 2>/dev/null)" || return 1
+	name="$(printf '%s' "${name}" | tr '[:upper:]' '[:lower:]')"
+	[[ -n ${name} ]] || return 1
+	_info "pinning this Mac's hostname to ${name}: unset, it follows the network"
+	_sudo_init
+	if ! _priv scutil --set HostName "${name}"; then
+		_warn "could not set HostName -- the key is still named ${name}"
+	fi
+	_MAC_NAME="${name}"
+}
+
+# Markers around the github.com block _macos_github_identity owns in
+# ~/.ssh/config; everything outside them is the user's.
+_SSH_GH_BEGIN="# >>> just-bashit: github.com key (setup-system) >>>"
+_SSH_GH_END="# <<< just-bashit: github.com key (setup-system) <<<"
+
+# _macos_github_identity KEY -- macOS: have ssh offer KEY to github.com
+# (#225). On Linux bashrc.sh loads host-named keys into the agent; a Mac's
+# login shell is zsh, which reads profile.sh and never bashrc.sh, and ssh on
+# its own tries only the id_* names. So the box key reached no agent and git
+# over ssh failed. An IdentityFile in ~/.ssh/config works for every shell,
+# interactive or not.
+#
+# KEY first, then every one of ssh's default id_* keys that exists: an
+# IdentityFile for a host REPLACES ssh's defaults there, and the lines
+# accumulate, so listing them keeps an id_ed25519 that works today working
+# whichever key GitHub knows. No asking GitHub first: a passphrase key
+# cannot be tested unattended, and the box key would never be named.
+#
+# Kept between markers and rewritten in place, so a second run changes
+# nothing. Left alone, with a warning: a `Host github.com` the user wrote, a
+# symlinked config (a dotfile manager owns it, and mv would replace the
+# link with a file), and markers that do not pair (rewriting would drop
+# everything after an orphan begin marker). No IdentitiesOnly: a key the
+# agent holds is still tried first.
+_macos_github_identity() {
+	local key="$1" cfg="${HOME}/.ssh/config" kept=""
+	if [[ ${DRY_RUN} -eq 1 ]]; then
+		_info "would point github.com at ${key} in ${cfg}"
+		return 0
+	fi
+	if [[ -L ${cfg} ]]; then
+		_warn "${cfg} is a symlink -- add to it: Host github.com / IdentityFile ${key}"
+		return 0
+	fi
+	if [[ -f ${cfg} ]]; then
+		# Exit 3: a marker out of turn, or a begin never closed.
+		local rc=0
+		kept="$(awk -v b="${_SSH_GH_BEGIN}" -v e="${_SSH_GH_END}" '
+			$0 == b { if (skip) exit 3; skip = 1; next }
+			$0 == e { if (!skip) exit 3; skip = 0; next }
+			!skip
+			END { if (skip) exit 3 }' "${cfg}")" || rc=$?
+		if [[ ${rc} -eq 3 ]]; then
+			_warn "${cfg} has an unpaired just-bashit marker -- leaving it; fix the markers and re-run"
+			return 0
+		elif [[ ${rc} -ne 0 ]]; then
+			_warn "could not read ${cfg} -- leaving it"
+			return 0
+		fi
+		if grep -qiE '^[[:space:]]*Host[[:space:]]+(.*[[:space:]])?github\.com([[:space:]]|$)' \
+			<<<"${kept}"; then
+			_info "${cfg} already has a Host github.com entry -- leaving it"
+			return 0
+		fi
+	fi
+	local block def
+	block="$(printf '%s\nHost github.com\n    IdentityFile "%s"' \
+		"${_SSH_GH_BEGIN}" "${key}")"
+	# ssh_config(5)'s default IdentityFile list, in its order.
+	for def in id_rsa id_ecdsa id_ecdsa_sk id_ed25519 id_ed25519_sk id_xmss id_dsa; do
+		def="${HOME}/.ssh/${def}"
+		[[ ${def} != "${key}" && -r ${def} ]] || continue
+		block="$(printf '%s\n    IdentityFile "%s"' "${block}" "${def}")"
+	done
+	block="$(printf '%s\n%s' "${block}" "${_SSH_GH_END}")"
+	local tmp="${cfg}.jb-tmp"
+	if ! {
+		if [[ -n ${kept} ]]; then printf '%s\n\n' "${kept}"; fi
+		printf '%s\n' "${block}"
+	} >"${tmp}" || ! chmod 0600 "${tmp}" || ! mv -f -- "${tmp}" "${cfg}"; then
+		rm -f -- "${tmp}"
+		_warn "could not write ${cfg} -- git over ssh may not find ${key}"
+		return 0
+	fi
+	_info "github.com uses ${key} (${cfg})"
+}
+
 # ssh — directory permissions, then a key if the user has none.
 step_ssh() {
 	_head "ssh — agent keys"
@@ -1471,6 +1578,9 @@ step_ssh() {
 	_ssh_harden "${dir}"
 
 	local name="${KEY_NAME}"
+	if [[ -z ${name} ]] && _on_macos && _macos_box_name; then
+		name="${_MAC_NAME}"
+	fi
 	if [[ -z ${name} ]]; then
 		name="$(ssh-key-name)"
 	fi
@@ -1492,6 +1602,7 @@ step_ssh() {
 		_info "existing key(s) found in ${dir} — not generating another"
 		_result "ssh:     ok (existing key)"
 		_ssh_github_check "${found}"
+		if _on_macos; then _macos_github_identity "${found}"; fi
 		return 0
 	fi
 
@@ -1559,6 +1670,7 @@ step_ssh() {
 	fi
 	_result "ssh:     ok (created ${key})"
 	_ssh_github_check "${key}"
+	if _on_macos; then _macos_github_identity "${key}"; fi
 }
 
 # ---------------------------------------------------------------------------

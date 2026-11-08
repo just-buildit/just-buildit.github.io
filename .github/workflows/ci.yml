@@ -1279,6 +1279,50 @@ jobs:
           echo "  ok  names the failure instead of guessing at it"
 
   # ------------------------------------------------------------------
+  # Every vendored Python script lands verbatim in adopters that run
+  # `mypy --strict` over their scripts/ (hunterdsp/mcp-store does), and
+  # standard-check forbids them fixing it locally. So a script that is not
+  # strict-clean here fails an adopter's lint the day it re-vendors, with
+  # no fix available to it: ci-runner.py did exactly that (mcp-store#119).
+  #
+  # The list is the one `make standard-files` prints -- the adopter bot's
+  # own plumbing -- under a Makefile that turns ON every HAS_* flag
+  # standard.mk reads and fills every variable it `_std_require`s, both
+  # read off standard.mk itself. A script added to VENDORED_FILES, in any
+  # feature group present or future, is checked with nothing to register.
+  # mypy is pinned to the version mcp-store's uv.lock resolves, and run
+  # with no config, so --strict is the whole of what it asks.
+  # ------------------------------------------------------------------
+  mypy:
+    name: mypy --strict (vendored scripts)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.1.0
+        with:
+          python-version: "3.13"
+      - name: mypy
+        run: python -m pip install mypy==2.3.0
+      - name: Every vendored Python file is clean under mypy --strict
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"; cp standard.mk "$tmp/"
+          grep -oE '\bHAS_[A-Z_]+' standard.mk | sort -u \
+            | sed 's/$/ = 1/' > "$tmp/Makefile"
+          grep -oE '_std_require,[A-Z_]+' standard.mk | sort -u \
+            | sed 's/^_std_require,//; s/$/ = x/' >> "$tmp/Makefile"
+          printf 'CLEAN_PATHS = dist/\ninclude standard.mk\n' >> "$tmp/Makefile"
+          make -s -C "$tmp" standard-files > "$tmp/files"
+          mapfile -t py < <(grep -E '\.pyi?$' "$tmp/files" || true)
+          # mypy over an empty list would pass having checked nothing.
+          [ "${#py[@]}" -gt 0 ] \
+            || { echo "::error::no vendored Python file listed"; exit 1; }
+          printf '  checking %s\n' "${py[@]}"
+          mypy --version
+          mypy --strict "${py[@]}"
+
+  # ------------------------------------------------------------------
   # Aggregator: the single "CI passed" check the `main` ruleset requires.
   # Adding a job above means adding it to `needs:` here — otherwise the
   # aggregator goes green while the new job is red, and the required check
@@ -1368,6 +1412,7 @@ jobs:
       - standard-mk
       - serving
       - scripts
+      - mypy
       - changelog
       - msvc-env
     runs-on: ubuntu-latest

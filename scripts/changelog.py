@@ -71,6 +71,7 @@ from typing import (
     Dict,
     Iterable,
     List,
+    Mapping,
     NamedTuple,
     Optional,
     Sequence,
@@ -444,7 +445,7 @@ def date_separator(text: str) -> str:
             continue
         rest = _HEADING.match(s.text.split("\n", 1)[0])
         d = _DATE.search(rest.group(2)) if rest else None
-        if d:
+        if rest and d:  # d is None without rest; this says so to mypy
             return rest.group(2)[: d.start()]
     return " - "
 
@@ -477,7 +478,7 @@ def retitle(text: str, version: str, today: str) -> str:
 # ── git ──────────────────────────────────────────────────────────────────────
 
 
-def git(*args: str) -> subprocess.CompletedProcess:
+def git(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", *args], capture_output=True, text=True, check=False
     )
@@ -861,7 +862,7 @@ class Evidence(NamedTuple):
 
 def evidence(
     frag_dir: str,
-    found: Dict[str, Sequence[Union[str, pathlib.Path]]],
+    found: Mapping[str, Sequence[Union[str, pathlib.Path]]],
     changelog_text: str,
 ) -> Evidence:
     """The ``Evidence`` in *found* (``by_section``) and the CHANGELOG."""

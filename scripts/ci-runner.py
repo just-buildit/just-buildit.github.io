@@ -24,40 +24,53 @@ line whose value is a JSON object must be a matrix in ``include`` form, and
 each of its legs gains a ``runs_on``: the leg's hosted label (the first of
 ``--key``'s keys the leg has, ``runs_on`` then ``os`` by default) or, for
 as many legs as there are idle matching runners, that pool's self-hosted
-labels. Every other line passes through unchanged. A job then reads
+labels. Every other ``name=value`` line passes through unchanged; any
+other line (a ``name<<DELIM`` block) is refused, and so is a leg whose
+label is not a GitHub-hosted image (:data:`HOSTED`). A job then reads
 ``runs-on: ${{ matrix.runs_on }}``. A leg goes to a pool only when ALL of
 these hold:
 
-1. the run is not a fork's pull request -- every event whose payload is a
-   pull request counts, and a head repository that is gone counts as a fork;
+1. the run is not fork-driven: not a fork's pull request (every event whose
+   payload is a pull request; a head repository that is gone counts as a
+   fork), not a ``workflow_run`` whose triggering run came from another
+   repository, and not a comment on a pull request;
 2. the repository opted in: the pool's variable (``JB_SELF_HOSTED_MACOS``)
    is ``true``. The workflow passes it in from ``vars.``, so it is a
    repository or organization VARIABLE, not a secret;
 3. a runner of the pool is online, idle, and in a runner group this
    repository may use (public repositories need "Allow public
-   repositories"; a group restricted to selected workflows is not counted).
-   That is read from the org's runner API with ``JB_RUNNER_READ_TOKEN``, a
-   fine-grained token with the org permission "Self-hosted runners: read".
-   ``GITHUB_TOKEN`` cannot read it: its permissions are repository-scoped,
-   and the endpoint is organization-only.
+   repositories"; a group restricted to selected workflows must list this
+   one, ``GITHUB_WORKFLOW_REF``). That is read from the org's runner API
+   with ``JB_RUNNER_READ_TOKEN``, a fine-grained token with the org
+   permission "Self-hosted runners: read". ``GITHUB_TOKEN`` cannot read it:
+   its permissions are repository-scoped, and the endpoint is
+   organization-only;
+4. this repository's jobs already queued for the pool (read with
+   ``GITHUB_TOKEN``, ``actions: read``) leave an idle runner over: each
+   will take the next one, so they are counted against the idle ones.
 
 Anything else -- no token, an API error, a busy or offline runner, a group
 this repository cannot use -- keeps the hosted label. It fails toward a
 hosted leg, never toward one queued for a runner that will not take it. One
 self-hosted runner serves one job, so a pool gets at most as many legs as
 it has idle runners, in the order the lines and legs arrive: list the leg
-that most needs it first. It decides at plan time; two runs planned in the
-same moment can both count one idle runner, and the second waits for it.
+that most needs it first. It decides at plan time: another repository's
+jobs, or a run planned in the same moment, can still take the runner
+first, and then the leg waits for it.
 
 ``check``: no fork PR reaches a self-hosted runner
 ---------------------------------------------------
 Each workflow job whose ``runs-on`` can resolve to a self-hosted runner --
-the label ``self-hosted``, a runner ``group``, or a value it cannot resolve
--- must be gated so that a fork's pull request never selects it. Accepted:
+any label that is not a GitHub-hosted image (a runner must carry all of a
+job's labels, so ``[macOS, ARM64]`` can only be ours), a runner ``group``,
+or a value it cannot resolve -- must be gated so that a fork never selects
+it, on a pull request event, ``workflow_run`` or ``issue_comment``.
+Accepted:
 
 * ``runs-on: ${{ matrix.runs_on }}`` over a matrix read with ``fromJSON``
-  from a job output that a step running ``make ci-runner`` set. ``pick``
-  never gives a fork's pull request a self-hosted label;
+  from a job output of a step in which ``make ci-runner`` is the one
+  command writing ``$GITHUB_OUTPUT`` (a heredoc, quote or comment is not a
+  command). ``pick`` never gives a fork-driven run a self-hosted label;
 * a job ``if:`` that is FALSE for a fork's pull request on every pull
   request event the workflow can run on, whatever else is unknown, for
   example ``github.event.pull_request.head.repo.full_name ==
@@ -96,6 +109,7 @@ True
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import math
 import os
@@ -142,10 +156,34 @@ PR_EVENTS = (
     "pull_request_review_comment",
 )
 
-#: ``make`` running ci-runner, at a command position of a ``run:`` script.
-MAKE_CI_RUNNER = re.compile(
-    r"(?:^|[;&|(]|\$\()\s*make\b[^;&|\n]*?(?<![\w-])ci-runner(?![\w-])", re.M
+#: The events that run this repository's workflow with code or a request
+#: a fork can supply: a pull request's, a ``workflow_run`` a fork's pull
+#: request triggered, and a comment on a pull request.
+FORK_EVENTS = PR_EVENTS + ("workflow_run", "issue_comment")
+
+#: GitHub-hosted image labels, from "GitHub-hosted runners" (standard and
+#: larger runners). A runner is matched by ALL of a job's labels, and no
+#: hosted image carries any other label, so a job asking for anything else
+#: -- ``macOS``, ``ARM64``, a name of our own -- can only ever run on a
+#: self-hosted runner, whether or not it says ``self-hosted``.
+HOSTED = re.compile(
+    r"^(ubuntu-(latest|slim|\d{2}\.\d{2})(-arm)?"
+    r"|windows-(latest|\d{4}|11-arm)(-vs\d{4})?"
+    r"|macos-(latest|\d{2})(-(large|xlarge|intel))?)$",
+    re.I,
 )
+
+#: Job statuses that will still take a runner.
+WAITING = ("queued", "waiting", "requested", "pending")
+
+
+def hosted(label: Any) -> bool:
+    """Whether *label* names a GitHub-hosted image.
+
+    >>> [hosted(x) for x in ("macos-latest", "ubuntu-24.04-arm", "macOS")]
+    [True, True, False]
+    """
+    return isinstance(label, str) and bool(HOSTED.match(label.strip()))
 
 
 # ---------------------------------------------------------------- pick
@@ -154,9 +192,11 @@ MAKE_CI_RUNNER = re.compile(
 def trusted(env: "dict[str, str]") -> "tuple[bool, str]":
     """Whether this run may use a self-hosted runner, and why not.
 
-    Not a fork's pull request: any :data:`PR_EVENTS` event whose head
-    repository is not this one, or is gone. Outside Actions, or with an
-    event file it cannot read, it says no.
+    No for a fork's pull request -- any :data:`PR_EVENTS` event whose
+    head repository is not this one, or is gone -- for a ``workflow_run``
+    whose triggering run's head repository is not this one, and for a
+    comment on a pull request. Outside Actions, or with an event file it
+    cannot read, it says no.
     """
     event, repo = (
         env.get("GITHUB_EVENT_NAME", ""),
@@ -164,17 +204,24 @@ def trusted(env: "dict[str, str]") -> "tuple[bool, str]":
     )
     if not event or not repo:
         return False, "not a GitHub Actions run"
-    if event not in PR_EVENTS:
+    if event not in FORK_EVENTS:
         return True, ""
     try:
         with open(env.get("GITHUB_EVENT_PATH", ""), encoding="utf-8") as f:
             payload = json.load(f)
-        head = payload["pull_request"]["head"]["repo"]
+        if event == "issue_comment":
+            if payload["issue"].get("pull_request"):
+                return False, "a comment on a pull request"
+            return True, ""
+        if event == "workflow_run":
+            head = payload["workflow_run"]["head_repository"]
+        else:
+            head = payload["pull_request"]["head"]["repo"]
         full = head["full_name"] if head else None
-    except (OSError, ValueError, KeyError, TypeError) as e:
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
         return False, f"cannot read the {event} event ({e})"
     if not full or full.lower() != repo.lower():
-        return False, f"a pull request from {full or 'a deleted fork'}"
+        return False, f"a {event} from {full or 'a deleted fork'}"
     return True, ""
 
 
@@ -211,19 +258,41 @@ def _paged(fetch: Fetch, path: str, key: str) -> "list[dict]":
         page += 1
 
 
+def _workflow_refs(ref: str) -> "list[str]":
+    """*ref* (``GITHUB_WORKFLOW_REF``) as a runner group may list it: as
+    given, and with a branch or tag ref shortened (``@main``)."""
+    ref = ref.lower()
+    path, _, at = ref.partition("@")
+    out = [ref]
+    for pre in ("refs/heads/", "refs/tags/"):
+        if at.startswith(pre):
+            out.append(f"{path}@{at[len(pre) :]}")
+    return out
+
+
 def idle(
-    fetch: Fetch, org: str, repo: str, private: bool
+    fetch: Fetch, org: str, repo: str, private: bool, workflow_ref: str = ""
 ) -> "dict[Pool, int]":
     """Idle runners of each pool in a group *repo* may use.
 
-    Raises on any API failure; :func:`main` turns that into "none".
+    A group restricted to selected workflows is usable only by a workflow
+    it lists: *workflow_ref*, ``GITHUB_WORKFLOW_REF``, matched as a glob
+    (on a pull request that ref is ``refs/pull/N/merge``, so a group pinned
+    to ``main`` is not counted there). Raises on any API failure.
     """
     usable = set()
     for g in _paged(
         fetch, f"/orgs/{org}/actions/runner-groups", "runner_groups"
     ):
         if g.get("restricted_to_workflows"):
-            continue
+            mine = _workflow_refs(workflow_ref) if workflow_ref else []
+            allowed = [
+                str(w).lower() for w in g.get("selected_workflows") or []
+            ]
+            if not any(
+                fnmatch.fnmatchcase(r, w) for r in mine for w in allowed
+            ):
+                continue
         if not private and not g.get("allows_public_repositories"):
             continue
         vis = g.get("visibility")
@@ -253,6 +322,36 @@ def idle(
     return counts
 
 
+def queued(fetch: Fetch, repo: str) -> "dict[Pool, int]":
+    """This repository's jobs already waiting for each pool's runners.
+
+    Each will take the next idle runner of its pool, so the picker counts
+    them against the idle ones. A job already running is not counted: its
+    runner is busy, and :func:`idle` has left it out. Read with the run's
+    ``GITHUB_TOKEN`` (``actions: read``); raises on any API failure.
+    """
+    runs: "dict[Any, dict]" = {}
+    for status in ("queued", "in_progress"):
+        for r in _paged(
+            fetch,
+            f"/repos/{repo}/actions/runs?status={status}",
+            "workflow_runs",
+        ):
+            runs[r["id"]] = r
+    counts = {p: 0 for p in POOLS}
+    for rid in runs:
+        for j in _paged(
+            fetch, f"/repos/{repo}/actions/runs/{rid}/jobs", "jobs"
+        ):
+            if j.get("status") not in WAITING:
+                continue
+            have = {str(x).lower() for x in j.get("labels") or []}
+            for p in POOLS:
+                if {x.lower() for x in p.labels} <= have:
+                    counts[p] += 1
+    return counts
+
+
 def pool_of(label: str) -> "Pool | None":
     for p in POOLS:
         if p.hosted.match(label):
@@ -266,8 +365,9 @@ def allocate(
     """Each leg with a ``runs_on``; spends *free* in leg order.
 
     A leg's hosted label is the value of the first of *keys* it has, and
-    must not be self-hosted already: that would carry a self-hosted label
-    past the fork check.
+    must be a GitHub-hosted image (:data:`HOSTED`): anything else -- not
+    only ``self-hosted`` but ``macOS`` -- can only be met by a self-hosted
+    runner, and would carry one past the fork check.
     """
     keys = tuple(keys)
     out = []
@@ -277,8 +377,8 @@ def allocate(
         label = next((leg[k] for k in keys if k in leg), None)
         if not isinstance(label, str) or not label:
             raise ValueError(f"a leg names no hosted label in {keys}: {leg}")
-        if "self-hosted" in label.lower():
-            raise ValueError(f"a leg's hosted label is self-hosted: {label}")
+        if not hosted(label):
+            raise ValueError(f"a leg's label is not a hosted image: {label}")
         p = pool_of(label)
         runs_on: "str | list[str]" = label
         if p is not None and free.get(p, 0) > 0:
@@ -306,6 +406,10 @@ def pick(
     wanted = set()
     for line in lines:
         name, sep, value = line.partition("=")
+        # One `name=value` per line. A `name<<DELIM` block would pass a
+        # multi-line value through untouched, matrix and all.
+        if not sep or not re.fullmatch(r"[A-Za-z_][\w-]*", name):
+            raise ValueError(f"not a name=value output line: {line[:60]}")
         m = None
         if sep and value.strip().startswith("{"):
             m = json.loads(value)
@@ -333,25 +437,37 @@ def pick(
             log.append(f"{p.name}: hosted -- {p.opt_in} is not 'true'")
         elif not env.get(TOKEN_ENV):
             log.append(f"{p.name}: hosted -- no {TOKEN_ENV}")
+        elif not env.get("GITHUB_TOKEN"):
+            log.append(f"{p.name}: hosted -- no GITHUB_TOKEN for the queue")
         else:
             continue
         asking.remove(p)
     if asking:
         repo = env["GITHUB_REPOSITORY"]
+        api = env.get("GITHUB_API_URL", "https://api.github.com")
+        org_fetch = fetch or http_fetch(api, env[TOKEN_ENV])
+        repo_fetch = fetch or http_fetch(api, env["GITHUB_TOKEN"])
         try:
-            if fetch is None:
-                fetch = http_fetch(
-                    env.get("GITHUB_API_URL", "https://api.github.com"),
-                    env[TOKEN_ENV],
-                )
-            counts = idle(fetch, repo.split("/")[0], repo, _private(env))
+            counts = idle(
+                org_fetch,
+                repo.split("/")[0],
+                repo,
+                _private(env),
+                env.get("GITHUB_WORKFLOW_REF", ""),
+            )
+            waiting = queued(repo_fetch, repo)
         except Exception as e:  # noqa: BLE001 -- any failure means hosted
             for p in asking:
                 log.append(f"{p.name}: hosted -- runner API: {e}")
             asking = []
         else:
             for p in asking:
-                free[p] = counts[p]
+                free[p] = max(0, counts[p] - waiting[p])
+                if waiting[p]:
+                    log.append(
+                        f"{p.name}: {waiting[p]} job(s) already queued for "
+                        f"{counts[p]} idle runner(s)"
+                    )
 
     out = []
     total = {p: [0, 0] for p in asking}
@@ -866,27 +982,30 @@ def _compare(op: str, a: Any, b: Any) -> Any:
     if isinstance(a, (dict, list)) or isinstance(b, (dict, list)):
         same = a is b
         return same if op == "==" else (not same if op == "!=" else False)
+    x: Any
+    y: Any
     if isinstance(a, str) and isinstance(b, str):
         x, y = a.lower(), b.lower()
-    elif type(a) is type(b) and not isinstance(a, str):
+    elif op in ("==", "!=") and type(a) is type(b):
         x, y = a, b
     else:
         x, y = _num(a), _num(b)
-    if (
-        isinstance(x, float)
-        and math.isnan(x)
-        or isinstance(y, float)
-        and (math.isnan(y))
-    ):
-        return op == "!="
-    return {
-        "==": x == y,
-        "!=": x != y,
-        "<": x < y,
-        "<=": x <= y,
-        ">": x > y,
-        ">=": x >= y,
-    }[op]
+    nan = any(isinstance(v, float) and math.isnan(v) for v in (x, y))
+    # Only the operator asked for: `null < null` must not be evaluated by
+    # Python, which cannot order None.
+    if op == "==":
+        return not nan and x == y
+    if op == "!=":
+        return nan or x != y
+    if nan:
+        return False
+    if op == "<":
+        return x < y
+    if op == "<=":
+        return x <= y
+    if op == ">":
+        return x > y
+    return x >= y
 
 
 def _lookup(ctx: "dict[str, Any]", path: "tuple[str, ...]") -> Any:
@@ -967,15 +1086,27 @@ REPO, FORK = "owner/repo", "stranger/repo"
 
 
 def scenario(event: str, deleted: bool) -> "dict[str, Any]":
-    """What a fork's pull request run knows: the event, the repository and
-    a head repository that is a fork (or gone). Everything else UNKNOWN."""
+    """What a fork-driven run of *event* knows: the event, the repository,
+    which of the payload's ``pull_request`` / ``workflow_run`` / ``issue``
+    it carries, and a head repository that is a fork (or gone). Everything
+    else is UNKNOWN."""
     head = None if deleted else {"full_name": FORK, "fork": True}
-    return {
-        "github": {
-            "event_name": event,
-            "repository": REPO,
-            "event": {"pull_request": {"head": {"repo": head}}},
+    payload: "dict[str, Any]" = {
+        "pull_request": None,
+        "workflow_run": None,
+        "issue": None,
+    }
+    if event in PR_EVENTS:
+        payload["pull_request"] = {"head": {"repo": head}}
+    elif event == "workflow_run":
+        payload["workflow_run"] = {
+            "head_repository": head,
+            "event": "pull_request",
         }
+    elif event == "issue_comment":
+        payload["issue"] = {"pull_request": {"url": "pr"}}
+    return {
+        "github": {"event_name": event, "repository": REPO, "event": payload}
     }
 
 
@@ -1038,9 +1169,9 @@ class Workflow:
         on = doc.get("on", doc.get("true"))
         trig = _triggers(on)
         if "workflow_call" in trig:
-            self.pr_events = list(PR_EVENTS)
+            self.pr_events = list(FORK_EVENTS)
         else:
-            self.pr_events = [e for e in PR_EVENTS if e in trig]
+            self.pr_events = [e for e in FORK_EVENTS if e in trig]
 
     def canonical(self, job: str, out: str) -> bool:
         """Whether ``needs.<job>.outputs.<out>`` is ci-runner's output."""
@@ -1059,7 +1190,7 @@ class Workflow:
             return False
         for step in j.get("steps") or []:
             if isinstance(step, dict) and step.get("id") == sid:
-                return bool(MAKE_CI_RUNNER.search(str(step.get("run") or "")))
+                return writes_only_ci_runner(str(step.get("run") or ""))
         return False
 
     def values(self, node: tuple, job: dict) -> "list[Any]":
@@ -1185,12 +1316,90 @@ class Workflow:
             if isinstance(v, dict):
                 if "group" in v:
                     return "runs-on names a runner group"
-                for x in _flatten(v.get("labels") or []):
-                    if isinstance(x, str) and x.lower() == "self-hosted":
-                        return "runs-on can be self-hosted"
-            elif isinstance(v, str) and v.strip().lower() == "self-hosted":
-                return "runs-on can be self-hosted"
+                labels = list(_flatten(v.get("labels") or []))
+            else:
+                labels = [v]
+            for x in labels:
+                if isinstance(x, str) and x.strip() and not hosted(x):
+                    return f"runs-on can be {x!r}, not a GitHub-hosted image"
         return ""
+
+
+_OUT = re.compile(r'"?\$(?:GITHUB_OUTPUT|\{GITHUB_OUTPUT\})"?')
+
+
+def _shell_lines(run: str) -> "list[str]":
+    """*run*'s command text: continuations joined, heredoc bodies and
+    comments dropped, quoted text blanked but for ``$( )`` inside double
+    quotes, and ``$GITHUB_OUTPUT`` (any spelling) as the word ``@OUT@``."""
+    out: "list[str]" = []
+    lines = _OUT.sub("@OUT@", run.replace("\\\n", " ")).split("\n")
+    delim = None
+    for line in lines:
+        if delim is not None:
+            if line.strip() == delim:
+                delim = None
+            continue
+        kept, quote, depth, i = "", "", 0, 0
+        while i < len(line):
+            c = line[i]
+            if quote == "'":
+                quote = "" if c == "'" else quote
+            elif quote == '"' and not depth:
+                if c == '"':
+                    quote = ""
+                elif line.startswith("$(", i):
+                    depth, kept = 1, kept + " $("
+                    i += 1
+            elif c in "'\"" and not depth:
+                quote = c
+            elif c == "#" and (not kept or kept[-1] in " \t;&|("):
+                break
+            else:
+                if depth:
+                    depth += {"(": 1, ")": -1}.get(c, 0)
+                kept += c
+            i += 1
+        m = re.search(r"(?<!<)<<-?(?!<)\s*\\?(\w+)", kept) or re.search(
+            r"(?<!<)<<-?(?!<)\s*['\"](\w+)['\"]", line
+        )
+        if m:
+            delim = m.group(1)
+        out.append(kept)
+    return out
+
+
+def writes_only_ci_runner(run: str) -> bool:
+    """Whether a ``run:`` script's outputs are all ``make ci-runner``'s.
+
+    True when exactly one command writes ``$GITHUB_OUTPUT``, and it is
+    ``make`` running ``ci-runner`` with its stdout appended there. A
+    mention in a heredoc, a quoted string or a comment is not a command.
+
+    >>> writes_only_ci_runner('x | make -s ci-runner >> "$GITHUB_OUTPUT"')
+    True
+    >>> writes_only_ci_runner('echo "make ci-runner" >> "$GITHUB_OUTPUT"')
+    False
+    """
+    cmds = [
+        c.strip()
+        for line in _shell_lines(run)
+        for c in re.split(r"&&|\|\||[;|()]|\$\(|`", line)
+    ]
+    writers = [c for c in cmds if "@OUT@" in c]
+    # Every mention counts, read or not: one hidden from the reader above
+    # (a misread heredoc) must not leave a second writer unseen.
+    if len(writers) != 1 or _OUT.sub("@OUT@", run).count("@OUT@") != 1:
+        return False
+    words = re.sub(r">>\s*", " >> ", writers[0]).split()
+    while words and re.fullmatch(r"\w+=\S*", words[0]):
+        words.pop(0)
+    return (
+        len(words) >= 3
+        and words[0] == "make"
+        and "ci-runner" in words
+        and words[-2:] == [">>", "@OUT@"]
+    )
 
 
 def _flatten(vals: "Iterable[Any]") -> "Iterable[Any]":

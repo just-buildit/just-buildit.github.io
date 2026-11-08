@@ -2662,30 +2662,40 @@ close-keywords-check: ## A PR's commits, title and body close only the issues it
 # `ci-runner` is a FILTER over a planner's $GITHUB_OUTPUT lines: each
 # `name=<matrix in include form>` line comes back with a `runs_on` on every
 # leg, and the job reads `runs-on: ${{ matrix.runs_on }}`. A leg gets the
-# self-hosted labels only when the run is not a fork's pull request, the
-# repository opted in (the variable JB_SELF_HOSTED_MACOS is `true`) and a
-# matching runner is online and idle per the org runner API, read with the
-# secret JB_RUNNER_READ_TOKEN (GITHUB_TOKEN cannot read org runners). Any
-# doubt keeps the hosted label. Opt-in and token come from the step's env:
+# self-hosted labels only when the run is not fork-driven, the repository
+# opted in (the variable JB_SELF_HOSTED_MACOS is `true`), a matching runner
+# is online and idle per the org runner API, read with the secret
+# JB_RUNNER_READ_TOKEN (GITHUB_TOKEN cannot read org runners), and this
+# repository's jobs already queued for it (read with GITHUB_TOKEN, `actions:
+# read`) leave one over. Any doubt keeps the hosted label. The planner runs
+# in a step of its own, so the token never reaches it:
 #
-#   env:
-#     JB_SELF_HOSTED_MACOS: ${{ vars.JB_SELF_HOSTED_MACOS }}
-#     JB_RUNNER_READ_TOKEN: ${{ secrets.JB_RUNNER_READ_TOKEN }}
-#   run: |
-#     legs=$(make -s <planner>)
-#     printf '%s\n' "$legs" | make -s ci-runner >> "$GITHUB_OUTPUT"
+#   permissions: {contents: read, actions: read}
+#   steps:
+#     - id: legs
+#       run: make -s <planner> >> "$GITHUB_OUTPUT"
+#     - id: runners
+#       env:
+#         LEGS: ${{ steps.legs.outputs.matrix }}
+#         JB_SELF_HOSTED_MACOS: ${{ vars.JB_SELF_HOSTED_MACOS }}
+#         JB_RUNNER_READ_TOKEN: ${{ secrets.JB_RUNNER_READ_TOKEN }}
+#         GITHUB_TOKEN: ${{ github.token }}
+#       run: >-
+#         printf 'matrix=%s\n' "$LEGS"
+#         | make -s ci-runner >> "$GITHUB_OUTPUT"
 #
-# The planner's output goes through a variable, not a pipe: Actions' default
-# shell has no pipefail, so a failed planner piped straight in would read as
-# a plan with nothing in it.
+# printf cannot fail, so the pipe needs no pipefail; ci-runner must be the
+# only command in the step that writes $GITHUB_OUTPUT.
 #
 #   CI_RUNNER_KEY           the leg keys naming its hosted label, first one
 #                           present wins.
 #   SELF_HOSTED_CHECK_DIRS  where self-hosted-check reads workflows.
 #
 # `self-hosted-check` is in `lint`, on in every repo: it refuses a job whose
-# runs-on can resolve to a self-hosted runner unless it comes from ci-runner
-# or the job's `if:` is false for every fork pull request. It is a guard
+# runs-on can resolve to a self-hosted runner -- any label no GitHub-hosted
+# image carries -- unless it comes from ci-runner or the job's `if:` is
+# false for every fork-driven event (pull requests, workflow_run,
+# issue_comment). It is a guard
 # against our own mistakes, not against a fork: a pull_request run uses the
 # fork's copy of the workflows, so the runner group's repository access and
 # the fork-PR approval policy are what stop a hostile one.
@@ -2696,10 +2706,10 @@ VENDORED_FILES += scripts/ci-runner.py
 
 lint: self-hosted-check
 
-self-hosted-check: ## Verify no fork pull request can reach a self-hosted runner
+self-hosted-check: ## Verify no fork can reach a self-hosted runner
 	@python3 scripts/ci-runner.py check $(SELF_HOSTED_CHECK_DIRS)
 
-ci-runner: ## Give each matrix leg on stdin a runs_on: self-hosted when one is free
+ci-runner: ## Give each matrix leg on stdin a runs_on, self-hosted when free
 	@python3 scripts/ci-runner.py pick --key '$(CI_RUNNER_KEY)'
 
 # ── Help ─────────────────────────────────────────────────────────────────────

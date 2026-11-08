@@ -118,7 +118,7 @@ class Gate(Adopter):
         self.assertPasses(job("[macos-latest]"))
 
     def test_a_literal_self_hosted_job_is_refused(self) -> None:
-        self.assertRefused(job("self-hosted"), "runs-on can be self-hosted")
+        self.assertRefused(job("self-hosted"), "can be 'self-hosted'")
 
     def test_a_label_list_with_self_hosted_is_refused(self) -> None:
         self.assertRefused(job("[self-hosted, macOS, ARM64]"))
@@ -127,6 +127,39 @@ class Gate(Adopter):
             "runs-on:\n      - Self-Hosted\n      - macOS",
         )
         self.assertRefused(block)
+
+    def test_labels_no_hosted_image_carries_are_refused(self) -> None:
+        # MUST-FIX 1: a runner must carry ALL of a job's labels, and no
+        # hosted image carries `macOS`, so these can only run on the Mac.
+        self.assertRefused(job("[macOS, ARM64]"), "'macOS'")
+        self.assertRefused(job("{labels: [macOS, ARM64]}"), "'macOS'")
+        self.assertRefused(job("my-mac"), "not a GitHub-hosted image")
+        self.assertRefused(
+            job(
+                "${{ matrix.os }}",
+                "strategy:\n  matrix:\n    os: [ubuntu-latest, macOS]\n",
+            ),
+            "'macOS'",
+        )
+
+    def test_every_documented_hosted_label_passes(self) -> None:
+        for label in (
+            "ubuntu-latest",
+            "ubuntu-24.04",
+            "ubuntu-22.04-arm",
+            "ubuntu-slim",
+            "windows-latest",
+            "windows-2025",
+            "windows-11-arm",
+            "macos-latest",
+            "macos-15",
+            "macos-26",
+            "macos-15-intel",
+            "macos-latest-large",
+            "macos-15-xlarge",
+        ):
+            with self.subTest(label=label):
+                self.assertPasses(job(label))
 
     def test_a_runner_group_is_refused(self) -> None:
         self.assertRefused(job("{group: mac}"), "runner group")
@@ -179,6 +212,42 @@ class Gate(Adopter):
             job("self-hosted", f"if: ${{{{ {GUARD} }}}} && true\n"),
             "always true",
         )
+
+    def test_workflow_run_and_issue_comment_are_fork_reachable(
+        self,
+    ) -> None:
+        # MUST-FIX 2: both run this repo's workflow on a fork's behalf.
+        events_only = (
+            "github.event_name != 'pull_request' && "
+            "github.event_name != 'pull_request_target'"
+        )
+        for ev in ("workflow_run", "issue_comment"):
+            with self.subTest(ev=ev):
+                text = job("self-hosted", f"if: {events_only}\n")
+                text = text.replace("[push, pull_request]", ev)
+                self.assertRefused(text, f"can be true for {ev}")
+        wr = (
+            "github.event.workflow_run.head_repository.full_name"
+            " == github.repository"
+        )
+        on_wr = job("self-hosted", f"if: {wr}\n").replace(
+            "[push, pull_request]", "workflow_run"
+        )
+        self.assertPasses(on_wr)
+        # A comment on an issue, never on a pull request.
+        ic = job("self-hosted", "if: '!github.event.issue.pull_request'\n")
+        self.assertPasses(ic.replace("[push, pull_request]", "issue_comment"))
+
+    def test_a_null_guard_is_read_not_crashed_on(self) -> None:
+        # SHOULD-FIX 3: Python cannot order None; GitHub's `<` can.
+        cond = (
+            "github.event.pull_request.head.repo != null && "
+            f"github.event.pull_request.number < 1 || {GUARD}"
+        )
+        r = self.gate(job("self-hosted", f"if: {cond}\n"))
+        self.assertNotIn("Traceback", r.stdout + r.stderr)
+        guarded = f"github.event.pull_request.head.repo != null && {GUARD}"
+        self.assertPasses(job("self-hosted", f"if: {guarded}\n"))
 
     def test_a_workflow_no_pull_request_starts_may_use_one(self) -> None:
         text = job("self-hosted").replace(
@@ -248,7 +317,8 @@ class Gate(Adopter):
               - id: legs
                 run: |
                   legs=$(make -s plan)
-                  printf '%s\\n' "$legs" | make -s ci-runner >> "$OUT"
+                  printf '%s\\n' "$legs" > legs.txt
+                  make -s ci-runner < legs.txt >> "$GITHUB_OUTPUT"
           j:
             needs: plan
             runs-on: ${{ matrix.runs_on }}
@@ -271,6 +341,23 @@ class Gate(Adopter):
         self.assertRefused(
             text.replace("steps.legs.outputs", "steps.other.outputs")
         )
+
+    def test_only_a_real_ci_runner_command_counts(self) -> None:
+        # NIT 6: a mention in an echo, a heredoc or a comment is not the
+        # command, and another writer of $GITHUB_OUTPUT is not ci-runner.
+        text = textwrap.dedent(self.PLAN)
+        real = 'make -s ci-runner < legs.txt >> "$GITHUB_OUTPUT"'
+        self.assertIn(real, text)
+        for fake in (
+            'echo "make -s ci-runner" >> "$GITHUB_OUTPUT"',
+            "echo make ci-runner >> $GITHUB_OUTPUT",
+            "cat >> $GITHUB_OUTPUT <<EOF\n"
+            "              make -s ci-runner\n              EOF",
+            real + "\n              echo 'matrix={}' >> $GITHUB_OUTPUT",
+            "# make -s ci-runner >> $GITHUB_OUTPUT",
+        ):
+            with self.subTest(fake=fake):
+                self.assertRefused(text.replace(real, fake))
 
     def test_only_runs_on_of_a_ci_runner_matrix_is_trusted(self) -> None:
         text = textwrap.dedent(self.PLAN).replace(
@@ -356,16 +443,25 @@ class FakeApi:
             {"id": 1, "visibility": "all", "allows_public_repositories": True}
         ]
         self.repos: "dict[int, list[str]]" = {}
+        #: run id -> its jobs, each listed under every status asked for.
+        self.runs: "dict[int, list[dict]]" = {}
         self.calls: "list[str]" = []
         self.fail = False
+        self.fail_queue = False
 
     def __call__(self, path: str) -> Any:
         self.calls.append(path)
-        if self.fail:
+        if self.fail or (self.fail_queue and path.startswith("/repos/")):
             raise OSError("HTTP 502")
         base, _, query = path.partition("?")
-        page = int(dict(q.split("=") for q in query.split("&"))["page"])
-        if base.endswith("/runner-groups"):
+        args = dict(q.split("=") for q in query.split("&"))
+        page = int(args["page"])
+        if base.endswith("/actions/runs"):
+            items = [{"id": i} for i in self.runs]
+            key = "workflow_runs"
+        elif base.endswith("/jobs"):
+            items, key = self.runs[int(base.split("/")[-2])], "jobs"
+        elif base.endswith("/runner-groups"):
             items, key = self.groups, "runner_groups"
         elif base.endswith("/repositories"):
             gid = int(base.split("/")[-2])
@@ -406,6 +502,7 @@ class Pick(unittest.TestCase):
             "GITHUB_EVENT_PATH": pr_event(self.tmp, None, False),
             "JB_SELF_HOSTED_MACOS": "true",
             "JB_RUNNER_READ_TOKEN": "t",
+            "GITHUB_TOKEN": "g",
         }
         self.api = FakeApi([runner()])
 
@@ -447,7 +544,7 @@ class Pick(unittest.TestCase):
         self.env["GITHUB_EVENT_PATH"] = pr_event(self.tmp, "x/repo", False)
         legs, log = self.run_pick()
         self.assertEqual(legs, self.hosted())
-        self.assertIn("a pull request from x/repo", log[0])
+        self.assertIn("a pull_request from x/repo", log[0])
         self.assertEqual(self.api.calls, [])
 
     def test_a_deleted_fork_counts_as_a_fork(self) -> None:
@@ -466,6 +563,94 @@ class Pick(unittest.TestCase):
         self.env["GITHUB_EVENT_NAME"] = "pull_request"
         self.env["GITHUB_EVENT_PATH"] = pr_event(self.tmp, "Org/Repo", False)
         self.assertEqual(self.run_pick()[0][1], MAC)
+
+    def event(self, name: str, payload: dict) -> None:
+        self.env["GITHUB_EVENT_NAME"] = name
+        f = self.tmp / f"{name}.json"
+        f.write_text(json.dumps(payload))
+        self.env["GITHUB_EVENT_PATH"] = str(f)
+
+    def test_a_fork_workflow_run_stays_hosted(self) -> None:
+        for head in ({"full_name": "x/repo"}, None):
+            with self.subTest(head=head):
+                self.event(
+                    "workflow_run", {"workflow_run": {"head_repository": head}}
+                )
+                legs, log = self.run_pick()
+                self.assertEqual(legs, self.hosted())
+                self.assertIn("a workflow_run from", log[0])
+        self.event(
+            "workflow_run",
+            {"workflow_run": {"head_repository": {"full_name": "org/repo"}}},
+        )
+        self.assertEqual(self.run_pick()[0][1], MAC)
+
+    def test_a_comment_on_a_pull_request_stays_hosted(self) -> None:
+        self.event("issue_comment", {"issue": {"pull_request": {"url": "u"}}})
+        legs, log = self.run_pick()
+        self.assertEqual(legs, self.hosted())
+        self.assertIn("a comment on a pull request", log[0])
+        self.event("issue_comment", {"issue": {"number": 1}})
+        self.assertEqual(self.run_pick()[0][1], MAC)
+
+    def test_queued_jobs_for_the_pool_are_counted_first(self) -> None:
+        # SHOULD-FIX 5: one idle Mac, one job of this repo already queued
+        # for it: nothing left for this run.
+        self.api.runs = {7: [{"status": "queued", "labels": MAC}]}
+        legs, log = self.run_pick()
+        self.assertEqual(legs, self.hosted())
+        self.assertIn(
+            "macOS ARM64: 1 job(s) already queued for 1 idle runner(s)", log
+        )
+        self.api.runners = [runner(), runner()]
+        self.assertEqual(self.run_pick()[0][1:], [MAC, "macos-latest"])
+
+    def test_running_or_other_jobs_do_not_count(self) -> None:
+        self.api.runs = {
+            7: [
+                {"status": "in_progress", "labels": MAC},
+                {"status": "completed", "labels": MAC},
+                {"status": "queued", "labels": ["ubuntu-latest"]},
+            ]
+        }
+        self.assertEqual(self.run_pick()[0][1], MAC)
+
+    def test_no_queue_token_or_a_queue_error_stays_hosted(self) -> None:
+        self.env["GITHUB_TOKEN"] = ""
+        legs, log = self.run_pick()
+        self.assertEqual(legs, self.hosted())
+        self.assertIn("no GITHUB_TOKEN", log[0])
+        self.env["GITHUB_TOKEN"] = "g"
+        self.api.fail_queue = True
+        self.assertEqual(self.run_pick()[0], self.hosted())
+
+    def test_a_group_restricted_to_workflows_matches_this_one(self) -> None:
+        # SHOULD-FIX 4: "Selected workflows", pinned to main.
+        wf = "org/repo/.github/workflows/ci.yml"
+        g = {
+            "id": 1,
+            "visibility": "all",
+            "allows_public_repositories": True,
+            "restricted_to_workflows": True,
+        }
+        for listed, ref, ok in (
+            (f"{wf}@refs/heads/main", "refs/heads/main", True),
+            (f"{wf}@main", "refs/heads/main", True),
+            (f"{wf}@main", "refs/pull/3/merge", False),
+            (
+                "org/repo/.github/workflows/other.yml@main",
+                "refs/heads/main",
+                False,
+            ),
+            ("org/repo/.github/workflows/*@main", "refs/heads/main", True),
+        ):
+            with self.subTest(listed=listed, ref=ref):
+                self.api.groups = [dict(g, selected_workflows=[listed])]
+                self.env["GITHUB_WORKFLOW_REF"] = f"{wf}@{ref}"
+                got = self.run_pick()[0][1]
+                self.assertEqual(got, MAC if ok else "macos-latest")
+        self.env.pop("GITHUB_WORKFLOW_REF")
+        self.assertEqual(self.run_pick()[0][1], "macos-latest")
 
     def test_outside_actions_stays_hosted(self) -> None:
         del self.env["GITHUB_EVENT_NAME"]
@@ -585,6 +770,12 @@ class Pick(unittest.TestCase):
             ['m={"os": ["macos-latest"]}'],
             ['m={"include": [{"os": "self-hosted"}]}'],
             ['m={"include": [{"python": "3.12"}]}'],
+            # MUST-FIX 1: any label no hosted image carries.
+            ['m={"include": [{"os": "macOS"}]}'],
+            ['m={"include": [{"os": "my-mac"}]}'],
+            # NIT 6: a multi-line output would pass through unread.
+            ["m<<EOF", '{"include": [{"os": "macOS"}]}', "EOF"],
+            ["just text"],
         ]
         for lines in bad:
             with self.subTest(lines=lines), self.assertRaises(ValueError):
@@ -627,6 +818,7 @@ class MakeCiRunner(Adopter):
             "GITHUB_EVENT_PATH": str(ev),
             "JB_SELF_HOSTED_MACOS": "true",
             "JB_RUNNER_READ_TOKEN": "sekret",
+            "GITHUB_TOKEN": "repo-token",
             **kw,
         }
 
@@ -642,7 +834,9 @@ class MakeCiRunner(Adopter):
         self.assertEqual(tag, "tag=v1")
         legs = json.loads(matrix.partition("=")[2])["include"]
         self.assertEqual([x["runs_on"] for x in legs][1], MAC)
-        self.assertEqual(set(_Handler.auth), {"Bearer sekret"})
+        self.assertEqual(
+            set(_Handler.auth), {"Bearer sekret", "Bearer repo-token"}
+        )
 
     def test_an_unreachable_api_stays_hosted(self) -> None:
         r = self.make(

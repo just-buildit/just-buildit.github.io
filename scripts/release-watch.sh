@@ -56,6 +56,15 @@ RW_POST_JOBS="${RW_POST_JOBS:-publish|post-release|github.release|create github|
 RW_MIN_ASSETS="${RW_MIN_ASSETS:-0}"
 RW_ASSET_PATTERN="${RW_ASSET_PATTERN:-\\.tar\\.gz$}"
 
+# The CI workflow whose push run on main certifies a commit, and how long to
+# wait for it when the verify job gave up while it was still alive (see
+# `ci_live_run` below). 240 min: just-makeit measured main's CI at up to 135
+# min queue included (2026-11-11, 59 runs), and its verify job's own
+# timeout-minutes is 240 for the same reason. Past this the watch stops
+# WITHOUT spending the recovery, and says so.
+RW_CI_WORKFLOW="${RW_CI_WORKFLOW:-ci.yml}"
+RW_CI_WAIT_MIN="${RW_CI_WAIT_MIN:-240}"
+
 RETRIED=0
 
 echo "release-watch: $REPO $TAG"
@@ -264,6 +273,27 @@ wait_ci() {     # <sha> -> 0 when `CI passed` concludes success, 1 otherwise
   return 1
 }
 
+# ── A verify job that gave up on a CI still running (just-buildit.github.io#226)
+# `ci_run_id` finds CI through its `CI passed` check-run, which does not exist
+# while the run is queued behind its concurrency group with no jobs. So when
+# the verify job timed out on a merely QUEUED CI, the repair below saw no CI
+# at all and the one recovery went on a release rerun that hit the same wall:
+# just-makeit v0.128.0 stopped "no safe auto-recovery left" on a CI that later
+# went green. The Actions API lists a queued run, so ask it, and wait while
+# the run is alive before deciding anything.
+ci_live_run() {  # <sha> -> "<id> <status> <conclusion>" of CI's newest push run
+  gh api "repos/$REPO/actions/workflows/$RW_CI_WORKFLOW/runs?head_sha=$1&branch=main&event=push&per_page=10" \
+    --jq '.workflow_runs[0] // empty
+          | "\(.id) \(.status) \(.conclusion // "")"' 2>/dev/null
+}
+
+ci_alive() {     # <status> -> 0 while a run in that status may still finish
+  case "$1" in
+    queued|pending|waiting|requested|in_progress) return 0 ;;
+  esac
+  return 1
+}
+
 # ── 2. Watch, recovering from one pre-publish flake or hang.
 declare -A SEEN
 while true; do
@@ -301,8 +331,33 @@ while true; do
               | select(.name|test("verify ci";"i"))] | length > 0' \
               >/dev/null 2>&1; then
         SHA=$(gh run view "$RUN" -R "$REPO" --json headSha --jq .headSha 2>/dev/null)
-        CIRUN=$(ci_run_id "$SHA")
-        if [ -n "$CIRUN" ]; then
+        # #226: CI still alive? Then the verify job only gave up early. Wait
+        # for the run, and spend the recovery only once it is green.
+        CI_GREEN=0
+        read -r CI_ID CI_ST CI_CONCL <<<"$(ci_live_run "$SHA")"
+        if ci_alive "${CI_ST:-}"; then
+          echo "  CI run $CI_ID for ${SHA:0:8} is still $CI_ST — waiting for it" \
+               "(up to ${RW_CI_WAIT_MIN}m) before spending the one recovery…"
+          waited=0
+          while ci_alive "${CI_ST:-}"; do
+            if [ "$waited" -ge $((RW_CI_WAIT_MIN * 60)) ]; then
+              echo "::error:: CI run $CI_ID for $SHA is still $CI_ST after" \
+                   "${RW_CI_WAIT_MIN}m (RW_CI_WAIT_MIN). The recovery is NOT" \
+                   "spent: rerun the release once" \
+                   "https://github.com/$REPO/actions/runs/$CI_ID is green."
+              exit 1
+            fi
+            sleep 30; waited=$((waited + 30))
+            read -r CI_ID CI_ST CI_CONCL <<<"$(ci_live_run "$SHA")"
+          done
+          echo "  CI run $CI_ID finished: ${CI_CONCL:-<none>}"
+          [ "${CI_CONCL:-}" = success ] && CI_GREEN=1
+        fi
+        CIRUN=""
+        [ "$CI_GREEN" = 0 ] && CIRUN=$(ci_run_id "$SHA")
+        if [ "$CI_GREEN" = 1 ]; then
+          echo "  CI is green — rerunning the release run…"
+        elif [ -n "$CIRUN" ]; then
           echo "  CI is red on ${SHA:0:8} — rerunning ITS failed jobs first…"
           gh run rerun "$CIRUN" -R "$REPO" --failed >/dev/null 2>&1 || true
           if ! wait_ci "$SHA"; then

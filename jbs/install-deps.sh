@@ -859,7 +859,11 @@ _do_install() {
 		_run apt-get "${apt_opts[@]}" install -y --no-install-recommends "$@"
 		;;
 	pacman)
-		_run pacman -Sy --needed --noconfirm "$@"
+		# -Syu, never -Sy: refreshing the databases without upgrading is
+		# a partial upgrade, which Arch does not support. It breaks the
+		# moment a library bumps its soname -- openssl 4 refused to
+		# install beside packages still linked to libcrypto.so.3.
+		_run pacman -Syu --needed --noconfirm "$@"
 		;;
 	brew)
 		_run brew install "$@"

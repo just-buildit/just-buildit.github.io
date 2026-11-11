@@ -24,6 +24,8 @@ import shutil
 import subprocess
 import sys
 import doctest
+import contextlib
+import io
 import tempfile
 import textwrap
 import unittest
@@ -1208,6 +1210,151 @@ def load_tests(
     return tests
 
 
+class Retires(Fixture):
+    """``--retire T``: once train T merges, each constituent's branch still
+    at the head T's table recorded is deleted, and one that moved is kept
+    and named (just-buildit.github.io#219). GitHub's delete-on-merge fires
+    only for the train itself, so without this they pile up forever."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.heads = {}
+        for n, f in ((1, "a.txt"), (2, "b.txt"), (3, "c.txt")):
+            self.heads[n] = self.pr(n, {f: f"{n}\n"}, headRefName=f"pr{n}")
+            sh(self.work, "git", "push", "--quiet", "origin",
+               f"pr{n}:refs/heads/pr{n}")
+        p = self.train("--push", "1", "2", "3")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        # It merges, and GitHub deletes the train's own branch.
+        sh(self.work, "git", "push", "--quiet", "origin",
+           ":refs/heads/train/1-2-3")
+        self.state["prs"]["99"] = dict(
+            number=99,
+            state="MERGED",
+            body=pathlib.Path(str(self.log) + ".body").read_text(),
+        )
+        del self.state["created"]
+        self.log.unlink()
+
+    def branches(self) -> dict[str, str]:
+        out = sh(self.work, "git", "ls-remote", "--heads", str(self.origin))
+        return {
+            ref.removeprefix("refs/heads/"): sha
+            for sha, ref in (x.split() for x in out.splitlines())
+        }
+
+    def move(self, n: int) -> str:
+        """Pushes a new commit onto PR n's branch, after the train took
+        it."""
+        sh(self.work, "git", "switch", "--quiet", f"pr{n}")
+        (self.work / "later.txt").write_text(f"later {n}\n")
+        tip = self.commit(f"later {n}")
+        sh(self.work, "git", "push", "--quiet", "origin",
+           f"pr{n}:refs/heads/pr{n}")
+        sh(self.work, "git", "switch", "--quiet", "main")
+        return tip
+
+    def test_heads_that_match_are_deleted_and_a_moved_one_is_kept(
+        self,
+    ) -> None:
+        tip = self.move(3)
+        summary = self.tmp / "summary.md"
+        self.env["GITHUB_STEP_SUMMARY"] = str(summary)
+        p = self.train("--retire", "99")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        left = self.branches()
+        self.assertNotIn("pr1", left)
+        self.assertNotIn("pr2", left)
+        self.assertEqual(left.get("pr3"), tip)
+        self.assertIn("main", left)
+        said = (
+            f"kept: #3: pr3 moved after the train took it: "
+            f"{self.heads[3][:9]} -> {tip[:9]}"
+        )
+        self.assertIn(said, p.stdout)
+        self.assertIn("deleted: #1: pr1 deleted at", p.stdout)
+        self.assertIn("**kept** #3: pr3 moved", summary.read_text())
+
+    def test_a_rerun_finds_them_gone(self) -> None:
+        self.assertEqual(self.train("--retire", "99").returncode, 0)
+        p = self.train("--retire", "99")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("gone: #1: pr1 is already gone", p.stdout)
+        self.assertEqual(set(self.branches()), {"main"})
+
+    def test_a_pr_with_no_table_is_a_no_op(self) -> None:
+        self.state["prs"]["50"] = dict(
+            number=50, state="MERGED", body="Closes #7\n\n| a | #1 |x"
+        )
+        before = self.branches()
+        p = self.train("--retire", "50")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("#50 is not a train; nothing to retire", p.stdout)
+        self.assertEqual(self.branches(), before)
+        # Not a single constituent was even looked up.
+        self.assertEqual(
+            [c[:3] for c in self.calls()], [["pr", "view", "50"]]
+        )
+
+    def test_an_unmerged_train_keeps_every_branch(self) -> None:
+        # A red train is re-cut from its constituents' branches.
+        self.state["prs"]["99"]["state"] = "CLOSED"
+        before = self.branches()
+        p = self.train("--retire", "99")
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn("#99 is closed, not merged", p.stdout)
+        self.assertEqual(self.branches(), before)
+
+    def test_a_fork_an_open_pr_and_no_record_are_kept(self) -> None:
+        self.state["prs"]["1"]["isCrossRepository"] = True
+        self.state["prs"]["2"]["state"] = "OPEN"
+        body = self.state["prs"]["99"]["body"]
+        self.state["prs"]["99"]["body"] = body.replace(
+            f" `{self.heads[3]}` |", ""
+        )
+        p = self.train("--retire", "99")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(set(self.branches()), {"main", "pr1", "pr2", "pr3"})
+        self.assertIn("#1: its branch pr1 is in a fork", p.stdout)
+        self.assertIn("#2: pr2 -- the PR is open again", p.stdout)
+        self.assertIn("#3: pr3 -- the train recorded no head", p.stdout)
+
+    def test_a_push_racing_the_delete_keeps_the_branch(self) -> None:
+        # Between the ls-remote and the delete, someone pushes: the lease
+        # is what keeps it, not the earlier read.
+        tip = self.move(2)
+        real = train.git
+
+        def stale(*args: str, check: bool = True) -> str:
+            out = real(*args, check=check)
+            if args[:2] == ("ls-remote", "--heads") and "pr2" in args[-1]:
+                return out.replace(tip, self.heads[2])
+            return out
+
+        (self.tmp / "s.json").write_text(json.dumps(self.state))
+        out = io.StringIO()
+        cwd = os.getcwd()
+        os.chdir(self.work)
+        try:
+            with mock.patch.dict(os.environ, self.env), mock.patch.object(
+                train, "git", stale
+            ), contextlib.redirect_stdout(out):
+                rc = train.main(["--retire", "99"])
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(rc, 0, out.getvalue())
+        self.assertIn("#2: pr2 moved while it was being retired",
+                      out.getvalue())
+        self.assertEqual(self.branches().get("pr2"), tip)
+        self.assertNotIn("pr1", self.branches())
+
+    def test_retire_takes_no_other_operation(self) -> None:
+        p = self.train("--retire", "99", "1")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("--retire T takes no other operation", p.stdout)
+        self.assertEqual(len(self.branches()), 4)
+
+
 class SameCommit(unittest.TestCase):
     """The patch-id + message comparison is what makes a train land exactly
     what was reviewed; a forged diff or a reworded message must not pass."""
@@ -1347,12 +1494,93 @@ class Target(unittest.TestCase):
         p = self.make("train", "PRS=3", "PUSH=1")
         self.assertIn("'--push'", p.stdout)
 
+    def test_retire_reaches_the_script(self) -> None:
+        p = self.make("train-retire", "TRAIN=12")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("['--retire', '12']", p.stdout)
+
+    def test_retire_without_a_train_is_usage(self) -> None:
+        p = self.make("train-retire")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("usage: make train-retire TRAIN=", p.stdout)
+
     def test_train_is_vendored(self) -> None:
         p = self.make("-pn")
         line = next(
             x for x in p.stdout.splitlines() if x.startswith("VENDORED_FILES")
         )
         self.assertIn("scripts/train.py", line)
+        self.assertIn(".github/workflows/train-retire.yml", line)
+        # `.github/` is served from `github/`: the source must exist there.
+        self.assertTrue(WORKFLOW.exists())
+
+
+WORKFLOW = ROOT / "github" / "workflows" / "train-retire.yml"
+
+
+class RetireWorkflow(unittest.TestCase):
+    """The vendored workflow: on a merged PR from this repository only,
+    with the token it needs, calling the target -- and the workflow gates
+    every adopter's lint runs over it pass, and go red when it breaks."""
+
+    def setUp(self) -> None:
+        self.text = WORKFLOW.read_text(encoding="utf-8")
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        shutil.copy(ROOT / "standard.mk", self.tmp / "standard.mk")
+        (self.tmp / "scripts").mkdir()
+        shutil.copy(ROOT / "scripts" / "ci-runner.py", self.tmp / "scripts")
+        (self.tmp / ".github" / "workflows").mkdir(parents=True)
+        (self.tmp / "Makefile").write_text(
+            "TEST_CMD = @echo t\nTEST_FAST_CMD = @echo t\n"
+            "CLEAN_PATHS = dist/\ninclude standard.mk\n"
+        )
+
+    def gates(self, text: str) -> subprocess.CompletedProcess:
+        (self.tmp / ".github" / "workflows" / "train-retire.yml").write_text(
+            text
+        )
+        return subprocess.run(
+            ["make", "--no-print-directory", "-C", str(self.tmp),
+             "workflow-timeout-check", "workflow-dispatch-check",
+             "self-hosted-check", "help-check"],
+            capture_output=True, text=True,
+            env={k: v for k, v in os.environ.items() if k != "MAKEFLAGS"},
+        )
+
+    def test_it_runs_on_a_merged_pr_of_this_repository_only(self) -> None:
+        self.assertIn("types: [closed]", self.text)
+        self.assertIn("github.event.pull_request.merged == true", self.text)
+        self.assertIn(
+            "github.event.pull_request.head.repo.full_name == "
+            "github.repository",
+            self.text,
+        )
+        self.assertIn("permissions: {}", self.text)
+        self.assertIn("contents: write", self.text)
+
+    def test_it_calls_the_target_with_the_number_from_env(self) -> None:
+        self.assertIn('run: make -s train-retire TRAIN="$TRAIN"', self.text)
+        self.assertIn(
+            "TRAIN: ${{ github.event.pull_request.number || inputs.train }}",
+            self.text,
+        )
+
+    def test_the_workflow_gates_pass(self) -> None:
+        p = self.gates(self.text)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+
+    def test_no_timeout_is_red(self) -> None:
+        p = self.gates(self.text.replace("    timeout-minutes: 5\n", ""))
+        self.assertNotEqual(p.returncode, 0, p.stdout)
+        self.assertIn("train-retire.yml: retire", p.stdout + p.stderr)
+
+    def test_no_dispatch_is_red(self) -> None:
+        cut = self.text.index("  workflow_dispatch:")
+        end = self.text.index("# Every `run:`")
+        p = self.gates(self.text[:cut] + "\n" + self.text[end:])
+        self.assertNotEqual(p.returncode, 0, p.stdout)
+        self.assertIn("train-retire.yml", p.stdout + p.stderr)
 
 
 if __name__ == "__main__":

@@ -634,7 +634,13 @@ def pr_event(tmp: pathlib.Path, head: "str | None", private: bool) -> str:
 
 
 class FakeApi:
-    """The three org endpoints ``idle`` reads, from in-memory lists."""
+    """The org endpoints ``idle`` reads, from in-memory lists.
+
+    Shaped like the real API: a runner's group is known only from
+    ``/runner-groups/{id}/runners``, and the entries carry no group field.
+    The org-wide ``/actions/runners`` refuses, so a reader that filters it
+    on a group id it does not carry cannot pass here.
+    """
 
     def __init__(self, runners: list, groups: "list | None" = None) -> None:
         self.runners = runners
@@ -666,8 +672,16 @@ class FakeApi:
             gid = int(base.split("/")[-2])
             items = [{"full_name": r} for r in self.repos.get(gid, [])]
             key = "repositories"
+        elif "/runner-groups/" in base and base.endswith("/runners"):
+            gid = int(base.split("/")[-2])
+            items = [
+                {k: v for k, v in r.items() if k != "group"}
+                for r in self.runners
+                if r["group"] == gid
+            ]
+            key = "runners"
         else:
-            items, key = self.runners, "runners"
+            raise AssertionError(f"not an endpoint idle reads: {base}")
         return {key: items[(page - 1) * 100 : page * 100]}
 
 
@@ -677,7 +691,7 @@ def runner(
     return {
         "status": status,
         "busy": busy,
-        "runner_group_id": group,
+        "group": group,  # where FakeApi lists it, never a response field
         "labels": [{"name": x} for x in labels],
     }
 

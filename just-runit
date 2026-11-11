@@ -35,6 +35,13 @@ _NAMESPACES=(
 	"just-bashit ${_JBS_BASE}"
 	"just-makeit ${_JB_DEFAULT_BASE}/just-makeit"
 )
+# The PowerShell hand-off (see "PowerShell scripts" below). get-jb.ps1's jbx
+# function sets JB_PS1_OUT to a file of its own; a run that resolves to a
+# PowerShell script writes it there instead of running it. Taken out of the
+# environment at once, so nothing jbx runs -- a nested jbx included -- sees it.
+_PS1_OUT="${JB_PS1_OUT:-}"
+unset JB_PS1_OUT
+
 # All src/ libs; fetched together so relative inter-source calls resolve.
 _JBS_LIBS=(
 	datetime environment file format
@@ -707,7 +714,7 @@ if [[ ${_ME} == "just-runit" ]]; then
 				# Treat arg as a URL — remove its cache entry.
 				_key=$(printf '%s' "${_CACHE_TARGET}" | _sha256)
 				_removed=0
-				for _f in "${_CACHE_DIR}/${_key}".{sh,py} "${_CACHE_DIR}/${_key}".meta; do
+				for _f in "${_CACHE_DIR}/${_key}".{sh,py,ps1} "${_CACHE_DIR}/${_key}".meta; do
 					[[ -f ${_f} ]] && {
 						rm -f "${_f}"
 						_removed=1
@@ -890,6 +897,8 @@ read -r -d '' HELP <<-EOF || true
 	Resolution order for NAME / NS:NAME:
 	  1. aliases.toml at namespace base
 	  2. Direct URL probe: NS_BASE/NAME.sh then NS_BASE/NAME.py
+	  From PowerShell (get-jb.ps1's jbx), first [aliases.ps1] in
+	  aliases.toml, then NS_BASE/NAME.ps1: run in the PowerShell session.
 
 	Options:
 	  -h        Show this message and exit.
@@ -1031,7 +1040,9 @@ _err() {
 
 # ---- namespace resolution ---------------------------------------------------
 
-# Parse aliases.toml from NS_BASE/aliases.toml and look up a name.
+# Parse aliases.toml from NS_BASE/aliases.toml and look up a name, in the
+# [aliases] table or the one TABLE names ([aliases.ps1], the PowerShell
+# scripts; a jbx that predates it skips that table as any other).
 # Prints the resolved URL, or nothing when the file was read and does not list
 # the name -- the one case in which the caller may fall through to the direct
 # probe.
@@ -1056,7 +1067,7 @@ _err() {
 # Under -n the file goes to main's per-run directory, never the cache, and as
 # that directory starts empty it is always fetched fresh (just-bashit#122).
 _lookup_alias() {
-	local base="${1}" name="${2}"
+	local base="${1}" name="${2}" table="${3:-aliases}"
 	local aliases_url="${base}/aliases.toml"
 	local key
 	key=$(printf '%s' "${base}" | _sha256)
@@ -1100,7 +1111,7 @@ _lookup_alias() {
 	local value_re='^[[:space:]"]*(.*[^[:space:]"])[[:space:]"]*$'
 	while IFS= read -r line || [[ -n ${line} ]]; do
 		case "${line}" in
-		'[aliases]'*)
+		"[${table}]"*)
 			in_sec=1
 			continue
 			;;
@@ -1146,18 +1157,28 @@ _head_ok() {
 	[[ ${code} == "200" || ${code} == "301" || ${code} == "302" ]]
 }
 
+# _ns_base NS -- the base URL of a built-in namespace; fails for any other.
+_ns_base() {
+	local row
+	for row in "${_NAMESPACES[@]}"; do
+		if [[ ${row%% *} == "${1}" ]]; then
+			printf '%s\n' "${row#* }"
+			return 0
+		fi
+	done
+	return 1
+}
+
 # Resolve NS:NAME or bare NAME against a namespace base URL.
 # Returns a URL or the internal "jbs:NAME" marker for just-bashit.
 _resolve_ns() {
 	local ns="${1}" name="${2}"
 
-	# Map namespace to base URL.
-	local base="" row known=""
-	for row in "${_NAMESPACES[@]}"; do
-		known+="${known:+, }${row%% *}"
-		[[ ${row%% *} == "${ns}" ]] && base="${row#* }"
-	done
-	[[ -n ${base} ]] || _err "unknown namespace '${ns}'; known: ${known}"
+	local base row known=""
+	base=$(_ns_base "${ns}") || {
+		for row in "${_NAMESPACES[@]}"; do known+="${known:+, }${row%% *}"; done
+		_err "unknown namespace '${ns}'; known: ${known}"
+	}
 	if [[ ${ns} == just-bashit ]]; then
 		# just-bashit uses the co-fetch mechanism; return internal marker.
 		echo "jbs:${name}"
@@ -1190,6 +1211,71 @@ _resolve_ns() {
 	fi
 
 	_err "cannot resolve '${name}' in namespace '${ns}' (checked ${base}/aliases.toml and ${url_sh})"
+}
+
+# ---- PowerShell scripts -----------------------------------------------------
+
+# A script run in bash cannot change the PowerShell session that called it,
+# so an installer that must put a tool on that session's PATH cannot work
+# through bash. Called from get-jb.ps1's jbx function (_PS1_OUT set), a run
+# therefore prefers a PowerShell script, and hands it back rather than running
+# it: the function runs it in the session. Everything up to the run is the
+# ordinary path -- the cache, its TTL, -r, -n, -t and -k apply unchanged.
+#
+# Resolution, from PowerShell only:
+#   NS:NAME / NAME   [aliases.ps1] in the namespace's aliases.toml, then a
+#                    probe of NS_BASE/NAME.ps1; neither found, the bash
+#                    resolution exactly as from bash. Not just-bashit:,
+#                    which is a bash library bundle.
+#   any URL form     taken as PowerShell when the URL it resolves to ends
+#                    in .ps1.
+# A separate [aliases.ps1] table, not a .ps1 URL in [aliases], because one
+# name has to serve both shells: jbx just-makeit:install is install.sh from
+# bash and install.ps1 from PowerShell. -l, -f and -c keep the bash
+# resolution: they list, fetch, or run in a fresh process, and a script that
+# changes the session can do none of that.
+
+# _resolve_ps1 SPEC -- the URL of the PowerShell script SPEC names, or
+# nothing. It refuses only what _resolve would refuse next (an aliases.toml
+# that cannot be had); anything else it cannot answer, _resolve then
+# answers, with its own errors.
+_resolve_ps1() {
+	local raw="${1}" ns name base url
+	case "${raw}" in
+	just-bashit:*) return 0 ;;
+	*://* | gh:*)
+		url=$(_resolve "${raw}" 2>/dev/null) || return 0
+		[[ ${url} == *.ps1 ]] && printf '%s\n' "${url}"
+		return 0
+		;;
+	*@*:*//*) return 0 ;;
+	*:*) ns="${raw%%:*}" name="${raw#*:}" ;;
+	*) ns="${_JB_DEFAULT_NS}" name="${raw}" ;;
+	esac
+	base=$(_ns_base "${ns}") || return 0
+	url=$(_lookup_alias "${base}" "${name}" aliases.ps1) || exit 1
+	if [[ -n ${url} ]]; then
+		_log "resolved '${name}' via aliases.toml [aliases.ps1] -> ${url}"
+		printf '%s\n' "${url}"
+		return 0
+	fi
+	if _head_ok "${base}/${name}.ps1"; then
+		_log "resolved '${name}' via direct probe -> ${base}/${name}.ps1"
+		printf '%s\n' "${base}/${name}.ps1"
+	fi
+}
+
+# _ps1_handoff URL SCRIPT -- write what the jbx function needs to _PS1_OUT:
+# how many arguments follow SPEC (the script's own, which the function still
+# holds as typed), the URL, then the script. The function reads it once bash
+# has exited and runs the script in its session.
+_ps1_handoff() {
+	local n=${#ARGS[@]}
+	[[ -n ${FUNC} ]] && n=$((n + 1))
+	{
+		printf '%s\n%s\n' "${n}" "${1}"
+		cat "${2}"
+	} >"${_PS1_OUT}"
 }
 
 # ---- URL resolution ---------------------------------------------------------
@@ -1352,7 +1438,7 @@ _resolve() {
 
 _cache_key() { printf '%s' "${1}" | _sha256; }
 
-_cache_ext() { case "${1}" in *.py) echo ".py" ;; *) echo ".sh" ;; esac }
+_cache_ext() { case "${1}" in *.py) echo ".py" ;; *.ps1) echo ".ps1" ;; *) echo ".sh" ;; esac }
 
 _cache_path() {
 	local url="${1}"
@@ -2546,7 +2632,14 @@ if [[ ${OPT_NO_CACHE} -eq 1 ]]; then
 	trap 'rm -rf "${_NO_CACHE_DIR}"' EXIT
 fi
 
-URL=$(_resolve "${RAW_SPEC}")
+URL=""
+_PS1=0
+if [[ -n ${_PS1_OUT} && ${OPT_LIST} -eq 0 && ${OPT_FETCH} -eq 0 &&
+	${OPT_CLEAN} -eq 0 ]]; then
+	URL=$(_resolve_ps1 "${RAW_SPEC}")
+	[[ -n ${URL} ]] && _PS1=1
+fi
+[[ -n ${URL} ]] || URL=$(_resolve "${RAW_SPEC}")
 _log "resolved: ${URL}"
 
 SCRIPT=$(_acquire "${URL}")
@@ -2557,6 +2650,12 @@ _log "script: ${SCRIPT}"
 # Before anything reads the script as code: -l below sources it.
 if [[ ${OPT_FETCH} -eq 1 ]]; then
 	echo "${SCRIPT}"
+	exit 0
+fi
+
+# A PowerShell script is the jbx function's to run, in its session.
+if [[ ${_PS1} -eq 1 ]]; then
+	_ps1_handoff "${URL}" "${SCRIPT}"
 	exit 0
 fi
 

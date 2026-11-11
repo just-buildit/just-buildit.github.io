@@ -10,22 +10,29 @@
 # change its parent's environment -- that is Unix, not a choice. A function  #
 # runs IN the caller's shell, so it can source what the child wrote.         #
 #                                                                            #
-# The handshake. The function exports JB_CALLER_APPLIES=1 for the child;     #
-# setup-system, seeing it, writes the marker below listing what the shell    #
-# now lacks, one directive per line:                                         #
+# The handshake. The function exports JB_CALLER_APPLIES=1 for the child,    #
+# and JB_RELOAD_MARKER, the marker's path (jb_reload_marker below). Whatever #
+# jbx runs -- setup-system, or ANY script -- may append to that file what    #
+# the shell now lacks, one directive per line:                               #
 #                                                                            #
+#   path DIR       put DIR first on PATH, once                               #
 #   profile FILE   source FILE (POSIX: every shell)                          #
 #   bashrc FILE    source FILE when this shell is bash (it is bash-only)     #
-#   path DIR       put DIR first on PATH, once                               #
 #                                                                            #
-# Only just-bashit's own files are ever named: they are written to be        #
+# A third-party script writes `path` lines only, and only when the variable  #
+# is set (`[ -n "${JB_RELOAD_MARKER:-}" ] && echo "path $d" >>"$_"`):        #
+# profile and bashrc name just-bashit's own files, which are written to be   #
 # sourced again (PATH entries are added once; a live ssh-agent is adopted,   #
 # never a second one started). The user's own ~/.profile is not -- Debian's #
 # stock one prepends ~/bin unconditionally -- so it is never re-run.         #
+# Append (>>), never truncate: more than one writer may share one call.      #
 #                                                                            #
-# A run started any other way (bash setup-system.sh, a script) exports no    #
-# JB_CALLER_APPLIES, writes no marker, and prints the "open a new shell"     #
-# hint instead, so a stale marker cannot be applied to some later shell.     #
+# The function removes the marker before the call and after it, and a run   #
+# started any other way (bash setup-system.sh, a script) has neither         #
+# variable, writes no marker, and prints the "open a new shell" hint         #
+# instead, so a stale marker cannot be applied to some later shell. In       #
+# PowerShell, get-jb.ps1's jbx function sets both too, with a marker of its  #
+# own, and applies the `path` lines to $env:PATH.                            #
 #                                                                            #
 # POSIX sh on purpose -- no `local`, no [[ ]], no arrays -- so it works the  #
 # same in bash, zsh, dash and busybox ash, on every distro. Installed by     #
@@ -44,9 +51,12 @@ jb_reload_marker() {
 }
 
 jbx() {
-	JB_CALLER_APPLIES=1 command jbx "$@"
-	_jbx_rc=$?
 	_jbx_mark=$(jb_reload_marker)
+	rm -f "${_jbx_mark}"
+	# Its directory exists, so a script can append with a bare >>.
+	mkdir -p "${_jbx_mark%/*}" 2>/dev/null
+	JB_CALLER_APPLIES=1 JB_RELOAD_MARKER="${_jbx_mark}" command jbx "$@"
+	_jbx_rc=$?
 	if [ -f "${_jbx_mark}" ]; then
 		_jbx_done=""
 		while IFS=' ' read -r _jbx_kind _jbx_arg; do

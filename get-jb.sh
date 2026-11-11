@@ -38,7 +38,6 @@ _jb_install() {
 	# Pages CDN mirror of src/just_bashit/ (not rate-limited raw.github).
 	RAW_BASE="https://just-buildit.github.io/jbs"
 	local RUNIT_URL="${RAW_BASE}/just-runit"
-	local BASHRC="${HOME}/.bashrc"
 
 	local BOLD="\033[1m"
 	local GREEN="\033[1;32m"
@@ -142,21 +141,21 @@ _jb_install() {
 
 	# -- PATH ------------------------------------------------------------------
 
+	# This script is sourced, so this shell is the caller: it gets the
+	# directory here. Every later shell gets it from update-path.sh, the one
+	# implementation `jbx update-path` runs too -- ~/.bashrc, ~/.zshrc when
+	# there is a zsh, and the Windows user Path. Run through the jbx just
+	# installed (-n: fetched fresh, as install-uv below), so this file,
+	# fetched alone, needs no copy of it. Fails soft: jbx works in this
+	# shell either way, and `jbx update-path` can be run again.
 	if [[ ":${PATH}:" != *":${INSTALL_DIR}:"* ]]; then
 		_jb_say "adding ${INSTALL_DIR} to PATH (current shell)"
 		export PATH="${INSTALL_DIR}:${PATH}"
-
-		# shellcheck disable=SC2016
-		local entry='export PATH="${HOME}/.local/bin:${PATH}"'
-		if ! grep -qF '.local/bin' "${BASHRC}" 2>/dev/null; then
-			_jb_say "persisting PATH to ${BASHRC}"
-			printf '\n%s\n' "${entry}" >>"${BASHRC}"
-			_jb_ok "added to ${BASHRC}"
-		else
-			_jb_warn "${BASHRC} already references .local/bin — skipped"
-		fi
 	else
 		_jb_ok "${INSTALL_DIR} already in PATH"
+	fi
+	if ! "${INSTALL_DIR}/just-runit" -n just-bashit:update-path; then
+		_jb_warn "PATH was not persisted for new shells; run: jbx update-path"
 	fi
 
 	# -- the jbx shell function -----------------------------------------------

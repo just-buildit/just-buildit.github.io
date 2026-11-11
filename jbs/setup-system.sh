@@ -2976,7 +2976,9 @@ if [[ ${#_RELOAD[@]} -gt 0 ]]; then
 	# which are written to be sourced again. Anything else -- a direct run, a
 	# script, a dry run -- gets the hint.
 	if [[ ${JB_CALLER_APPLIES:-0} == 1 && ${DRY_RUN} -eq 0 ]]; then
-		_mark="$(jb_reload_marker)"
+		# The function's own path when it gave one; appended, as every
+		# writer of the marker does (jbx-shell.sh).
+		_mark="${JB_RELOAD_MARKER:-$(jb_reload_marker)}"
 		mkdir -p "${_mark%/*}"
 		{
 			[[ -r "${PREFIX}/profile.sh" ]] && printf 'profile %s\n' "${PREFIX}/profile.sh"
@@ -2985,7 +2987,7 @@ if [[ ${#_RELOAD[@]} -gt 0 ]]; then
 			for _d in "${_PATH_ADDED[@]+"${_PATH_ADDED[@]}"}"; do
 				printf 'path %s\n' "${_d}"
 			done
-		} >"${_mark}"
+		} >>"${_mark}"
 		_say "jbx applies this to your shell when setup-system exits:"
 	else
 		_say "open a new shell, or run: exec bash -l"

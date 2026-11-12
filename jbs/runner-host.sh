@@ -145,6 +145,18 @@ _run() {
 	fi
 }
 
+# _rh_command WORD -- take WORD as the command, the one positional. Shared
+# by the option loop and the words after `--`, so both refuse alike.
+_rh_command() {
+	case "$1" in
+	image | run | install | uninstall | status)
+		[[ -z ${CMD} ]] || _die "one command at a time (got ${CMD} and $1)"
+		CMD="$1"
+		;;
+	*) _die "unknown argument: $1 (try --help)" ;;
+	esac
+}
+
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	-h | --help)
@@ -153,11 +165,14 @@ while [[ $# -gt 0 ]]; do
 		;;
 	-n | --dry-run) DRY_RUN=1 ;;
 	--once) ONCE=1 ;;
-	image | run | install | uninstall | status)
-		[[ -z ${CMD} ]] || _die "one command at a time (got ${CMD} and $1)"
-		CMD="$1"
+	--)
+		# End of options (gh-248): every word after it is a command word,
+		# so `-- --once` is no option.
+		shift
+		for _rh_word in "$@"; do _rh_command "${_rh_word}"; done
+		break
 		;;
-	*) _die "unknown argument: $1 (try --help)" ;;
+	*) _rh_command "$1" ;;
 	esac
 	shift
 done

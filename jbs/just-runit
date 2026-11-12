@@ -453,8 +453,17 @@ _secret_store() {
 
 _secret_set() {
 	local name="" backend="" value file
+	local one="set takes one NAME; the value comes from stdin, never an argument"
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
+		--)
+			# End of options (gh-248): the NAME, even one starting with `-`.
+			shift
+			[[ $# -eq 0 ]] && break
+			[[ $# -eq 1 && -z ${name} ]] || _secret_err "${one}"
+			name="$1"
+			break
+			;;
 		--backend)
 			[[ $# -ge 2 ]] || _secret_err "--backend needs gpg or age"
 			backend="$2"
@@ -466,8 +475,7 @@ _secret_set() {
 			;;
 		-*) _secret_err "set: unknown option '$1'" ;;
 		*)
-			[[ -z ${name} ]] ||
-				_secret_err "set takes one NAME; the value comes from stdin, never an argument"
+			[[ -z ${name} ]] || _secret_err "${one}"
 			name="$1"
 			shift
 			;;
@@ -515,13 +523,21 @@ _secret_set() {
 }
 
 _secret_get() {
-	local name="" show=0 file
+	local name="" show=0 file one="get takes one NAME"
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
+		--)
+			# End of options (gh-248): the NAME, even one starting with `-`.
+			shift
+			[[ $# -eq 0 ]] && break
+			[[ $# -eq 1 && -z ${name} ]] || _secret_err "${one}"
+			name="$1"
+			break
+			;;
 		--show) show=1 ;;
 		-*) _secret_err "get: unknown option '$1'" ;;
 		*)
-			[[ -z ${name} ]] || _secret_err "get takes one NAME"
+			[[ -z ${name} ]] || _secret_err "${one}"
 			name="$1"
 			;;
 		esac
@@ -637,9 +653,17 @@ _secret_reencrypt() {
 }
 
 _secret_migrate() {
-	local name="" to="" file
+	local name="" to="" file one="migrate takes one NAME"
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
+		--)
+			# End of options (gh-248): the NAME, even one starting with `-`.
+			shift
+			[[ $# -eq 0 ]] && break
+			[[ $# -eq 1 && -z ${name} ]] || _secret_err "${one}"
+			name="$1"
+			break
+			;;
 		--to)
 			[[ $# -ge 2 ]] || _secret_err "--to needs gpg or age"
 			to="$2"
@@ -651,7 +675,7 @@ _secret_migrate() {
 			;;
 		-*) _secret_err "migrate: unknown option '$1'" ;;
 		*)
-			[[ -z ${name} ]] || _secret_err "migrate takes one NAME"
+			[[ -z ${name} ]] || _secret_err "${one}"
 			name="$1"
 			shift
 			;;

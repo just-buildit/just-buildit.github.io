@@ -91,6 +91,11 @@ class FakeApi:
         self.limit = limit
         self.polls = 0
         self.paths: list[str] = []
+        #: GET .../runs?branch=main&event=push: main's push runs, newest
+        #: first, whatever their commit.
+        self.main_runs: list[dict[str, Any]] = []
+        #: The run the last CI lookup returned.
+        self.current: Optional[dict[str, Any]] = None
 
     def __call__(self, path: str) -> Any:
         self.paths.append(path)
@@ -102,8 +107,26 @@ class FakeApi:
             found = [
                 c for c in self.checks.get(suite, []) if c["name"] == name
             ]
+            # As GitHub reports it: while the run is not completed, its
+            # aggregate check (if it exists yet) has no conclusion.
+            cur = self.current
+            if cur is not None and cur["status"] != "completed":
+                found = [
+                    {**c, "status": "in_progress", "conclusion": None}
+                    for c in found
+                ]
             return {"total_count": len(found), "check_runs": found}
         assert base == f"repos/{REPO}/actions/workflows/ci.yml/runs", base
+        if "head_sha" not in args:
+            assert args == {
+                "branch": "main",
+                "event": "push",
+                "per_page": "20",
+            }, args
+            return {
+                "total_count": len(self.main_runs),
+                "workflow_runs": self.main_runs,
+            }
         assert args == {
             "head_sha": SHA,
             "branch": "main",
@@ -116,6 +139,7 @@ class FakeApi:
             raise AssertionError("verify() polled past any sane bound")
         if isinstance(state, Exception):
             raise state
+        self.current = state
         runs = [state] if state else []
         return {"total_count": len(runs), "workflow_runs": runs}
 
@@ -166,8 +190,18 @@ class ALiveRunIsWaitedFor(unittest.TestCase):
         self.assertEqual(v.verdict, "green", said[-1:])
         self.assertEqual(api.polls, 3 * LONG + 1)
 
-    def test_every_live_status_keeps_waiting(self) -> None:
-        for status in sorted(vc.LIVE_STATUSES):
+    def test_every_status_but_completed_keeps_waiting(self) -> None:
+        """A literal list, not the script's own: GitHub's non-completed run
+        statuses (`waiting` is an environment's approval), and one it may
+        add later. Only `completed` has a result to read."""
+        for status in (
+            "queued",
+            "pending",
+            "waiting",
+            "requested",
+            "in_progress",
+            "a_status_github_adds_later",
+        ):
             with self.subTest(status=status):
                 api = FakeApi(
                     [run(status)] * LONG + [run("completed", "success")],
@@ -255,6 +289,54 @@ class ACompletedRunIsJudgedByItsOwnCheck(unittest.TestCase):
         )
         v, _, _ = verify(api, min_attempt=2)
         self.assertEqual((v.verdict, v.run_attempt), ("green", "2"))
+
+
+NEWER = "https://github.com/o/r/actions/runs/9"
+
+
+def main_run(rid: int, status: str, sha: str = "def456") -> dict[str, Any]:
+    return {
+        "id": rid,
+        "head_sha": sha,
+        "status": status,
+        "conclusion": None if status != "completed" else "success",
+        "html_url": f"https://github.com/o/r/actions/runs/{rid}",
+    }
+
+
+class ANewerMainRunIsNamed(unittest.TestCase):
+    """Main's pushes share one concurrency group holding one PENDING run,
+    so rerunning an older commit's CI can cancel the head's. A red or
+    no-check verdict names a newer main run that is still alive."""
+
+    def judged(self, conclusion: str, main_runs: list[Any]) -> Any:
+        checks = {100: [check(conclusion)]} if conclusion else {}
+        api = FakeApi([run("completed", conclusion or "cancelled")], checks)
+        api.main_runs = main_runs
+        return verify(api)[0]
+
+    def test_red_with_a_newer_pending_run(self) -> None:
+        v = self.judged("failure", [main_run(9, "pending"), run("completed")])
+        self.assertEqual((v.verdict, v.newer_url), ("red", NEWER))
+        self.assertIn("could cancel it", v.message)
+
+    def test_no_check_with_a_newer_running_run(self) -> None:
+        v = self.judged("", [main_run(9, "in_progress")])
+        self.assertEqual((v.verdict, v.newer_url), ("no-check", NEWER))
+
+    def test_a_newer_run_that_finished_is_not_in_the_way(self) -> None:
+        v = self.judged("failure", [main_run(9, "completed")])
+        self.assertEqual((v.verdict, v.newer_url), ("red", ""))
+
+    def test_an_older_live_run_is_not_newer(self) -> None:
+        v = self.judged("failure", [main_run(5, "queued")])
+        self.assertEqual(v.newer_url, "")
+
+    def test_green_does_not_ask(self) -> None:
+        api = FakeApi([run("completed", "success")], GREEN)
+        api.main_runs = [main_run(9, "pending")]
+        v, _, _ = verify(api)
+        self.assertEqual((v.verdict, v.newer_url), ("green", ""))
 
 
 BAD_GATEWAY = "gh: HTTP 502: Bad Gateway (https://api.github.com/x)"
@@ -353,6 +435,22 @@ class OneReadRetriesWhatMayRecover(unittest.TestCase):
                     self.read(gh)
                 self.assertEqual(gh.calls, 1)
 
+    def test_no_token_is_refused_at_once(self) -> None:
+        """gh exits 4, with no HTTP code, when it has no token."""
+        gh = FakeGh(
+            [
+                (
+                    4,
+                    "",
+                    "gh: To use GitHub CLI in a GitHub Actions "
+                    "workflow, set the GH_TOKEN environment variable.",
+                )
+            ]
+        )
+        with self.assertRaises(vc.Refused):
+            self.read(gh)
+        self.assertEqual(gh.calls, 1)
+
     def test_a_reply_that_is_not_json_is_retried(self) -> None:
         gh = FakeGh([(0, "<html>", "")] + [(0, "[]", "")])
         self.assertEqual(self.read(gh)[0], [])
@@ -427,9 +525,9 @@ class Wiring(unittest.TestCase):
             "os.environ['CI_WORKFLOW'])\n"
         )
 
-    def make(self, body: str, *args: str) -> str:
+    def make(self, body: str, *args: str, after: str = "") -> str:
         (self.tmp / "Makefile").write_text(
-            BASE + body + "include standard.mk\n"
+            BASE + body + "include standard.mk\n" + after
         )
         env = {k: v for k, v in os.environ.items() if k != "MAKEFLAGS"}
         r = subprocess.run(
@@ -462,6 +560,28 @@ class Wiring(unittest.TestCase):
             "VERSION=1.2.3",
         )
         self.assertEqual(out.strip(), "watch CI passed ci.yml")
+
+    def test_a_name_set_after_the_include_reaches_both(self) -> None:
+        """An adopter may set CI_CHECK_NAME below `include standard.mk`;
+        the value the recipe runs with is the one exported."""
+        late = (
+            "CI_CHECK_NAME = Late\nGATES_CI_FILE = .github/workflows/x.yml\n"
+        )
+        out = self.make(
+            'RELEASE_WATCH_CMD = @echo watch "$$CI_CHECK_NAME" '
+            '"$$CI_WORKFLOW"\n',
+            "release-verify-ci",
+            after=late,
+        )
+        self.assertEqual(out.strip(), "verify-ci Late x.yml")
+        out = self.make(
+            'RELEASE_WATCH_CMD = @echo watch "$$CI_CHECK_NAME" '
+            '"$$CI_WORKFLOW"\n',
+            "release-watch",
+            "VERSION=1.2.3",
+            after=late,
+        )
+        self.assertEqual(out.strip(), "watch Late x.yml")
 
     def test_the_script_is_vendored_with_release(self) -> None:
         out = self.make("RELEASE_WATCH_CMD = true\n", "standard-files")

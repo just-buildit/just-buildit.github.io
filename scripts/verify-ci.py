@@ -24,8 +24,10 @@ started" and then as a timeout (just-makeit v0.127.1 and v0.128.0,
 2026-11-11, each spending the release's one recovery on it).
 
 ``alive``
-    The run is queued, pending, waiting, requested or in progress
-    (:data:`LIVE_STATUSES`). Keep waiting, with no cap of this script's
+    The run's status is anything but ``completed`` -- queued, pending,
+    waiting (an environment's approval), requested, in progress, or a
+    status GitHub adds later. Only ``completed`` has a result to read, so
+    nothing else is judged. Keep waiting, with no cap of this script's
     own unless ``--max-minutes`` gives one: in a workflow the job's
     ``timeout-minutes`` is the cap, and every waiting line says so.
 ``no-run``
@@ -45,6 +47,12 @@ started" and then as a timeout (just-makeit v0.127.1 and v0.128.0,
     403 that is not a rate limit, 404) it is a verdict at once, naming the
     path, since waiting cannot fix a wrong token or workflow name.
 
+A ``red`` or ``no-check`` verdict also names a NEWER main push run of
+the CI workflow that has not completed, when there is one
+(``newer_url``). Rerunning this commit's CI then is not safe: a workflow
+whose main pushes share one concurrency group holds one PENDING run, and
+a rerun queued on the older commit can cancel the newer head's.
+
 ``--min-attempt N`` treats a completed run whose ``run_attempt`` is below
 N as not yet re-run, so a caller that just reran CI does not read the
 previous attempt's result back.
@@ -57,7 +65,8 @@ Usage::
 ``CI_CHECK_NAME`` (default ``CI passed``) and ``CI_WORKFLOW`` (default
 ``ci.yml``) come from standard.mk. Exits 0 on ``green`` and 1 on every
 other verdict, after a ``::error::`` line naming it. ``--out`` appends
-``verdict=``, ``run_id=``, ``run_attempt=`` and ``run_url=`` lines to FILE
+``verdict=``, ``run_id=``, ``run_attempt=``, ``run_url=`` and
+``newer_url=`` lines to FILE
 for a caller to read. ``gh`` needs ``GH_TOKEN`` with ``actions: read`` and
 ``checks: read``.
 
@@ -89,11 +98,6 @@ import time
 import urllib.parse
 from typing import Any, Callable, NamedTuple, Optional
 
-#: Run statuses in which the run may still finish.
-LIVE_STATUSES = frozenset(
-    {"queued", "pending", "waiting", "requested", "in_progress"}
-)
-
 #: Seconds between polls.
 INTERVAL = 20
 #: Seconds a run may take to APPEAR: over a hundred times the measured
@@ -124,6 +128,7 @@ class Verdict(NamedTuple):
     run_id: str = ""
     run_attempt: str = ""
     run_url: str = ""
+    newer_url: str = ""
 
 
 def _permanent(err: str) -> bool:
@@ -146,10 +151,10 @@ def gh_api(
 ) -> Any:
     """GET one REST path through ``gh api``, retrying what may recover.
 
-    Each failed attempt is printed. A refusal (see :func:`_permanent`)
-    raises :class:`Refused` at once; anything else -- a 5xx, a rate limit,
-    no network, a reply that is not JSON -- is retried after each
-    :data:`BACKOFF` pause and then raises :class:`Unreadable`.
+    Each failed attempt is printed. A refusal (:func:`_permanent`, or gh
+    exit 4: no token) raises :class:`Refused` at once; anything else -- a
+    5xx, a rate limit, no network, a reply that is not JSON -- is retried
+    after each :data:`BACKOFF` pause and then raises :class:`Unreadable`.
     """
     err = ""
     for pause in (*BACKOFF, None):
@@ -161,7 +166,9 @@ def gh_api(
                 err = f"not JSON: {e}"
         else:
             err = r.stderr.strip() or f"gh exited {r.returncode}"
-            if _permanent(err):
+            # gh exits 4 when it has no token at all ("set the GH_TOKEN
+            # environment variable"): no HTTP code, and no wait fixes it.
+            if r.returncode == 4 or _permanent(err):
                 raise Refused(f"gh api {path}: {err}")
         if pause is None:
             break
@@ -199,6 +206,25 @@ def certifying_check(
         f"?check_name={name}"
     ).get("check_runs", [])
     return found[0] if found else None
+
+
+def newer_live_run(
+    repo: str, run: dict[str, Any], workflow: str, api: Api
+) -> Optional[dict[str, Any]]:
+    """A main push run of ``workflow`` newer than ``run``, not completed.
+
+    Newer is a larger run id (ids only grow); a rerun keeps its id, so
+    ``run`` itself never counts. The API lists newest first, so the first
+    page holds every run that can be newer and still alive.
+    """
+    runs: list[dict[str, Any]] = api(
+        f"repos/{repo}/actions/workflows/{workflow}/runs"
+        f"?branch=main&event=push&per_page=20"
+    ).get("workflow_runs", [])
+    for r in runs:
+        if r.get("id", 0) > run["id"] and r.get("status") != "completed":
+            return r
+    return None
 
 
 def verify(
@@ -257,13 +283,31 @@ def verify(
             last = run
             if run is None:
                 state = "absent"
-            elif run["status"] in LIVE_STATUSES:
-                state = run["status"]
+            elif run["status"] != "completed":
+                state = str(run["status"])
             elif int(run.get("run_attempt") or 1) < min_attempt:
                 state = f"attempt {run.get('run_attempt')}, not yet re-run"
             else:
                 url = run["html_url"]
                 got = certifying_check(repo, run, check, api)
+                if got is not None and got.get("conclusion") == "success":
+                    return Verdict(
+                        "green", f"'{check}' is green on {url}", **ident(run)
+                    )
+                newer = newer_live_run(repo, run, workflow, api)
+                busy = ""
+                if newer is not None:
+                    busy = (
+                        f" A newer main CI run, {newer.get('html_url')}, is "
+                        f"{newer.get('status')}: rerunning this one now "
+                        f"could cancel it, so let it finish first."
+                    )
+                extra = {
+                    **ident(run),
+                    "newer_url": str(newer.get("html_url", ""))
+                    if newer
+                    else "",
+                }
                 if got is None:
                     return Verdict(
                         "no-check",
@@ -271,18 +315,15 @@ def verify(
                         f"'{run.get('conclusion')}' with no '{check}' "
                         f"check: it never reached it (cancelled, or "
                         f"superseded by a newer push to main). Nothing "
-                        f"certified this commit.",
-                        **ident(run),
-                    )
-                if got.get("conclusion") == "success":
-                    return Verdict(
-                        "green", f"'{check}' is green on {url}", **ident(run)
+                        f"certified this commit.{busy}",
+                        **extra,
                     )
                 return Verdict(
                     "red",
                     f"'{check}' concluded '{got.get('conclusion')}' on CI "
-                    f"run {url} (run concluded '{run.get('conclusion')}').",
-                    **ident(run),
+                    f"run {url} (run concluded '{run.get('conclusion')}')."
+                    f"{busy}",
+                    **extra,
                 )
             unread_since = None
         except Refused as e:
@@ -368,7 +409,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"::error::[{v.verdict}] {v.message}")
     if a.out:
         with open(a.out, "a", encoding="utf-8") as f:
-            for key in ("verdict", "run_id", "run_attempt", "run_url"):
+            for key in (
+                "verdict",
+                "run_id",
+                "run_attempt",
+                "run_url",
+                "newer_url",
+            ):
                 f.write(f"{key}={getattr(v, key)}\n")
     return 0 if v.verdict == "green" else 1
 

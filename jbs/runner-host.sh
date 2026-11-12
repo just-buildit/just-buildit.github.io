@@ -562,6 +562,14 @@ _one_job() { # SLOT
 		_cleanup
 		return 1
 	}
+	# A clone keeps the image's CPU and memory, which `image` set from
+	# CPU and MEMORY when it was built: an image built before a change to
+	# either, or before JB_RUNNER_MEMORY's default fell to 6144, would boot
+	# two 8 GB VMs on a 16 GB Mac. So each VM is sized as configured now.
+	"${TART}" set "${vm}" --cpu "${CPU}" --memory "${MEMORY}" || {
+		_cleanup
+		return 1
+	}
 	if ! _vm_boot "${vm}"; then
 		_log "${vm} did not come up within ${BOOT_TIMEOUT}s"
 		_cleanup

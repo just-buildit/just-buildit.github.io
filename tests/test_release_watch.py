@@ -105,12 +105,28 @@ FAKE_GH = textwrap.dedent(
     case "$cmd" in
         "run list") json="$FAKE_RUNS" ;;
         "run view") json="$FAKE_RUN" ;;
-        "run cancel"|"run rerun") exit 0 ;;
+        "run cancel") exit 0 ;;
+        # FAKE_REFUSE_RUN: GitHub refuses to rerun that run, as gh reports
+        # it -- a message on stderr and exit 1.
+        "run rerun")
+            if [ -n "${FAKE_REFUSE_RUN:-}" ] && [ "$path" = "$FAKE_REFUSE_RUN" ]
+            then
+                echo "$FAKE_REFUSE_MSG" >&2; exit 1
+            fi
+            exit 0 ;;
         api)
             case "$path" in
                 */contents/.github/workflows/release.yml\\?ref=*)
                     [ -f "$FAKE_WORKFLOW" ] || exit 1
                     cat "$FAKE_WORKFLOW"; exit 0 ;;
+                # Main's push runs, whatever their commit, newest first
+                # (FAKE_MAIN_RUNS; none when unset).
+                */actions/workflows/*/runs\\?branch=*)
+                    json="${FAKE_MAIN_RUNS:-}"
+                    if [ -z "$json" ]; then
+                        json="$FAKE_GH_LOG.main"
+                        echo '{"total_count": 0, "workflow_runs": []}' >"$json"
+                    fi ;;
                 # CI's push runs for a SHA (#226): one reply per line of
                 # FAKE_CI_RUNS, one line per call, the last repeated. A line
                 # `ERROR <text>` is a failed call: gh prints <text> on stderr
@@ -412,6 +428,9 @@ class VerifyGaveUpOnALiveCI(Fakes):
         ci: list[str],
         *,
         checks: dict[int, dict[str, object]] | None = None,
+        verify_conclusion: str = "failure",
+        main_runs: list[dict[str, object]] | None = None,
+        refuse: str = "",
     ) -> subprocess.CompletedProcess[str]:
         """Run the watch over a COMPLETED release run whose verify job
         failed; ``ci`` is gh's reply to each successive CI lookup."""
@@ -433,13 +452,13 @@ class VerifyGaveUpOnALiveCI(Fakes):
             json.dumps(
                 {
                     "status": "completed",
-                    "conclusion": "failure",
+                    "conclusion": verify_conclusion,
                     "headSha": SHA,
                     "jobs": [
                         {
                             "name": VERIFY,
                             "status": "completed",
-                            "conclusion": "failure",
+                            "conclusion": verify_conclusion,
                             "startedAt": _ago(80),
                         },
                         {
@@ -474,6 +493,17 @@ class VerifyGaveUpOnALiveCI(Fakes):
         }
         for k in ("CI_CHECK_NAME", "CI_WORKFLOW"):
             env.pop(k, None)
+        if main_runs is not None:
+            m = self.tmp / "main-runs.json"
+            m.write_text(
+                json.dumps(
+                    {"total_count": len(main_runs), "workflow_runs": main_runs}
+                )
+            )
+            env["FAKE_MAIN_RUNS"] = str(m)
+        if refuse:
+            env["FAKE_REFUSE_RUN"] = str(CI_RUN)
+            env["FAKE_REFUSE_MSG"] = refuse
         f = self.tmp / "checks.json"
         f.write_text(
             json.dumps({str(k): v for k, v in (checks or {}).items()})
@@ -495,9 +525,7 @@ class VerifyGaveUpOnALiveCI(Fakes):
         ]
 
     def ci_polls(self) -> int:
-        return len(
-            [c for c in self.calls("api ") if "/actions/workflows/" in c]
-        )
+        return len([c for c in self.calls("api ") if "?head_sha=" in c])
 
     def waited_s(self) -> float:
         return sum(float(x) for x in self.py_sleeps.read_text().split())
@@ -507,9 +535,7 @@ class VerifyGaveUpOnALiveCI(Fakes):
         lookup."""
         self.assertIn(f"run rerun {RUN}", self.calls("run rerun "), out)
         log = self.log.read_text().splitlines()
-        last_ci = max(
-            i for i, c in enumerate(log) if "/actions/workflows/" in c
-        )
+        last_ci = max(i for i, c in enumerate(log) if "?head_sha=" in c)
         self.assertGreater(log.index(f"run rerun {RUN}"), last_ci, out)
 
     def assert_recovery_unspent(self, r: subprocess.CompletedProcess[str]):
@@ -660,6 +686,77 @@ class VerifyGaveUpOnALiveCI(Fakes):
         self.assert_recovery_unspent(r)
         self.assertIn("Traceback", r.stdout)
         self.assertIn("'unreadable'", r.stdout)
+
+    def test_a_refused_ci_rerun_stops_at_once(self) -> None:
+        """Review A: a refused `gh run rerun` (past the 30-day window, no
+        permission, no failed job) was swallowed, and the wait for an
+        attempt that never comes ended hours later as a false 'alive'."""
+        msg = "run 42998505736 cannot be retried: it is older than 30 days"
+        r = self.failed_verify(
+            [_ci("completed", "failure")],
+            checks={100: _check("failure")},
+            refuse=msg,
+        )
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 1, out)
+        # The CI rerun was asked for, refused, and nothing else was rerun.
+        self.assertEqual(
+            self.calls("run rerun "), [f"run rerun {CI_RUN}"], out
+        )
+        self.assertIn("The one recovery is NOT spent", out)
+        self.assertIn("'rerun-refused'", out)
+        self.assertIn(msg, out)
+        self.assertEqual(self.ci_polls(), 1, out)
+        self.assertEqual(self.waited_s(), 0, out)
+
+    def test_red_with_a_newer_main_run_alive_reruns_nothing(self) -> None:
+        """Review D: main's pushes share one concurrency group holding one
+        PENDING run; rerunning the older commit's CI could cancel the
+        head's. Stop, name it, rerun nothing."""
+        newer = {
+            "id": CI_RUN + 5,
+            "head_sha": "f" * 40,
+            "status": "pending",
+            "conclusion": None,
+            "html_url": f"https://github.com/{REPO}/actions/runs/{CI_RUN + 5}",
+        }
+        r = self.failed_verify(
+            [_ci("completed", "failure")],
+            checks={100: _check("failure")},
+            main_runs=[newer],
+        )
+        out = r.stdout + r.stderr
+        self.assert_recovery_unspent(r)
+        self.assertIn(str(newer["html_url"]), out)
+        self.assertIn("could cancel", out)
+
+    def test_no_check_advice_waits_for_a_newer_main_run(self) -> None:
+        newer = {
+            "id": CI_RUN + 5,
+            "head_sha": "f" * 40,
+            "status": "in_progress",
+            "conclusion": None,
+            "html_url": f"https://github.com/{REPO}/actions/runs/{CI_RUN + 5}",
+        }
+        r = self.failed_verify(
+            [_ci("completed", "cancelled")], main_runs=[newer]
+        )
+        self.assert_recovery_unspent(r)
+        self.assertIn(f"once the newer main run {newer['html_url']}", r.stdout)
+
+    def test_a_verify_job_ended_by_its_timeout_asks_ci(self) -> None:
+        """Review E: a job that reaches its timeout-minutes concludes
+        `cancelled` (measured on just-makeit run 43071316806), so matching
+        `failure` alone sent exactly #226's case to the release rerun."""
+        for concl in ("cancelled", "timed_out"):
+            with self.subTest(conclusion=concl):
+                r = self.failed_verify(
+                    [_ci("queued")], verify_conclusion=concl
+                )
+                out = r.stdout + r.stderr
+                self.assert_recovery_unspent(r)
+                self.assertIn("'alive'", out)
+                self.assertGreater(self.ci_polls(), 1, out)
 
     def test_a_ci_already_green_reruns_the_release_at_once(self) -> None:
         r = self.failed_verify(

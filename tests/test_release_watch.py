@@ -111,19 +111,31 @@ FAKE_GH = textwrap.dedent(
                 */contents/.github/workflows/release.yml\\?ref=*)
                     [ -f "$FAKE_WORKFLOW" ] || exit 1
                     cat "$FAKE_WORKFLOW"; exit 0 ;;
-                # CI's push runs for a SHA (#226): one JSON document per
-                # line of FAKE_CI_RUNS, one line per call, the last repeated.
+                # CI's push runs for a SHA (#226): one reply per line of
+                # FAKE_CI_RUNS, one line per call, the last repeated. A line
+                # `ERROR <text>` is a failed call: gh prints <text> on stderr
+                # and exits 1, as it does for an HTTP error.
                 */actions/workflows/*/runs\\?*)
                     [ -n "${FAKE_CI_RUNS:-}" ] || exit 1
                     n=$(( $(cat "$FAKE_CI_RUNS.n" 2>/dev/null || echo 0) + 1 ))
                     echo "$n" >"$FAKE_CI_RUNS.n"
                     total=$(wc -l <"$FAKE_CI_RUNS")
                     [ "$n" -le "$total" ] || n=$total
+                    line=$(sed -n "${n}p" "$FAKE_CI_RUNS")
+                    case "$line" in
+                        ERROR*) echo "${line#ERROR }" >&2; exit 1 ;;
+                    esac
                     json="$FAKE_CI_RUNS.cur"
-                    sed -n "${n}p" "$FAKE_CI_RUNS" >"$json" ;;
-                */commits/*/check-runs)
+                    printf '%s\\n' "$line" >"$json" ;;
+                # A check suite's check-runs: FAKE_CHECKS maps a suite id to
+                # its `CI passed` check-run.
+                */check-suites/*/check-runs\\?*)
                     [ -n "${FAKE_CHECKS:-}" ] || exit 1
-                    json="$FAKE_CHECKS" ;;
+                    id=${path#*/check-suites/}; id=${id%%/*}
+                    json="$FAKE_CHECKS.cur"
+                    jq --arg id "$id" '[.[$id] // empty]
+                        | {total_count: length, check_runs: .}' \\
+                        "$FAKE_CHECKS" >"$json" ;;
                 *) exit 1 ;;
             esac ;;
         *) exit 1 ;;
@@ -145,11 +157,6 @@ WAITING = "<fake sleep: the watcher is waiting>"
 FAKE_SLEEP = textwrap.dedent(
     f"""\
     #!/usr/bin/env bash
-    # A sleep of FAKE_SLEEP_PASS seconds returns at once: the #226 tests let
-    # the watch wait out a CI run poll by poll, and stop at any other sleep.
-    if [ -n "${{FAKE_SLEEP_PASS:-}}" ] && [ "$1" = "$FAKE_SLEEP_PASS" ]; then
-        exit 0
-    fi
     echo "{WAITING}"
     kill -TERM "$PPID"
     """
@@ -330,35 +337,84 @@ class ReleaseWatch(Fakes):
 
 CI_RUN = 42998505736
 VERIFY = "Verify CI already passed for this commit"
+CI_URL = f"https://github.com/{REPO}/actions/runs/{CI_RUN}"
+BAD_GATEWAY = "ERROR gh: HTTP 502: Bad Gateway (https://api.github.com/...)"
+
+# verify-ci.py's clock, in the child Python the watch runs: a sleep returns
+# at once and advances a fake monotonic clock by its length, and each one
+# is logged. So a 75-minute wait costs no time, and the bound it is held to
+# is the script's own arithmetic, not a test knob in the product.
+SITECUSTOMIZE = textwrap.dedent(
+    """\
+    import os, time
+    _now = [0.0]
+    def _sleep(s):
+        _now[0] += s
+        with open(os.environ["FAKE_PY_SLEEPS"], "a") as f:
+            f.write(f"{s}\\n")
+    time.sleep = _sleep
+    time.monotonic = lambda: _now[0]
+    """
+)
 
 
-def _ci(status: str, conclusion: str | None = None) -> str:
-    """One Actions-API reply listing CI's push run for the SHA."""
+def _ci(
+    status: str,
+    conclusion: str | None = None,
+    *,
+    attempt: int = 1,
+) -> str:
+    """One Actions-API reply listing CI's push run for the SHA, shaped like
+    GET /repos/{o}/{r}/actions/workflows/{id}/runs. Each attempt has its
+    own check suite, ``attempt`` * 100."""
     return json.dumps(
         {
+            "total_count": 1,
             "workflow_runs": [
-                {"id": CI_RUN, "status": status, "conclusion": conclusion}
-            ]
+                {
+                    "id": CI_RUN,
+                    "run_attempt": attempt,
+                    "head_sha": SHA,
+                    "head_branch": "main",
+                    "event": "push",
+                    "status": status,
+                    "conclusion": conclusion,
+                    "check_suite_id": attempt * 100,
+                    "html_url": CI_URL,
+                }
+            ],
         }
     )
 
 
+NO_RUN = json.dumps({"total_count": 0, "workflow_runs": []})
+
+
+def _check(conclusion: str) -> dict[str, object]:
+    return {
+        "name": "CI passed",
+        "status": "completed",
+        "conclusion": conclusion,
+        "html_url": f"{CI_URL}/job/1",
+    }
+
+
 class VerifyGaveUpOnALiveCI(Fakes):
     """just-buildit.github.io#226: the verify job timed out while main's CI
-    for the tag was still queued (no jobs, so no `CI passed` check-run for
-    `ci_run_id` to find), and the watch spent its one recovery on a release
-    rerun that hit the same wall. It must wait for that run first, and
-    spend the recovery only once it is green."""
+    for the tag was still queued (no jobs, so no `CI passed` check-run),
+    and the watch spent its one recovery on a release rerun that hit the
+    same wall. The watch now asks verify-ci.py -- the script the verify job
+    runs -- and spends the recovery only on a verdict a rerun can change.
+    """
 
     def failed_verify(
         self,
         ci: list[str],
         *,
-        checks: dict[str, object] | None = None,
-        wait_min: int | None = None,
+        checks: dict[int, dict[str, object]] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Run the watch over a COMPLETED release run whose verify job
-        failed; ``ci`` is CI's run state on each successive poll."""
+        failed; ``ci`` is gh's reply to each successive CI lookup."""
         self.log.write_text("")
         runs = self.tmp / "runs.json"
         runs.write_text(
@@ -398,9 +454,16 @@ class VerifyGaveUpOnALiveCI(Fakes):
         )
         ci_runs = self.tmp / "ci-runs.jsonl"
         ci_runs.write_text("".join(line + "\n" for line in ci))
+        site = self.tmp / "site"
+        site.mkdir(exist_ok=True)
+        (site / "sitecustomize.py").write_text(SITECUSTOMIZE)
+        self.py_sleeps = self.tmp / "py-sleeps"
+        self.py_sleeps.write_text("")
         env = {
             **os.environ,
             "PATH": f"{self.bindir}{os.pathsep}{os.environ['PATH']}",
+            "PYTHONPATH": str(site),
+            "FAKE_PY_SLEEPS": str(self.py_sleeps),
             "REPO": REPO,
             "RW_PKG": "just-makeit",
             "FAKE_GH_LOG": str(self.log),
@@ -408,21 +471,20 @@ class VerifyGaveUpOnALiveCI(Fakes):
             "FAKE_RUN": str(run),
             "FAKE_WORKFLOW": str(self.workflow),
             "FAKE_CI_RUNS": str(ci_runs),
-            "FAKE_SLEEP_PASS": "30",
         }
-        env.pop("RW_CI_WAIT_MIN", None)
-        if checks is not None:
-            f = self.tmp / "checks.json"
-            f.write_text(json.dumps({"check_runs": [checks]}))
-            env["FAKE_CHECKS"] = str(f)
-        if wait_min is not None:
-            env["RW_CI_WAIT_MIN"] = str(wait_min)
+        for k in ("CI_CHECK_NAME", "CI_WORKFLOW"):
+            env.pop(k, None)
+        f = self.tmp / "checks.json"
+        f.write_text(
+            json.dumps({str(k): v for k, v in (checks or {}).items()})
+        )
+        env["FAKE_CHECKS"] = str(f)
         return subprocess.run(
             ["bash", str(SCRIPT), VERSION],
             env=env,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=120,
         )
 
     def calls(self, prefix: str) -> list[str]:
@@ -437,73 +499,190 @@ class VerifyGaveUpOnALiveCI(Fakes):
             [c for c in self.calls("api ") if "/actions/workflows/" in c]
         )
 
+    def waited_s(self) -> float:
+        return sum(float(x) for x in self.py_sleeps.read_text().split())
+
+    def assert_released_after_ci(self, out: str) -> None:
+        """The recovery is the RELEASE rerun, made once, after the last CI
+        lookup."""
+        self.assertIn(f"run rerun {RUN}", self.calls("run rerun "), out)
+        log = self.log.read_text().splitlines()
+        last_ci = max(
+            i for i, c in enumerate(log) if "/actions/workflows/" in c
+        )
+        self.assertGreater(log.index(f"run rerun {RUN}"), last_ci, out)
+
+    def assert_recovery_unspent(self, r: subprocess.CompletedProcess[str]):
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 1, out)
+        self.assertEqual(self.calls("run rerun "), [], out)
+        self.assertIn("The one recovery is NOT spent", out)
+
     def test_a_queued_then_running_ci_is_waited_for_then_released(
         self,
     ) -> None:
         r = self.failed_verify(
             [_ci("pending")] * 5
             + [_ci("in_progress")] * 5
-            + [_ci("completed", "success")]
+            + [_ci("completed", "success")],
+            checks={100: _check("success")},
         )
         out = r.stdout + r.stderr
         self.assertIn(WAITING, r.stdout, out)
         self.assertEqual(self.ci_polls(), 11, out)
-        self.assertIn(f"CI run {CI_RUN} for 01234567 is still pending", out)
+        self.assertIn(f"CI run {CI_URL} is pending", out)
         self.assertIn("CI is green — rerunning the release run", out)
-        # The recovery is the RELEASE rerun, made once, and only after the
-        # CI run finished: CI's own run is never rerun.
         self.assertEqual(self.calls("run rerun "), [f"run rerun {RUN}"])
-        log = self.log.read_text().splitlines()
-        last_ci = max(
-            i for i, c in enumerate(log) if "/actions/workflows/" in c
+        self.assert_released_after_ci(out)
+
+    def test_a_failed_lookup_is_never_a_finished_ci(self) -> None:
+        """Finding 1 on #227: a failed API call read as an empty status, the
+        wait ended ("finished: <none>"), no `CI passed` check existed yet,
+        and the release was rerun while CI was still queued -- v0.128.0's
+        failure, from one bad reply. A failed lookup is retried and waited
+        past; the release is rerun only once CI is green."""
+        r = self.failed_verify(
+            [_ci("queued")] * 2
+            + [BAD_GATEWAY] * 6
+            + [_ci("queued")] * 2
+            + [_ci("completed", "success")],
+            checks={100: _check("success")},
         )
-        self.assertGreater(log.index(f"run rerun {RUN}"), last_ci)
+        out = r.stdout + r.stderr
+        self.assertIn(WAITING, r.stdout, out)
+        self.assertEqual(self.ci_polls(), 11, out)
+        self.assertIn("HTTP 502", out)
+        self.assertIn("CI is green — rerunning the release run", out)
+        self.assert_released_after_ci(out)
 
     def test_the_ci_lookup_is_by_sha_on_mains_push_runs(self) -> None:
-        self.failed_verify([_ci("completed", "success")])
+        self.failed_verify(
+            [_ci("completed", "success")], checks={100: _check("success")}
+        )
+        log = self.log.read_text().splitlines()
         self.assertIn(
             f"api repos/{REPO}/actions/workflows/ci.yml/runs"
             f"?head_sha={SHA}&branch=main&event=push&per_page=10",
-            self.log.read_text().splitlines(),
+            log,
+        )
+        self.assertIn(
+            f"api repos/{REPO}/check-suites/100/check-runs"
+            f"?check_name=CI%20passed",
+            log,
         )
 
-    def test_a_ci_alive_past_the_bound_stops_without_the_recovery(
+    def test_the_wait_is_the_verify_jobs_own_timeout(self) -> None:
+        """No second number: the verify job's `timeout-minutes` (75 in the
+        fixture) bounds the wait, and past it the watch stops unspent."""
+        r = self.failed_verify([_ci("queued")])
+        out = r.stdout + r.stderr
+        self.assert_recovery_unspent(r)
+        self.assertIn("up to 75m", out)
+        self.assertIn("'alive'", out)
+        self.assertEqual(self.waited_s(), 75 * 60, out)
+        self.assertIn(CI_URL, out)
+
+    def test_a_verify_job_without_a_timeout_waits_githubs_maximum(
         self,
     ) -> None:
-        r = self.failed_verify([_ci("queued")], wait_min=1)
-        out = r.stdout + r.stderr
-        self.assertEqual(r.returncode, 1, out)
-        self.assertEqual(self.calls("run rerun "), [], out)
-        self.assertIn("The recovery is NOT", out)
-        self.assertIn(f"actions/runs/{CI_RUN}", out)
-        # 1 min at 30 s a poll: the first read, then one after each sleep.
-        self.assertEqual(self.ci_polls(), 3, out)
-
-    def test_a_ci_that_finishes_red_takes_the_existing_repair(self) -> None:
-        """Unchanged once CI concluded: rerun CI's failed jobs, and stop if
-        it is still red."""
+        self.workflow.write_text(
+            WORKFLOW.replace(
+                "    timeout-minutes: 75   # above the 60-minute poll window\n",
+                "",
+            )
+        )
         r = self.failed_verify(
-            [_ci("in_progress"), _ci("completed", "failure")],
-            checks={
-                "name": "CI passed",
-                "status": "completed",
-                "conclusion": "failure",
-                "details_url": f"https://github.com/{REPO}/actions/runs/"
-                f"{CI_RUN}/job/1",
-            },
+            [_ci("queued"), _ci("completed", "success")],
+            checks={100: _check("success")},
+        )
+        self.assertIn("up to 360m", r.stdout, r.stdout + r.stderr)
+
+    def test_a_ci_that_finishes_red_takes_the_ci_repair(self) -> None:
+        """Rerun CI's failed jobs, wait for THAT attempt (the previous
+        one's red, still listed for a moment, is not its answer), and rerun
+        the release once it is green."""
+        r = self.failed_verify(
+            [_ci("in_progress"), _ci("completed", "failure")]
+            + [_ci("completed", "failure")] * 2  # the rerun not yet seen
+            + [
+                _ci("queued", attempt=2),
+                _ci("completed", "success", attempt=2),
+            ],
+            checks={100: _check("failure"), 200: _check("success")},
+        )
+        out = r.stdout + r.stderr
+        self.assertIn(WAITING, r.stdout, out)
+        self.assertEqual(
+            self.calls("run rerun "),
+            [f"run rerun {CI_RUN}", f"run rerun {RUN}"],
+            out,
+        )
+        self.assert_released_after_ci(out)
+
+    def test_a_ci_still_red_after_its_rerun_stops(self) -> None:
+        r = self.failed_verify(
+            [
+                _ci("completed", "failure"),
+                _ci("completed", "failure", attempt=2),
+            ],
+            checks={100: _check("failure"), 200: _check("failure")},
         )
         out = r.stdout + r.stderr
         self.assertEqual(r.returncode, 1, out)
         self.assertEqual(self.calls("run rerun "), [f"run rerun {CI_RUN}"])
         self.assertIn("CI still red", out)
 
-    def test_a_ci_already_finished_does_not_wait(self) -> None:
-        """No live run: straight to the pre-#226 path, which (with no `CI
-        passed` check found) reruns the release once."""
-        r = self.failed_verify([_ci("completed", "success")])
+    def test_a_cancelled_ci_stops_without_the_recovery(self) -> None:
+        """Finding 5: superseded before `CI passed` existed. No rerun of the
+        release can certify the commit, so the watch says so and keeps the
+        recovery for after a human reruns CI."""
+        r = self.failed_verify([_ci("completed", "cancelled")])
+        self.assert_recovery_unspent(r)
+        self.assertIn("'no-check'", r.stdout)
+        self.assertIn("make release-watch VERSION=0.106.1", r.stdout)
+
+    def test_a_ci_that_never_ran_stops_without_the_recovery(self) -> None:
+        r = self.failed_verify([NO_RUN])
+        self.assert_recovery_unspent(r)
+        self.assertIn("'no-run'", r.stdout)
+
+    def test_a_github_that_never_answers_stops_without_the_recovery(
+        self,
+    ) -> None:
+        r = self.failed_verify([BAD_GATEWAY])
+        self.assert_recovery_unspent(r)
+        self.assertIn("'unreadable'", r.stdout)
+
+    def test_a_verify_ci_that_crashed_is_not_a_finished_ci(self) -> None:
+        """A reply of an unexpected shape crashes the script before any
+        verdict: no answer, so the recovery stays unspent."""
+        r = self.failed_verify(["[]"])
+        self.assert_recovery_unspent(r)
+        self.assertIn("Traceback", r.stdout)
+        self.assertIn("'unreadable'", r.stdout)
+
+    def test_a_ci_already_green_reruns_the_release_at_once(self) -> None:
+        r = self.failed_verify(
+            [_ci("completed", "success")], checks={100: _check("success")}
+        )
         self.assertEqual(self.ci_polls(), 1, r.stdout)
-        self.assertNotIn("is still", r.stdout)
+        self.assertEqual(self.waited_s(), 0, r.stdout)
         self.assertEqual(self.calls("run rerun "), [f"run rerun {RUN}"])
+
+
+class OneImplementation(unittest.TestCase):
+    """The watch's CI question is verify-ci.py's: a lookup of its own here
+    is the peer that drifted (#226 finding 1)."""
+
+    def test_the_watch_has_no_ci_lookup_of_its_own(self) -> None:
+        code = "\n".join(
+            line
+            for line in SCRIPT.read_text().splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        self.assertIn("verify-ci.py", code)
+        for own in ("actions/workflows/", "check-runs", "CI passed"):
+            self.assertNotIn(own, code)
 
 
 if __name__ == "__main__":

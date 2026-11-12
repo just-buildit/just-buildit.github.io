@@ -84,6 +84,13 @@ while [[ $# -gt 0 ]]; do
 		GROUPS_EXPLICIT=1
 		shift 2
 		;;
+	--)
+		# End of options: what follows is the deps file, even if it starts
+		# with `-` -- taken exactly as the `*)` arm takes it (gh-248).
+		shift
+		[[ $# -eq 0 ]] || DEPS_FILE="${!#}"
+		break
+		;;
 	-*)
 		echo "Invalid option: $1"
 		echo "${HELP}"

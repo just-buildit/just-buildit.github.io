@@ -195,6 +195,16 @@ while [[ $# -gt 0 ]]; do
 			shift
 		fi
 		;;
+	--)
+		# End of options (gh-248). setup-system takes no positional, so
+		# nothing may follow.
+		shift
+		if [[ $# -gt 0 ]]; then
+			echo "Unexpected argument: $1" >&2
+			echo "${HELP}" >&2
+			exit 1
+		fi
+		;;
 	*)
 		echo "Invalid option: $1" >&2
 		echo "${HELP}" >&2

@@ -93,6 +93,10 @@ while [[ $# -gt 0 ]]; do
 		KEY_NAME="$2"
 		shift
 		;;
+	--)
+		# End of options (gh-248); ssh-to-windows takes no positional.
+		[[ $# -eq 1 ]] || _die "unexpected argument: $2 (try --help)"
+		;;
 	*) _die "unknown option: $1 (try --help)" ;;
 	esac
 	shift

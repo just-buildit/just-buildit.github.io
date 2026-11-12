@@ -253,7 +253,11 @@ hang_limit() {  # <job name as the run shows it> -> minutes before it is hung
 #
 #   green       rerun the release: the verify job gave up early, or flaked.
 #   red         rerun CI's failed jobs, wait for that attempt, and only if it
-#               goes green rerun the release.
+#               goes green rerun the release -- unless a NEWER main CI run
+#               is still alive (newer_url): main's pushes share one
+#               concurrency group holding one pending run, so a rerun on
+#               this older commit could cancel the head's. Then, and when
+#               GitHub refuses the rerun, STOP as below.
 #   alive       CI is still running past the verify job's own allowance;
 #   no-check    it was cancelled/superseded before certifying anything;
 #   no-run      main never ran CI on the commit;
@@ -267,18 +271,31 @@ hang_limit() {  # <job name as the run shows it> -> minutes before it is hung
 # release already decided CI may take -- else GitHub's 360-minute job maximum,
 # which is what a job without one gets. Never a second number here.
 GITHUB_JOB_MAX_MIN=360
+# The verify job, when it did not succeed. NOT only `failure`: a job that
+# reaches its own timeout-minutes is reported `cancelled` (measured:
+# just-makeit run 43071316806, `test (ubuntu-latest, 3.9)` ran 55.3 min
+# against `timeout-minutes: 55` and concluded `cancelled`, annotated "The
+# job has exceeded the maximum execution time of 55m0s"). Matching
+# `failure` alone let exactly the #226 case -- a verify job that waited out
+# its timeout on a live CI -- fall through to the generic release rerun.
+# `timed_out` is listed for completeness; GitHub's docs name it.
+VERIFY_JOB_JQ='[.jobs[]
+  | select(.conclusion=="failure" or .conclusion=="cancelled"
+           or .conclusion=="timed_out")
+  | select(.name|test("verify ci";"i")) | .name][0] // empty'
 VERIFY_CI="$(dirname "${BASH_SOURCE[0]}")/verify-ci.py"
 
-ci_verdict() {  # <sha> <max-minutes> [min-attempt] -> sets CI_VERDICT CI_RUN_ID CI_ATTEMPT CI_URL
+ci_verdict() {  # <sha> <max-minutes> [min-attempt] -> sets CI_VERDICT CI_RUN_ID CI_ATTEMPT CI_URL CI_NEWER
   local out
   out=$(mktemp)
-  CI_VERDICT="" CI_RUN_ID="" CI_ATTEMPT="" CI_URL=""
+  CI_VERDICT="" CI_RUN_ID="" CI_ATTEMPT="" CI_URL="" CI_NEWER=""
   REPO="$REPO" SHA="$1" python3 -u "$VERIFY_CI" --max-minutes "$2" \
       --min-attempt "${3:-1}" --out "$out" 2>&1 | sed 's/^/    /'
   while IFS='=' read -r k v; do
     case "$k" in
       verdict) CI_VERDICT=$v ;; run_id) CI_RUN_ID=$v ;;
       run_attempt) CI_ATTEMPT=$v ;; run_url) CI_URL=$v ;;
+      newer_url) CI_NEWER=$v ;;
     esac
   done <"$out"
   rm -f "$out"
@@ -291,7 +308,9 @@ ci_stop() {     # <sha> -> exit 1 naming the verdict, the recovery unspent
   local why
   case "$CI_VERDICT" in
     alive)      why="main's CI for it is still running past the verify job's allowance" ;;
-    no-check)   why="main's CI for it ended without certifying it (cancelled or superseded): rerun that CI run" ;;
+    no-check)   why="main's CI for it ended without certifying it (cancelled or superseded): rerun that CI run${CI_NEWER:+ once the newer main run $CI_NEWER has finished -- rerunning it while that one is pending could cancel it}" ;;
+    red)        why="it is red, and a newer main CI run ($CI_NEWER) is still alive: rerunning this commit's CI could cancel that one's pending run, so let it finish, then rerun $CI_URL" ;;
+    rerun-refused) why="GitHub refused to rerun its failed jobs: $CI_RERUN_ERR" ;;
     no-run)     why="main never ran CI on it: a release must tag a commit main's CI ran" ;;
     *)          why="GitHub did not answer whether main's CI certified it" ;;
   esac
@@ -335,24 +354,29 @@ while true; do
 
     if [ "$RETRIED" = 0 ] && ! published; then
       # Did the CI-verify gate fail? Then CI is what needs rerunning, not us.
-      if echo "$J" | jq -e '[.jobs[] | select(.conclusion=="failure")
-              | select(.name|test("verify ci";"i"))] | length > 0' \
-              >/dev/null 2>&1; then
+      VJOB=$(echo "$J" | jq -r "$VERIFY_JOB_JQ" 2>/dev/null)
+      if [ -n "$VJOB" ]; then
         SHA=$(gh run view "$RUN" -R "$REPO" --json headSha --jq .headSha 2>/dev/null)
         SHA=${SHA:-$TAG_SHA}
-        VJOB=$(echo "$J" | jq -r '[.jobs[] | select(.conclusion=="failure")
-                | select(.name|test("verify ci";"i")) | .name][0]')
         CI_MAX=$(job_timeout "$VJOB")
         CI_MAX=${CI_MAX:-$GITHUB_JOB_MAX_MIN}
-        echo "  '$VJOB' failed — asking main's CI for ${SHA:0:8} (waiting" \
+        echo "  '$VJOB' did not pass — asking main's CI for ${SHA:0:8} (waiting" \
              "up to ${CI_MAX}m while it is alive) before spending the" \
              "one recovery…"
         ci_verdict "$SHA" "$CI_MAX"
         case "$CI_VERDICT" in
           green) ;;
           red)
+            [ -n "$CI_NEWER" ] && ci_stop "$SHA"
             echo "  CI is red on ${SHA:0:8} — rerunning ITS failed jobs first…"
-            gh run rerun "$CI_RUN_ID" -R "$REPO" --failed >/dev/null 2>&1 || true
+            # A refused rerun (past GitHub's 30-day window, no permission,
+            # no failed job to rerun) leaves nothing to wait for: waiting
+            # would end hours later as a false 'alive'.
+            if ! CI_RERUN_ERR=$(gh run rerun "$CI_RUN_ID" -R "$REPO" --failed \
+                                2>&1 >/dev/null); then
+              CI_VERDICT=rerun-refused
+              ci_stop "$SHA"
+            fi
             ci_verdict "$SHA" "$CI_MAX" $(( ${CI_ATTEMPT:-1} + 1 ))
             case "$CI_VERDICT" in
               green) ;;
@@ -378,7 +402,9 @@ while true; do
       # made a deterministic, reproducible failure read as noise for three
       # releases.
       FAILED_JOBS=$(echo "$J" | jq -r '[.jobs[]
-          | select(.conclusion=="failure") | .name] | join(", ")' \
+          | select(.conclusion=="failure" or .conclusion=="cancelled"
+                   or .conclusion=="timed_out")
+          | "\(.name) (\(.conclusion))"] | join(", ")' \
           2>/dev/null)
       echo "  run failed before publish — rerunning once (one recovery," \
            "then it stops)."

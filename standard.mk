@@ -1528,12 +1528,15 @@ endif
 # finished" and spent the release's one recovery on a CI still queued
 # (just-buildit.github.io#226, just-makeit v0.128.0). The waiting rule and
 # every verdict: the script's docstring. The check name and the CI
-# workflow's file are this file's variables, exported to both askers here
-# -- target-specific, so a RELEASE_WATCH_CMD of any shape (an `@` prefix, a
-# `define`) receives them untouched.
+# workflow's file are this file's variables, exported to both askers --
+# through the environment, so a RELEASE_WATCH_CMD of any shape (an `@`
+# prefix, a `define`) receives them untouched. A plain `export`, not a
+# target-specific `export X := $(X)`: that expands where it is read, so a
+# repo that sets CI_CHECK_NAME after `include standard.mk` would export the
+# default; this exports whatever the variable holds when the recipe runs.
 VENDORED_FILES += scripts/verify-ci.py
-release-verify-ci release-watch: export CI_CHECK_NAME := $(CI_CHECK_NAME)
-release-verify-ci release-watch: export CI_WORKFLOW := $(notdir $(GATES_CI_FILE))
+CI_WORKFLOW ?= $(notdir $(GATES_CI_FILE))
+export CI_CHECK_NAME CI_WORKFLOW
 
 # For a release workflow's verify step: REPO, SHA and GH_TOKEN (actions:
 # read, checks: read) come from the step's env, and the job's own

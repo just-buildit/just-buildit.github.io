@@ -868,7 +868,12 @@ class Recuts(Fixture):
             self.heads[n] = self.pr(n, {f: f"{n}\n"}, headRefName=f"pr{n}")
             sh(self.work, "git", "push", "--quiet", "origin",
                f"pr{n}:refs/heads/pr{n}")
+        # One committer date for every pick of the first train. Left to the
+        # clock, two picks can straddle a second, and a test that re-picks
+        # at the head's date then cannot reproduce the first pick's sha.
+        self.env["GIT_COMMITTER_DATE"] = "1800000000 +0000"
         p = self.train("--push", "1", "2")
+        del self.env["GIT_COMMITTER_DATE"]
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertEqual(self.state["prs"]["1"]["state"], "CLOSED")
         self.old = sh(self.work, "git", "rev-parse", "origin/train/1-2")

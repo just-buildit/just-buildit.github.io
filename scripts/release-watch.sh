@@ -56,15 +56,6 @@ RW_POST_JOBS="${RW_POST_JOBS:-publish|post-release|github.release|create github|
 RW_MIN_ASSETS="${RW_MIN_ASSETS:-0}"
 RW_ASSET_PATTERN="${RW_ASSET_PATTERN:-\\.tar\\.gz$}"
 
-# The CI workflow whose push run on main certifies a commit, and how long to
-# wait for it when the verify job gave up while it was still alive (see
-# `ci_live_run` below). 240 min: just-makeit measured main's CI at up to 135
-# min queue included (2026-11-11, 59 runs), and its verify job's own
-# timeout-minutes is 240 for the same reason. Past this the watch stops
-# WITHOUT spending the recovery, and says so.
-RW_CI_WORKFLOW="${RW_CI_WORKFLOW:-ci.yml}"
-RW_CI_WAIT_MIN="${RW_CI_WAIT_MIN:-240}"
-
 RETRIED=0
 
 echo "release-watch: $REPO $TAG"
@@ -217,7 +208,7 @@ job_glob() {
   printf '%s' "$out$n"
 }
 
-hang_limit() {  # <job name as the run shows it> -> minutes before it is hung
+job_timeout() {  # <job name as the run shows it> -> its timeout-minutes, or ""
   local name="$1" g i t=""
   # The whole name first; then a matrix leg ("name (a, b)") or a reusable
   # workflow's job ("name / job"), so `build` cannot claim `build (x)`'s row.
@@ -233,6 +224,12 @@ hang_limit() {  # <job name as the run shows it> -> minutes before it is hung
         && { t=${WF_TIMEOUTS[$i]}; break; }
     done
   fi
+  printf '%s' "$t"
+}
+
+hang_limit() {  # <job name as the run shows it> -> minutes before it is hung
+  local t
+  t=$(job_timeout "$1")
   if [ -n "$t" ] && [ "$t" -gt "$HANG_MIN" ]; then
     echo $((t + HANG_MARGIN_MIN))
   else
@@ -241,57 +238,68 @@ hang_limit() {  # <job name as the run shows it> -> minutes before it is hung
 }
 
 # ── The CI-on-the-tagged-commit repair ──────────────────────────────────────
-# release.yml's "Verify CI passed on the tagged commit" job polls for the
-# `CI passed` check on the tag's SHA and refuses to publish unless it is green.
-# When THAT is what failed, rerunning the RELEASE run is useless: the verify job
-# simply re-reads the same completed failure and fails again in under a second,
-# burning the one recovery on something that could never have worked. That is
-# exactly what happened to doppler v0.42.0 — a `setup-uv` manifest fetch timed
-# out in one of six Python jobs, long after every wheel had already built.
+# release.yml's verify job (`make release-verify-ci`) refuses to publish
+# unless main's CI certified the tag's commit. When THAT is what failed,
+# rerunning the RELEASE run is useless until CI's answer changes: the verify
+# job re-reads the same red and fails again in under a second, burning the
+# one recovery on something that could never have worked (doppler v0.42.0:
+# a `setup-uv` fetch timed out in one of six Python jobs).
 #
-# The repair has to start one run earlier, on CI itself. `wait_ci` tolerates the
-# check-run being ABSENT (jq -> null): rerunning a run withdraws its check until
-# it re-completes, so "absent" means in-flight, not failed.
-ci_run_id() {   # <sha> -> the databaseId of the run that owns `CI passed`
-  gh api "repos/$REPO/commits/$1/check-runs" --paginate \
-    --jq '[.check_runs[] | select(.name=="CI passed")][0].details_url' 2>/dev/null \
-    | sed -n 's#.*/actions/runs/\([0-9]\{1,\}\)/.*#\1#p'
-}
+# So the watch asks CI first, through the SAME script the verify job runs,
+# `verify-ci.py` beside this one -- one answer to "did main's CI certify this
+# commit?", not a second copy of the lookup. A second copy here read a failed
+# API call as "CI finished" and spent the recovery on a CI still queued
+# (just-buildit.github.io#226, just-makeit v0.128.0). Its verdicts:
+#
+#   green       rerun the release: the verify job gave up early, or flaked.
+#   red         rerun CI's failed jobs, wait for that attempt, and only if it
+#               goes green rerun the release.
+#   alive       CI is still running past the verify job's own allowance;
+#   no-check    it was cancelled/superseded before certifying anything;
+#   no-run      main never ran CI on the commit;
+#   unreadable  GitHub would not answer (or the script could not run):
+#               STOP, with the recovery unspent, saying what to do. No rerun
+#               of the release can change any of these, and an unknown answer
+#               is never read as a finished CI.
+#
+# How long to wait on a live CI is the verify job's OWN timeout-minutes, read
+# from release.yml at the tag like every hang limit above -- the time the
+# release already decided CI may take -- else GitHub's 360-minute job maximum,
+# which is what a job without one gets. Never a second number here.
+GITHUB_JOB_MAX_MIN=360
+VERIFY_CI="$(dirname "${BASH_SOURCE[0]}")/verify-ci.py"
 
-wait_ci() {     # <sha> -> 0 when `CI passed` concludes success, 1 otherwise
-  local sha="$1" line
-  for _ in $(seq 1 80); do   # 80 x 30s = 40 min, above a full CI run
-    line=$(gh api "repos/$REPO/commits/$sha/check-runs" --paginate \
-           --jq '[.check_runs[] | select(.name=="CI passed")][0]
-                 | "\(.status) \(.conclusion // "")"' 2>/dev/null)
-    case "$line" in
-      "completed success") return 0 ;;
-      "completed "*)       return 1 ;;
+ci_verdict() {  # <sha> <max-minutes> [min-attempt] -> sets CI_VERDICT CI_RUN_ID CI_ATTEMPT CI_URL
+  local out
+  out=$(mktemp)
+  CI_VERDICT="" CI_RUN_ID="" CI_ATTEMPT="" CI_URL=""
+  REPO="$REPO" SHA="$1" python3 -u "$VERIFY_CI" --max-minutes "$2" \
+      --min-attempt "${3:-1}" --out "$out" 2>&1 | sed 's/^/    /'
+  while IFS='=' read -r k v; do
+    case "$k" in
+      verdict) CI_VERDICT=$v ;; run_id) CI_RUN_ID=$v ;;
+      run_attempt) CI_ATTEMPT=$v ;; run_url) CI_URL=$v ;;
     esac
-    sleep 30
-  done
-  return 1
+  done <"$out"
+  rm -f "$out"
+  # No verdict at all (the script crashed, python3 missing) is unreadable,
+  # never a finished CI.
+  CI_VERDICT=${CI_VERDICT:-unreadable}
 }
 
-# ── A verify job that gave up on a CI still running (just-buildit.github.io#226)
-# `ci_run_id` finds CI through its `CI passed` check-run, which does not exist
-# while the run is queued behind its concurrency group with no jobs. So when
-# the verify job timed out on a merely QUEUED CI, the repair below saw no CI
-# at all and the one recovery went on a release rerun that hit the same wall:
-# just-makeit v0.128.0 stopped "no safe auto-recovery left" on a CI that later
-# went green. The Actions API lists a queued run, so ask it, and wait while
-# the run is alive before deciding anything.
-ci_live_run() {  # <sha> -> "<id> <status> <conclusion>" of CI's newest push run
-  gh api "repos/$REPO/actions/workflows/$RW_CI_WORKFLOW/runs?head_sha=$1&branch=main&event=push&per_page=10" \
-    --jq '.workflow_runs[0] // empty
-          | "\(.id) \(.status) \(.conclusion // "")"' 2>/dev/null
-}
-
-ci_alive() {     # <status> -> 0 while a run in that status may still finish
-  case "$1" in
-    queued|pending|waiting|requested|in_progress) return 0 ;;
+ci_stop() {     # <sha> -> exit 1 naming the verdict, the recovery unspent
+  local why
+  case "$CI_VERDICT" in
+    alive)      why="main's CI for it is still running past the verify job's allowance" ;;
+    no-check)   why="main's CI for it ended without certifying it (cancelled or superseded): rerun that CI run" ;;
+    no-run)     why="main never ran CI on it: a release must tag a commit main's CI ran" ;;
+    *)          why="GitHub did not answer whether main's CI certified it" ;;
   esac
-  return 1
+  echo "::error:: CI for $1 is '$CI_VERDICT': $why${CI_URL:+ ($CI_URL)}."
+  echo "  The one recovery is NOT spent: no rerun of the release can change"
+  echo "  this. Once CI is green on it, run \`make release-watch VERSION=$VERSION\`"
+  echo "  again; it reruns the release then."
+  exit 1
 }
 
 # ── 2. Watch, recovering from one pre-publish flake or hang.
@@ -331,41 +339,32 @@ while true; do
               | select(.name|test("verify ci";"i"))] | length > 0' \
               >/dev/null 2>&1; then
         SHA=$(gh run view "$RUN" -R "$REPO" --json headSha --jq .headSha 2>/dev/null)
-        # #226: CI still alive? Then the verify job only gave up early. Wait
-        # for the run, and spend the recovery only once it is green.
-        CI_GREEN=0
-        read -r CI_ID CI_ST CI_CONCL <<<"$(ci_live_run "$SHA")"
-        if ci_alive "${CI_ST:-}"; then
-          echo "  CI run $CI_ID for ${SHA:0:8} is still $CI_ST — waiting for it" \
-               "(up to ${RW_CI_WAIT_MIN}m) before spending the one recovery…"
-          waited=0
-          while ci_alive "${CI_ST:-}"; do
-            if [ "$waited" -ge $((RW_CI_WAIT_MIN * 60)) ]; then
-              echo "::error:: CI run $CI_ID for $SHA is still $CI_ST after" \
-                   "${RW_CI_WAIT_MIN}m (RW_CI_WAIT_MIN). The recovery is NOT" \
-                   "spent: rerun the release once" \
-                   "https://github.com/$REPO/actions/runs/$CI_ID is green."
-              exit 1
-            fi
-            sleep 30; waited=$((waited + 30))
-            read -r CI_ID CI_ST CI_CONCL <<<"$(ci_live_run "$SHA")"
-          done
-          echo "  CI run $CI_ID finished: ${CI_CONCL:-<none>}"
-          [ "${CI_CONCL:-}" = success ] && CI_GREEN=1
-        fi
-        CIRUN=""
-        [ "$CI_GREEN" = 0 ] && CIRUN=$(ci_run_id "$SHA")
-        if [ "$CI_GREEN" = 1 ]; then
-          echo "  CI is green — rerunning the release run…"
-        elif [ -n "$CIRUN" ]; then
-          echo "  CI is red on ${SHA:0:8} — rerunning ITS failed jobs first…"
-          gh run rerun "$CIRUN" -R "$REPO" --failed >/dev/null 2>&1 || true
-          if ! wait_ci "$SHA"; then
-            echo "::error:: CI still red on $SHA — a real failure, not a flake"
-            exit 1
-          fi
-          echo "  CI is green — rerunning the release run…"
-        fi
+        SHA=${SHA:-$TAG_SHA}
+        VJOB=$(echo "$J" | jq -r '[.jobs[] | select(.conclusion=="failure")
+                | select(.name|test("verify ci";"i")) | .name][0]')
+        CI_MAX=$(job_timeout "$VJOB")
+        CI_MAX=${CI_MAX:-$GITHUB_JOB_MAX_MIN}
+        echo "  '$VJOB' failed — asking main's CI for ${SHA:0:8} (waiting" \
+             "up to ${CI_MAX}m while it is alive) before spending the" \
+             "one recovery…"
+        ci_verdict "$SHA" "$CI_MAX"
+        case "$CI_VERDICT" in
+          green) ;;
+          red)
+            echo "  CI is red on ${SHA:0:8} — rerunning ITS failed jobs first…"
+            gh run rerun "$CI_RUN_ID" -R "$REPO" --failed >/dev/null 2>&1 || true
+            ci_verdict "$SHA" "$CI_MAX" $(( ${CI_ATTEMPT:-1} + 1 ))
+            case "$CI_VERDICT" in
+              green) ;;
+              red) echo "::error:: CI still red on $SHA after rerunning its" \
+                        "failed jobs — a real failure, not a flake" \
+                        "${CI_URL:+($CI_URL)}"
+                   exit 1 ;;
+              *) ci_stop "$SHA" ;;
+            esac ;;
+          *) ci_stop "$SHA" ;;
+        esac
+        echo "  CI is green — rerunning the release run…"
       fi
       # NAME the jobs instead of guessing at a cause. This printed
       # "likely a flake" unconditionally — including for the verify-ci case

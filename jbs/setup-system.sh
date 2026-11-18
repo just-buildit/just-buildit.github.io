@@ -50,6 +50,7 @@ SSHD_GITHUB_USER=""
 SSHD_ALLOW=""
 TEMPLATE=""
 TEMPLATE_PATH="-"
+OS_UPGRADE_NOPASS=0
 
 read -r -d '' HELP <<-'EOF' || true
 	Usage: setup-system.sh [OPTIONS]
@@ -122,6 +123,12 @@ read -r -d '' HELP <<-'EOF' || true
 	                             Tailscale tailnet only, or any. Omitted,
 	                             an existing rule keeps its addresses and
 	                             a new one admits any. Windows only.
+	       --os-upgrade-no-pass  Also let this user upgrade the OS packages
+	                             with no password, and nothing else: writes
+	                             a root-owned /usr/local/sbin/jb-os-upgrade
+	                             (no arguments, never reboots) and a sudoers
+	                             rule for exactly that. For unattended
+	                             upgrades (sudo -n jb-os-upgrade). Linux.
 	       --template [PATH]     Write the bashrc template to PATH (or stdout).
 	       --template-profile [PATH]
 	                             Write the profile template to PATH (or stdout).
@@ -181,6 +188,10 @@ while [[ $# -gt 0 ]]; do
 	--sshd-allow)
 		SSHD_ALLOW="${2:?Option $1 requires an argument.}"
 		shift 2
+		;;
+	--os-upgrade-no-pass)
+		OS_UPGRADE_NOPASS=1
+		shift
 		;;
 	--template | --template-profile)
 		case "$1" in
@@ -1031,6 +1042,146 @@ step_certs() {
 	fi
 	rm -rf "${tmp}"
 	_result "certs:   ok (${count} Windows roots in ${cert_dir})"
+}
+
+# ---------------------------------------------------------------------------
+# --os-upgrade-no-pass -- let this user upgrade the OS packages with no
+# password, and nothing else. An unattended caller (an ssh one-shot, a
+# timer, tailnet-keeper's os-upgrade) has no terminal to type one into, so
+# `sudo -n <upgrade>` fails with "a password is required".
+#
+# Two root-owned files. _OSUP_BIN runs THIS box's full upgrade, takes no
+# arguments and never reboots; the commands are baked in when it is written,
+# from get-pkg-mgr, so as root it sources nothing a user can edit. _OSUP_RULE
+# lets the user run exactly that, with no arguments (the "" in the rule),
+# NOPASSWD. A rule naming the package manager instead would also pass
+# `pacman -U <any package>`, which is root for anyone holding the account.
+#
+# The rule is checked with visudo before it is installed, and the result is
+# verified by asking sudo, not assumed: a sudoers without the sudoers.d
+# include would take the file and ignore it.
+# ---------------------------------------------------------------------------
+_OSUP_ROOT="${JB_OSUP_ROOT:-}"
+_OSUP_BIN=/usr/local/sbin/jb-os-upgrade
+_OSUP_RULE=/etc/sudoers.d/jb-os-upgrade
+
+# _osup_cmd PM -- the non-interactive full upgrade for a package manager,
+# one command per line; fails for one with nothing to do here (brew needs
+# no root; the Windows managers have no sudo).
+_osup_cmd() {
+	case "$1" in
+	apt)
+		# confdef/confold: a changed config file keeps the local copy
+		# rather than stopping at dpkg's prompt, which nobody would answer.
+		printf '%s\n' 'apt-get -q update' \
+			'DEBIAN_FRONTEND=noninteractive apt-get -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade'
+		;;
+	pacman) printf '%s\n' 'pacman -Syu --noconfirm' ;;
+	dnf) printf '%s\n' 'dnf -y upgrade' ;;
+	zypper) printf '%s\n' 'zypper --non-interactive update' ;;
+	apk) printf '%s\n' 'apk update' 'apk upgrade' ;;
+	*) return 1 ;;
+	esac
+}
+
+# _osup_script PM -- the text of _OSUP_BIN for that package manager.
+_osup_script() {
+	cat <<-EOF
+		#!/bin/sh
+		# jb-os-upgrade -- written by just-bashit setup-system
+		# --os-upgrade-no-pass. Upgrades the OS packages ($1),
+		# non-interactively. Never reboots. Takes no arguments.
+		set -eu
+		PATH=/usr/sbin:/usr/bin:/sbin:/bin
+		export PATH
+		if [ \$# -ne 0 ]; then
+		    echo "jb-os-upgrade takes no arguments" >&2
+		    exit 2
+		fi
+	EOF
+	_osup_cmd "$1"
+}
+
+# _osup_allowed -- may this user run _OSUP_BIN without a password now?
+# sudo -l names a command it would run; -n makes "needs a password" a
+# failure instead of a prompt.
+_osup_allowed() {
+	sudo -n -l "${_OSUP_BIN}" >/dev/null 2>&1
+}
+
+_os_upgrade_nopass() {
+	_head "os-upgrade-no-pass — OS package upgrades without a password"
+	local pm user tmp bin rule
+	if [[ $(id -u) -eq 0 ]]; then
+		_info "running as root -- nothing to grant"
+		_result "os-upgrade-no-pass: skipped (root)"
+		return 0
+	fi
+	pm="$(get-pkg-mgr 2>/dev/null)" || pm=""
+	if [[ ${pm} == brew ]]; then
+		_info "brew upgrades without sudo -- nothing to grant"
+		_result "os-upgrade-no-pass: ok (brew needs no sudo)"
+		return 0
+	fi
+	if ! _osup_cmd "${pm}" >/dev/null; then
+		_warn "no unattended upgrade known for ${pm:-this OS}"
+		_result "os-upgrade-no-pass: skipped (${pm:-unknown} package manager)"
+		return 0
+	fi
+	if ! _have sudo; then
+		_warn "no sudo on this machine"
+		_result "os-upgrade-no-pass: skipped (no sudo)"
+		return 0
+	fi
+
+	user="$(id -un)"
+	bin="${_OSUP_ROOT}${_OSUP_BIN}"
+	rule="${_OSUP_ROOT}${_OSUP_RULE}"
+	tmp="$(mktemp -d "${TMPDIR:-/tmp}/jb-os-upgrade.XXXXXX")"
+	_osup_script "${pm}" >"${tmp}/bin"
+	printf '%s ALL=(root) NOPASSWD: %s ""\n' "${user}" "${_OSUP_BIN}" >"${tmp}/rule"
+
+	# The rule file is root-only (0440), so "unchanged" is read from what
+	# it grants rather than from its bytes -- a re-run asks for no password.
+	if cmp -s "${tmp}/bin" "${bin}" && _osup_allowed; then
+		rm -rf "${tmp}"
+		_info "up to date: ${_OSUP_BIN} (${pm}), passwordless for ${user}"
+		_result "os-upgrade-no-pass: ok (unchanged)"
+		return 0
+	fi
+
+	_sudo_init
+	if [[ ${DRY_RUN} -eq 1 ]]; then
+		_info "would allow ${user}: sudo -n ${_OSUP_BIN} (${pm})"
+		_priv install -m 0755 "<jb-os-upgrade for ${pm}>" "${bin}"
+		_priv install -m 0440 "<${user} NOPASSWD: ${_OSUP_BIN}>" "${rule}"
+		rm -rf "${tmp}"
+		_result "os-upgrade-no-pass: ok (dry run)"
+		return 0
+	fi
+
+	if ! _priv visudo -c -q -f "${tmp}/rule"; then
+		rm -rf "${tmp}"
+		_warn "visudo rejected the rule -- nothing installed"
+		_result "os-upgrade-no-pass: failed (visudo)"
+		return 0
+	fi
+	_info "installing ${_OSUP_BIN} (${pm}) and ${_OSUP_RULE}"
+	if ! _priv install -d -m 0755 "${bin%/*}" "${rule%/*}" ||
+		! _priv install -m 0755 "${tmp}/bin" "${bin}" ||
+		! _priv install -m 0440 "${tmp}/rule" "${rule}"; then
+		rm -rf "${tmp}"
+		_warn "could not install the files"
+		_result "os-upgrade-no-pass: failed (install)"
+		return 0
+	fi
+	rm -rf "${tmp}"
+	if ! _osup_allowed; then
+		_warn "installed, but sudo still wants a password: does /etc/sudoers include /etc/sudoers.d?"
+		_result "os-upgrade-no-pass: failed (rule not in effect)"
+		return 0
+	fi
+	_result "os-upgrade-no-pass: ok (sudo -n ${_OSUP_BIN})"
 }
 
 # ---------------------------------------------------------------------------
@@ -2925,6 +3076,12 @@ done
 if [[ ${_ran} -eq 0 ]]; then
 	echo "error: no steps selected" >&2
 	exit 1
+fi
+
+# Not a step: it grants a privilege, so it runs only when asked for by
+# name, never from a default run or bootstrap.toml.
+if [[ ${OS_UPGRADE_NOPASS} -eq 1 ]]; then
+	_os_upgrade_nopass
 fi
 
 _say ""

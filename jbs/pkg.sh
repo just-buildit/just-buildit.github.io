@@ -411,7 +411,10 @@ get-pkg-mgr() {
 		;;
 	Linux)
 		local ID="" ID_LIKE=""
-		[ -f /etc/os-release ] && . /etc/os-release
+		# JB_OS_RELEASE lets a test pin a distro, as JB_UNAME_S pins an OS.
+		local osr="${JB_OS_RELEASE:-/etc/os-release}"
+		# shellcheck source=/dev/null
+		[ -f "${osr}" ] && . "${osr}"
 		case "${ID_LIKE:-} ${ID:-}" in
 		*debian* | *ubuntu*) echo "apt" ;;
 		*arch* | *cachyos* | *manjaro*) echo "pacman" ;;

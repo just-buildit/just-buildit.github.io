@@ -11,6 +11,9 @@ like the script: ``python3 -m unittest discover -s tests``.
 
 from __future__ import annotations
 
+import contextlib
+import importlib.util
+import io
 import os
 import pathlib
 import re
@@ -18,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "ci-image.py"
@@ -463,10 +467,36 @@ class TestTheBaseSource(_Tree):
             self.answers(f"{REG}/{b}", "ok")
         (self.root / ".github" / "ci-images.env").write_text(
             "CI_JB_VERSION=v0.7.0\nCI_JB_SHA256=" + "b" * 64 + "\n")
-        r = self.source(cmd="inputs")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("CI_BASE_2404=ubuntu:24.04@sha256:" + "f" * 64,
-                      r.stdout.splitlines())
+        spec = importlib.util.spec_from_file_location("ci_image", SCRIPT)
+        self.assertIsNotNone(spec)
+        assert spec is not None and spec.loader is not None
+        ci_image = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ci_image)
+        read_pin = ci_image.read_pin
+        env = {
+            **os.environ,
+            "CI_IMAGE_BASES": BASES,
+            "PATH": f"{self.fake}:{os.environ['PATH']}",
+            "FAKE_DOCKER_DIR": str(self.fake),
+            "CI_IMAGE_BASE_REGISTRY": REG,
+            "CI_IMAGE_BASE_MIRROR": MIRROR,
+            "CI_IMAGE_PULL_ATTEMPTS": "3",
+            "CI_IMAGE_PULL_DELAY": "0",
+        }
+        with patch.object(
+            ci_image, "read_pin",
+            lambda: read_pin(self.root / ".github" / "ci-images.env"),
+        ), patch.object(
+            ci_image, "_latest_jb", return_value=("v0.7.0", "b" * 64)
+        ), patch.dict(os.environ, env):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                result = ci_image.main(["inputs", "--refresh"])
+        self.assertEqual(result, 0)
+        self.assertIn(
+            "CI_BASE_2404=ubuntu:24.04@sha256:" + "f" * 64,
+            output.getvalue().splitlines(),
+        )
         self.assertEqual(sorted(self.asked()),
                          sorted(f"{REG}/{b}" for b in BASES.split()))
 

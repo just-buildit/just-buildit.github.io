@@ -80,10 +80,13 @@ no ``name:`` is named its id. Names are compared trimmed and case aside.
    The name is never evaluated, so what cannot be read cannot be cleared.
    A ``name:`` that is not one plain or quoted scalar on its own line is
    unreadable too: a block scalar, a tag, an anchor or alias, a quote or
-   plain scalar continued onto the next line, an empty value, and a job
-   written as a flow mapping or merging an alias (``<<:``). The walk
-   marks those it sees by line (``UNREAD``); :func:`yaml_scalar` refuses
-   the rest by their first character.
+   plain scalar continued onto the next line, an empty value, and any
+   line at the job's key depth that is not a plain id-shaped key,
+   ``"name"``/``'name'`` or a sequence item: YAML spells the key in ways
+   no pattern for ``name`` sees (``? name``, ``"na\\x6de"``, ``!!str
+   name``, a flow mapping, a ``<<:`` merge), so the walk reads an
+   ALLOW-list and marks the rest ``UNREAD``. :func:`yaml_scalar` refuses
+   the value's own forms by their first character.
 
 Examples
 --------

@@ -1352,9 +1352,13 @@ ci-check-name: ## Print CI_CHECK_NAME, the aggregate check's name
 #     name -- is refused, naming the job, and so are two jobs that can
 #     carry it (just-buildit.github.io#243). So is a name this line walk
 #     cannot read whole: one continued onto the next line or empty on
-#     its own, and a job written as a flow mapping or with a `<<:` merge,
-#     which the walk marks UNREAD; the script refuses a block scalar, a
-#     tag, an anchor, an alias or an unclosed quote by its first character;
+#     its own, an id line with an inline value, and any line at a job's
+#     key depth that is not a plain id-shaped key, "name"/'name', or a
+#     sequence item -- an ALLOW-list, since YAML spells the key `name` in
+#     ways no pattern for it sees (`? name`, `"na\x6de"`, `!!str name`,
+#     a flow mapping, a `<<:` merge). The walk marks those UNREAD; the
+#     script refuses a block scalar, a tag, an anchor, an alias or an
+#     unclosed quote by its first character;
 #   - after the aggregator: it `needs:` it (a mirror trigger, a deploy) AND
 #     its `if:` says always(). Without a status function GitHub ANDs in
 #     success(), which is false when anything upstream was SKIPPED -- so on
@@ -1422,10 +1426,14 @@ ci-changes-wiring-check: ## Verify GATES_CI_FILE gates every job on the vendored
 	     if (ai < 0) ai = n; \
 	     if (n == ai) { \
 	       inneeds = 0; \
-	       if ($$0 ~ /^ *[[{]/) unread[job] = "it is written as a flow mapping"; \
-	       if ($$0 ~ /^ *<<[[:space:]]*:/) unread[job] = "it merges a YAML alias (<<:)"; \
+	       if ($$0 !~ /^ *[A-Za-z0-9_-]+[[:space:]]*:([[:space:]]|$$)/ && \
+	           $$0 !~ /^ *("name"|\047name\047)[[:space:]]*:([[:space:]]|$$)/ && \
+	           $$0 !~ /^ *-([[:space:]]|$$)/ && \
+	           !(job in unread)) \
+	         { v = $$0; sub(/^ */, "", v); \
+	           unread[job] = "a line at its key depth is not a plain key: " v } \
 	       if ($$0 ~ /^ *uses:/) uses[job] = val($$0); \
-	       else if ($$0 ~ /^ *["\047]?name["\047]?[[:space:]]*:/) { \
+	       else if ($$0 ~ /^ *(name|"name"|\047name\047)[[:space:]]*:([[:space:]]|$$)/) { \
 	         rawnm[job] = rawval($$0); nmline = 1; \
 	         if (rawnm[job] == "") unread[job] = "its name: is empty on its own line" } \
 	       else if ($$0 ~ /^ *if:/) iff[job] = rawval($$0); \

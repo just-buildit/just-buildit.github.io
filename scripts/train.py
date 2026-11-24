@@ -125,8 +125,9 @@ this on every merged pull request of the repository's own (never a
 fork's), through ``make train-retire TRAIN=<n>``:
 
 1. Reads ``T``; refuses one that is not merged, since a re-cut still needs
-   its constituents' branches. A body without the table ``make train`` writes (its
-   ``| commit | from |`` header) is not a train, and retires nothing.
+   its constituents' branches. A body without the table ``make train``
+   writes (its ``| commit | from |`` header) is not a train, and retires
+   nothing.
 2. Reads each constituent and its recorded head from ``T``'s table with
    ``constituents``, the reader a re-cut uses, and its branch name from
    GitHub (``headRefName``; the table does not hold it).
@@ -528,6 +529,14 @@ def constituents(body: str) -> dict[int, str | None]:
 
     >>> constituents("| item | issue |\\n|---|---|\\n| `x` | #7 |\\n")
     {}
+
+    A train's table beside other tables reads only the train's rows:
+
+    >>> issues = "| item | issue |\\n|---|---|\\n| `x` | #7 |\\n"
+    >>> train_t = ("| commit | from | source |\\n|---|---|---|\\n"
+    ...            "| `a` | #3 | `" + "1" * 40 + "` |\\n")
+    >>> list(constituents(issues + "\\n" + train_t + "\\n" + issues))
+    [3]
     """
     heads: dict[int, str | None] = {}
     inside = False

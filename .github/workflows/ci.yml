@@ -381,6 +381,7 @@ jobs:
         # shapes, every `needs:` spelling, each sabotage, the empty walk.
         run: |
           tmp="$(mktemp -d)"; cp standard.mk "$tmp/"
+          mkdir "$tmp/scripts"; cp scripts/ci-gate-name.py "$tmp/scripts/"
           printf '%s\n' 'HAS_RELEASE = 1' 'BUMP_VERSION_CMD = true' \
             'RELEASE_WATCH_CMD = true' 'VERSION_PROBES = v|echo 1' \
             'TEST_CMD = @echo t' 'TEST_FAST_CMD = @echo t' 'CLEAN_PATHS = d/' \

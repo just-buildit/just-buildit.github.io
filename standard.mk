@@ -1329,15 +1329,23 @@ ci-check-name: ## Print CI_CHECK_NAME, the aggregate check's name
 #   - the call itself (`uses: ./.github/workflows/changes.yml`);
 #   - gated: it `needs:` that job and its text reads `needs.<id>.outputs`;
 #   - the aggregator, the job whose `name:` is CI_CHECK_NAME -- it runs
-#     always() and counts a skipped matrix as passed. Its `if:` is absent or
-#     exactly always(): a job whose `if:` is false still reports, as a
-#     SKIPPED check of the required name, which branch protection counts as
-#     passing. Its `name:` is CI_CHECK_NAME literally, or an expression that
-#     yields it on the gate only (`${{ <cond> && 'CI passed' || ... ||
-#     '<other>' }}`, just-buildit.github.io#241), so a run that is not the
-#     gate -- doppler's minimal and skip pushes -- reports under another
-#     name. scripts/ci-gate-name.py inspects that shape and never
-#     evaluates it. One job only may be the aggregator;
+#     always() and counts a skipped matrix as passed. Its `if:` is exactly
+#     always(): a job whose `if:` is false still reports, as a SKIPPED
+#     check of the required name, which branch protection counts as
+#     passing, and an ABSENT `if:` is one that can be false -- the
+#     aggregator `needs:` the matrix, so GitHub ANDs in success() and a
+#     failed need skips it. Its `name:` is CI_CHECK_NAME literally, or an
+#     expression that yields it on the gate only (`${{ <cond> && 'CI
+#     passed' || ... || '<other>' }}`, just-buildit.github.io#241), so a
+#     run that is not the gate -- doppler's minimal and skip pushes --
+#     reports under another name. scripts/ci-gate-name.py inspects that
+#     shape and never evaluates it. A job is taken for the aggregator when
+#     its literal name is CI_CHECK_NAME, or its name holds `${{` and the
+#     quoted literal 'CI_CHECK_NAME' (case aside), and two such jobs are
+#     refused, as is any job whose double-quoted `name:` holds a backslash
+#     escape (YAML decodes it, so it could spell the name unseen). A name
+#     that reaches the required value another way -- format(), a context
+#     such as `CI ${{ matrix.w }}` -- is NOT detected;
 #   - after the aggregator: it `needs:` it (a mirror trigger, a deploy) AND
 #     its `if:` says always(). Without a status function GitHub ANDs in
 #     success(), which is false when anything upstream was SKIPPED -- so on
@@ -1375,7 +1383,15 @@ ci-changes-wiring-check: ## Verify GATES_CI_FILE gates every job on the vendored
 	   function lead(s) { match(s, /^ */); return RLENGTH } \
 	   function val(s) { sub(/^[^:]*:[[:space:]]*/, "", s); sub(/[[:space:]]+#.*$$/, "", s); \
 	                     gsub(/^["\047]|["\047]$$/, "", s); return s } \
-	   function rawval(s) { sub(/^[^:]*:[[:space:]]*/, "", s); sub(/[[:space:]]+#.*$$/, "", s); return s } \
+	   function rawval(s,  q, i, c) { sub(/^[^:]*:[[:space:]]*/, "", s); q = substr(s, 1, 1); \
+	     if (q == "\"" || q == "\047") { \
+	       for (i = 2; i <= length(s); i++) { c = substr(s, i, 1); \
+	         if (q == "\"" && c == "\\") { i++; continue } \
+	         if (c != q) continue; \
+	         if (q == "\047" && substr(s, i + 1, 1) == "\047") { i++; continue } \
+	         return substr(s, 1, i) } \
+	       return s } \
+	     sub(/[[:space:]]+#.*$$/, "", s); return s } \
 	   function addneeds(j, s) { gsub(/[][,]/, " ", s); needs[j] = needs[j] " " s " " } \
 	   /^[[:space:]]*(#|$$)/ { next } \
 	   /^jobs:[[:space:]]*(#.*)?$$/ { injobs = 1; next } \
@@ -1407,8 +1423,10 @@ ci-changes-wiring-check: ## Verify GATES_CI_FILE gates every job on the vendored
 	     for (i = 1; i <= total; i++) seen[order[i]] = 1; \
 	     for (k in isalways) if (!(k in seen)) print "STALE " k; \
 	     for (i = 1; i <= total; i++) { j = order[i]; \
+	       if (substr(rawnm[j], 1, 1) == "\"" && index(rawnm[j], "\\")) print "ESCNAME " j } \
+	     for (i = 1; i <= total; i++) { j = order[i]; \
 	       if (uses[j] ~ /^\.\/\.github\/workflows\/changes\.ya?ml$$/) c = j; \
-	       if (nm[j] == agg || (index(rawnm[j], "$${{") && index(rawnm[j], "\047" agg "\047"))) { \
+	       if (tolower(nm[j]) == tolower(agg) || (index(rawnm[j], "$${{") && index(tolower(rawnm[j]), "\047" tolower(agg) "\047"))) { \
 	         if (a != "") print "DUPAGG " a " " j; a = j } } \
 	     if (c == "") { print "NOCALL"; exit } \
 	     if (a == "") { print "NOAGG"; exit } \
@@ -1441,6 +1459,14 @@ ci-changes-wiring-check: ## Verify GATES_CI_FILE gates every job on the vendored
 	 if printf '%s\n' "$$out" | grep -q '^NOAGG'; then \
 	     echo "ERROR: $$ci has no job named '$(CI_CHECK_NAME)' (CI_CHECK_NAME)."; \
 	     echo "  The aggregator is what turns a skipped matrix into a pass."; \
+	     exit 1; \
+	 fi; \
+	 esc=$$(printf '%s\n' "$$out" | sed -n 's/^ESCNAME //p'); \
+	 if [ -n "$$esc" ]; then \
+	     echo "ERROR: $$ci jobs whose double-quoted name: holds a backslash escape:"; \
+	     printf '%s\n' "$$esc" | sed 's/^/  /'; \
+	     echo "  YAML decodes it (\"CI\\x20passed\" is 'CI passed'), so such a name"; \
+	     echo "  can carry '$(CI_CHECK_NAME)' unseen. Write the character itself."; \
 	     exit 1; \
 	 fi; \
 	 dup=$$(printf '%s\n' "$$out" | sed -n 's/^DUPAGG //p'); \

@@ -130,14 +130,14 @@ class GateName(unittest.TestCase):
     def test_refuses_the_name_unconditionally(self) -> None:
         self.refuses(
             "\"${{ 'CI passed' }}\"",
-            None,
+            "always()",
             "yields 'CI passed' unconditionally",
         )
 
     def test_refuses_parentheses(self) -> None:
         self.refuses(
             "\"${{ (a || b) && 'CI passed' || 'x' }}\"",
-            None,
+            "always()",
             "unsupported '('",
         )
 
@@ -151,7 +151,47 @@ class GateName(unittest.TestCase):
         self.accepts(
             "\"${{ needs.s.outputs.scope == 'full' && 'CI passed'"
             " || 'CI passed (push, minimal set)' }}\"",
-            None,
+            "always()",
+        )
+
+    def test_a_case_or_space_variant_off_the_gate_is_the_name(self) -> None:
+        # Failing closed: a value equal to the name but for case or its
+        # ends is treated as the name, so off the gate it is refused.
+        for v in ("ci passed", " CI passed "):
+            self.refuses(
+                "\"${{ needs.s.outputs.scope == 'full' && 'CI passed'"
+                f" || '{v}' }}}}\"",
+                "always()",
+                "the fallback yields 'CI passed' off the gate",
+            )
+
+    def test_refuses_a_backslash_escape_in_a_double_quoted_name(self) -> None:
+        # YAML decodes "\x20" to a space, so branch 2 below IS 'CI passed'.
+        # Nothing may compare the undecoded text. The awk walk refuses any
+        # escaped double-quoted name first; the script refuses it again
+        # (its doctests), so either refusal satisfies this test.
+        self.refuses(
+            "\"${{ needs.s.outputs.scope == 'full' && 'CI passed'"
+            " || needs.s.outputs.scope == 'min' && 'CI\\x20passed'"
+            " || 'z' }}\"",
+            "always()",
+            "backslash escape",
+        )
+
+    def test_refuses_a_backslash_escape_in_a_double_quoted_if(self) -> None:
+        self.refuses(
+            "CI passed",
+            "\"${{ alw\\x61ys() }}\"",
+            "a backslash escape in a double-quoted value is not supported",
+        )
+
+    def test_a_hash_inside_quotes_is_not_a_comment(self) -> None:
+        # ` #` inside a quoted scalar is text, not a YAML comment: cutting
+        # there left an unterminated string and refused a valid name.
+        self.accepts(
+            "\"${{ needs.s.outputs.scope == 'full' && 'CI passed'"
+            " || 'CI passed #2' }}\"  # the gate",
+            "always()  # the aggregator always runs",
         )
 
     # -- literal names ----------------------------------------------------
@@ -170,8 +210,14 @@ class GateName(unittest.TestCase):
         self.accepts("CI passed", "${{ always() }}")
         self.accepts("CI passed", "\"${{always( )}}\"")
 
-    def test_accepts_a_literal_with_no_if(self) -> None:
-        self.accepts("CI passed", None)
+    def test_refuses_a_literal_with_no_if(self) -> None:
+        # The aggregator needs: the matrix, so with no if: GitHub ANDs in
+        # success() and SKIPS it when a need fails -- a skipped required
+        # check counts as passing.
+        self.refuses("CI passed", None, "it has no if: -- with needs:")
+
+    def test_refuses_a_literal_in_another_case(self) -> None:
+        self.refuses("ci passed", "always()", "but for case or whitespace")
 
     def test_refuses_two_jobs_that_can_carry_the_name(self) -> None:
         # A second job of the required name reports a second check of it on
@@ -183,6 +229,18 @@ class GateName(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("more than one job", r.stdout)
         self.assertIn("ci-passed again", r.stdout)
+
+    def test_refuses_an_escaped_name_on_another_job(self) -> None:
+        # "CI\x20passed" is 'CI passed' once YAML decodes it: a second
+        # aggregator no substring match would see.
+        r = self.gate(
+            "CI passed\n    needs: [changes]\n  again:\n"
+            "    name: \"CI\\x20passed\"",
+            "always()",
+        )
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("holds a backslash escape", r.stdout)
+        self.assertIn("  again", r.stdout)
 
     def test_a_literal_longer_name_is_no_aggregator(self) -> None:
         self.refuses("CI passed (push, minimal set)", "always()",

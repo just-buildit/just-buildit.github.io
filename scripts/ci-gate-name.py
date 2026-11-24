@@ -25,10 +25,13 @@ ran. Two shapes put it somewhere else:
 
 The rule
 --------
-A **literal** name equal to ``CI_CHECK_NAME`` is the gate when its job has
-no ``if:``, or an ``if:`` that is exactly ``always()`` -- with or without
-``${{ }}``, whitespace aside. Anything else is refused: no other condition
-can be shown to be always true without evaluating it.
+A **literal** name equal to ``CI_CHECK_NAME`` is the gate when its job's
+``if:`` is exactly ``always()`` -- with or without ``${{ }}``, whitespace
+aside. Anything else is refused: no other condition can be shown to be
+always true without evaluating it. An ABSENT ``if:`` is refused too: the
+aggregator ``needs:`` the jobs it judges, and with no status function
+GitHub ANDs in ``success()``, so a failed need SKIPS it -- and a skipped
+required check counts as passing.
 
 An **expression** name is the gate when the whole value is one
 ``${{ ... }}`` of the single-branch shape::
@@ -38,7 +41,9 @@ An **expression** name is the gate when the whole value is one
 * the first branch's value is ``CI_CHECK_NAME``, exactly once;
 * every other value -- each later branch and the fallback -- is a string
   literal that differs from it. ``'CI passed (push, minimal set)'``
-  differs: values are compared whole, never by substring;
+  differs: values are compared whole, never by substring. Failing closed,
+  a value equal to it but for case or surrounding whitespace
+  (``'ci passed'``, ``' CI passed '``) counts as the name;
 * each condition reads a context (``needs.scope.outputs.scope == 'full'``);
   a constant condition is no gate;
 * the job's ``if:`` obeys the literal rule above, for the same reason.
@@ -49,6 +54,10 @@ its SHAPE is checked. Parentheses, ``!``, an index, a function call or any
 other operator are refused, naming it, rather than guessed at: a reader
 that guesses is a loophole, not a gate.
 
+A backslash anywhere in a double-quoted ``name:`` or ``if:`` is refused.
+YAML decodes escapes there (``"CI\\x20passed"`` is ``CI passed``), and
+a reader that decodes only some of them would compare the wrong text.
+
 Examples
 --------
 >>> full = ("${{ s == 'full' && 'CI passed' || "
@@ -56,10 +65,13 @@ Examples
 ...         "'CI passed (push, minimal set)' || 'CI passed (skipped)' }}")
 >>> refusal("CI passed", full, "always()") is None
 True
->>> print(refusal("CI passed", full.replace(" (push, minimal set)", ""), ""))
+>>> off = full.replace(" (push, minimal set)", "")
+>>> print(refusal("CI passed", off, "always()"))
 branch 2 yields 'CI passed' off the gate: s == 'minimal' && 'CI passed'
 >>> refusal("CI passed", "CI passed", "${{ always() }}") is None
 True
+>>> print(refusal("CI passed", "CI passed", ""))
+it has no if: -- with needs: GitHub adds success(), so a failed need SKIPS it
 >>> print(refusal("CI passed", "CI passed", "github.event_name == 'push'"))
 its if: is not always(): github.event_name == 'push'
 """
@@ -79,18 +91,29 @@ _WORD = re.compile(r"[A-Za-z0-9_.-]+")
 _CONSTANTS = {"true", "false", "null"}
 
 
+#: One token: ``(kind, value, start, end)``.
+Token = tuple[str, str, int, int]
+
+
 class Refused(ValueError):
     """Not the shape this gate accepts; the message says why."""
 
 
 def yaml_scalar(raw: str) -> str:
-    """The text of a one-line YAML scalar as written after ``key:``.
+    r"""The text of a one-line YAML scalar as written after ``key:``.
 
-    Double quotes take ``\\\\`` and ``\\"`` escapes, single quotes ``''``;
-    a plain scalar is returned stripped.
+    Single quotes take ``''``; a plain scalar is returned stripped. A
+    double-quoted scalar is returned unquoted, and refused if it holds a
+    backslash: YAML decodes a dozen escapes there (``\x20``, ``\u0020``,
+    a line continuation), so failing closed beats decoding some of them.
 
-    >>> yaml_scalar('"${{ a && \\'x\\' }}"')
+    >>> yaml_scalar('"${{ a && ' + "'x' }}" + '"')
     "${{ a && 'x' }}"
+    >>> try:
+    ...     yaml_scalar(r'"CI\x20"')
+    ... except Refused as e:
+    ...     print(e)
+    a backslash escape in a double-quoted value is not supported: "CI\x20"
     >>> yaml_scalar("'${{ a && ''x'' || ''y'' }}'")
     "${{ a && 'x' || 'y' }}"
     >>> yaml_scalar("  CI passed ")
@@ -100,7 +123,12 @@ def yaml_scalar(raw: str) -> str:
     if len(s) >= 2 and s[0] == s[-1] == "'":
         return s[1:-1].replace("''", "'")
     if len(s) >= 2 and s[0] == s[-1] == '"':
-        return re.sub(r'\\(["\\])', r"\1", s[1:-1])
+        if "\\" in s:
+            raise Refused(
+                "a backslash escape in a double-quoted value is not"
+                f" supported: {s}"
+            )
+        return s[1:-1]
     return s
 
 
@@ -120,7 +148,7 @@ def unwrap(value: str) -> str | None:
     return None
 
 
-def tokens(expr: str) -> list[tuple[str, str, int, int]]:
+def tokens(expr: str) -> list[Token]:
     """``(kind, value, start, end)`` for each token of an expression.
 
     Kinds: ``str`` (a literal, ``''`` unescaped), ``and``, ``or``, ``cmp``
@@ -146,7 +174,7 @@ def tokens(expr: str) -> list[tuple[str, str, int, int]]:
     ...     print(e)
     unterminated string at column 6 of the expression
     """
-    out: list[tuple[str, str, int, int]] = []
+    out: list[Token] = []
     i, n = 0, len(expr)
     while i < n:
         c = expr[i]
@@ -190,8 +218,8 @@ def tokens(expr: str) -> list[tuple[str, str, int, int]]:
     return out
 
 
-def _split(toks: list, kind: str) -> list[list]:
-    parts: list[list] = [[]]
+def _split(toks: list[Token], kind: str) -> list[list[Token]]:
+    parts: list[list[Token]] = [[]]
     for t in toks:
         if t[0] == kind:
             parts.append([])
@@ -273,11 +301,20 @@ def branches(expr: str) -> list[tuple[str | None, str, str]]:
     return out
 
 
-def _always(raw_if: str) -> bool:
-    s = yaml_scalar(raw_if)
+def _always(when: str) -> bool:
+    s = when
     inner = unwrap(s)
     s = inner if inner is not None else s
-    return re.sub(r"\s+", "", s) in ("", "always()")
+    return re.sub(r"\s+", "", s) == "always()"
+
+
+def _same(a: str, b: str) -> bool:
+    """Whether two names are one, failing closed: case and ends aside.
+
+    >>> _same(" ci PASSED ", "CI passed"), _same("CI  passed", "CI passed")
+    (True, False)
+    """
+    return a.strip().casefold() == b.strip().casefold()
 
 
 def refusal(check: str, raw_name: str, raw_if: str) -> str | None:
@@ -286,22 +323,38 @@ def refusal(check: str, raw_name: str, raw_if: str) -> str | None:
     ``raw_name`` and ``raw_if`` are the YAML scalars as written (an absent
     ``if:`` is ``""``); ``check`` is ``CI_CHECK_NAME``.
 
-    >>> print(refusal("CI passed", "${{ a && 'x' || 'CI passed' }}", ""))
-    the fallback yields 'CI passed' off the gate: 'CI passed'
-    >>> print(refusal("CI passed", "${{ 'CI passed' }}", ""))
+    >>> ok = "always()"
+    >>> print(refusal("CI passed", "${{ a && 'x' || ' ci passed' }}", ok))
+    the fallback yields 'CI passed' off the gate: ' ci passed'
+    >>> print(refusal("CI passed", "${{ 'CI passed' }}", ok))
     it yields 'CI passed' unconditionally: 'CI passed'
-    >>> print(refusal("CI passed", "${{ a && 'x' || b && 'y' || 'z' }}", ""))
+    >>> print(refusal("CI passed", "${{ a && 'x' || b && 'y' || 'z' }}", ok))
     the first branch yields 'x', not 'CI passed'
+    >>> print(refusal("CI passed", "${{ a && 'ci passed' || 'z' }}", ok))
+    the first branch yields 'ci passed', not 'CI passed'
     >>> print(refusal("CI passed", "${{ a && 'CI passed' || 'z' }}", "b"))
     its if: is not always(): b
-    >>> print(refusal("CI passed", "x-${{ a }}", ""))
+    >>> print(refusal("CI passed", "x-${{ a }}", ok))
     the name is not 'CI passed' nor wholly one ${{ ... }}: x-${{ a }}
+    >>> print(refusal("CI passed", "ci passed", ok))
+    the name is 'CI passed' but for case or whitespace: ci passed
     """
-    name = yaml_scalar(raw_name)
-    if not _always(raw_if):
-        return f"its if: is not always(): {yaml_scalar(raw_if)}"
+    try:
+        name = yaml_scalar(raw_name)
+        when = yaml_scalar(raw_if)
+    except Refused as e:
+        return str(e)
+    if when == "":
+        return (
+            "it has no if: -- with needs: GitHub adds success(),"
+            " so a failed need SKIPS it"
+        )
+    if not _always(when):
+        return f"its if: is not always(): {when}"
     if name == check:
         return None
+    if _same(name, check):
+        return f"the name is {check!r} but for case or whitespace: {name}"
     expr = unwrap(name)
     if expr is None:
         whole = "wholly one ${{ ... }}"
@@ -311,9 +364,9 @@ def refusal(check: str, raw_name: str, raw_if: str) -> str | None:
     except Refused as e:
         return str(e)
     for k, (cond, val, src) in enumerate(chain, 1):
-        if val == check and cond is None and k == 1:
+        if _same(val, check) and cond is None and k == 1:
             return f"it yields {check!r} unconditionally: {src}"
-        if val == check and k > 1:
+        if _same(val, check) and k > 1:
             where = "the fallback" if cond is None else f"branch {k}"
             return f"{where} yields {check!r} off the gate: {src}"
     if chain[0][1] != check:
@@ -339,8 +392,9 @@ def main(argv: list[str] | None = None) -> int:
         " still\n"
         "  reports -- a SKIPPED check, which branch protection counts as"
         " passing --\n"
-        "  so the aggregator's if: is always() or absent. A name expression"
-        " must be\n"
+        "  so the aggregator's if: is exactly always(): an absent if: is"
+        " success(),\n"
+        "  which SKIPS it when a need fails. A name expression must be\n"
         f"    ${{{{ <cond> && '{a.check_name}' || <cond> && '<other>' || "
         "'<fallback>' }}\n"
         f"  with '{a.check_name}' only in the first branch, every other value"

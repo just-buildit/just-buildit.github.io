@@ -1350,7 +1350,11 @@ ci-check-name: ## Print CI_CHECK_NAME, the aggregate check's name
 #     Anything else that might be the name -- format(), a fromJSON
 #     matrix, another context, a backslash escape in a double-quoted
 #     name -- is refused, naming the job, and so are two jobs that can
-#     carry it (just-buildit.github.io#243);
+#     carry it (just-buildit.github.io#243). So is a name this line walk
+#     cannot read whole: one continued onto the next line or empty on
+#     its own, and a job written as a flow mapping or with a `<<:` merge,
+#     which the walk marks UNREAD; the script refuses a block scalar, a
+#     tag, an anchor, an alias or an unclosed quote by its first character;
 #   - after the aggregator: it `needs:` it (a mirror trigger, a deploy) AND
 #     its `if:` says always(). Without a status function GitHub ANDs in
 #     success(), which is false when anything upstream was SKIPPED -- so on
@@ -1406,15 +1410,24 @@ ci-changes-wiring-check: ## Verify GATES_CI_FILE gates every job on the vendored
 	     n = lead($$0); \
 	     if (ji < 0 || ji == "") ji = n; \
 	     if (n == ji) { \
-	       job = $$0; sub(/^ */, "", job); sub(/:.*/, "", job); \
-	       order[++total] = job; ai = -1; inneeds = 0; next \
+	       job = $$0; sub(/^ */, "", job); rest = job; sub(/:.*/, "", job); \
+	       sub(/^[^:]*:[[:space:]]*/, "", rest); sub(/[[:space:]]*#.*$$/, "", rest); \
+	       order[++total] = job; ai = -1; inneeds = 0; nmline = 0; \
+	       if (rest != "") unread[job] = "its id line holds an inline value: " rest; \
+	       next \
 	     } \
 	     text[job] = text[job] " " $$0; print "L " job " " $$0; \
+	     if (nmline && n > ai) unread[job] = "its name: continues on the next line"; \
+	     nmline = 0; \
 	     if (ai < 0) ai = n; \
 	     if (n == ai) { \
 	       inneeds = 0; \
+	       if ($$0 ~ /^ *[[{]/) unread[job] = "it is written as a flow mapping"; \
+	       if ($$0 ~ /^ *<<[[:space:]]*:/) unread[job] = "it merges a YAML alias (<<:)"; \
 	       if ($$0 ~ /^ *uses:/) uses[job] = val($$0); \
-	       else if ($$0 ~ /^ *name:/) rawnm[job] = rawval($$0); \
+	       else if ($$0 ~ /^ *["\047]?name["\047]?[[:space:]]*:/) { \
+	         rawnm[job] = rawval($$0); nmline = 1; \
+	         if (rawnm[job] == "") unread[job] = "its name: is empty on its own line" } \
 	       else if ($$0 ~ /^ *if:/) iff[job] = rawval($$0); \
 	       else if ($$0 ~ /^ *needs:/) { v = val($$0); if (v == "") inneeds = 1; else addneeds(job, v) } \
 	       next \
@@ -1432,6 +1445,7 @@ ci-changes-wiring-check: ## Verify GATES_CI_FILE gates every job on the vendored
 	     if (c == "") { print "NOCALL"; exit } \
 	     for (i = 1; i <= total; i++) { j = order[i]; \
 	       print "NAME " j " " rawnm[j]; print "IF " j " " iff[j]; \
+	       if (j in unread) print "UNREAD " j " " unread[j]; \
 	       if (j == c || (j in isalways)) continue; \
 	       print "CLS " j " " (index(text[j], "always()") > 0) " " \
 	         (index(needs[j], " " c " ") && index(text[j], "needs." c ".outputs")) \

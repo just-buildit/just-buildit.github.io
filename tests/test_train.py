@@ -1287,6 +1287,25 @@ class Retires(Fixture):
         self.assertIn("gone: #1: pr1 is already gone", p.stdout)
         self.assertEqual(set(self.branches()), {"main"})
 
+    def test_an_issue_table_is_not_a_train(self) -> None:
+        # #237: doppler#3298's body listed issues in a table whose last
+        # cell was `#3295`; retire read it as a train row, looked the
+        # number up, and failed the run. Here the number is a real PR,
+        # so a misread would go on to delete its branch.
+        self.state["prs"]["51"] = dict(
+            number=51,
+            state="MERGED",
+            body=(
+                "Closes #7\n\n| change | issue |\n|---|---|\n"
+                "| `fix x` | #1 |\n| `fix y` | #2 |\n"
+            ),
+        )
+        before = self.branches()
+        p = self.train("--retire", "51")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("#51 is not a train; nothing to retire", p.stdout)
+        self.assertEqual(self.branches(), before)
+
     def test_a_pr_with_no_table_is_a_no_op(self) -> None:
         self.state["prs"]["50"] = dict(
             number=50, state="MERGED", body="Closes #7\n\n| a | #1 |x"

@@ -78,6 +78,12 @@ no ``name:`` is named its id. Names are compared trimmed and case aside.
 4. Anything else that might match is refused, naming the job: a
    ``format()``, a ``fromJSON`` or other dynamic matrix, another context.
    The name is never evaluated, so what cannot be read cannot be cleared.
+   A ``name:`` that is not one plain or quoted scalar on its own line is
+   unreadable too: a block scalar, a tag, an anchor or alias, a quote or
+   plain scalar continued onto the next line, an empty value, and a job
+   written as a flow mapping or merging an alias (``<<:``). The walk
+   marks those it sees by line (``UNREAD``); :func:`yaml_scalar` refuses
+   the rest by their first character.
 
 Examples
 --------
@@ -139,8 +145,29 @@ def yaml_scalar(raw: str) -> str:
     "${{ a && 'x' || 'y' }}"
     >>> yaml_scalar("  CI passed ")
     'CI passed'
+
+    Anything that is not one complete scalar on this line is refused: a
+    block scalar (``>-``, ``|``), a tag (``!!str``), an anchor or alias
+    (``&n``, ``*n``) or a quote that does not close here, which YAML
+    continues onto the next line.
+
+    >>> for v in (">-", "!!str CI passed", "&n CI passed", "*n", '"CI'):
+    ...     try:
+    ...         yaml_scalar(v)
+    ...     except Refused as e:
+    ...         print(e)
+    not one plain or quoted scalar on its line: >-
+    not one plain or quoted scalar on its line: !!str CI passed
+    not one plain or quoted scalar on its line: &n CI passed
+    not one plain or quoted scalar on its line: *n
+    not one plain or quoted scalar on its line: "CI
     """
     s = raw.strip()
+    whole = "not one plain or quoted scalar on its line"
+    if s[:1] and s[0] in "|>&*!%@`":
+        raise Refused(f"{whole}: {s}")
+    if s[:1] in ("'", '"') and (len(s) < 2 or s[-1] != s[0]):
+        raise Refused(f"{whole}: {s}")
     if len(s) >= 2 and s[0] == s[-1] == "'":
         return s[1:-1].replace("''", "'")
     if len(s) >= 2 and s[0] == s[-1] == '"':
@@ -862,7 +889,9 @@ def jobs(stream: list[str]) -> dict[str, dict[str, object]]:
 
     Each line is ``L <job> <line>`` (a line of the job's body, as written),
     ``NAME <job> <name>`` or ``IF <job> <if>`` (as written; empty when the
-    job has none); anything else is the walk's and ignored here.
+    job has none) or ``UNREAD <job> <why>`` (the walk could not read the
+    job's name: a flow-style job, a name continued onto the next line);
+    anything else is the walk's and ignored here.
 
     >>> jobs(["L a     runs-on: x", "NAME a CI passed", "IF a ", "TOTAL 1"])
     {'a': {'body': ['    runs-on: x'], 'name': 'CI passed', 'if': ''}}
@@ -870,7 +899,7 @@ def jobs(stream: list[str]) -> dict[str, dict[str, object]]:
     out: dict[str, dict[str, object]] = {}
     for line in stream:
         kind, _, rest = line.partition(" ")
-        if kind not in ("L", "NAME", "IF"):
+        if kind not in ("L", "NAME", "IF", "UNREAD"):
             continue
         job, _, value = rest.partition(" ")
         entry = out.setdefault(job, {"body": [], "name": "", "if": ""})
@@ -910,6 +939,9 @@ def gate(check: str, ci: str, stream: list[str]) -> tuple[str | None, str]:
     for job, entry in found.items():
         name, body = entry["name"], entry["body"]
         assert isinstance(name, str) and isinstance(body, list)
+        if "unread" in entry:
+            unread.append(f"  {job}: {entry['unread']}")
+            continue
         try:
             if carries(check, job, name, body):
                 carriers.append(job)

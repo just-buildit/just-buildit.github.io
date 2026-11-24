@@ -356,6 +356,94 @@ class SecondJob(Harness):
             "\n        san:\n          - { target: a, label: \"CI passed\" }",
         )
 
+    # -- a name: that is not one scalar on its line --------------------
+    #
+    # Each is YAML for a job named 'CI passed' that a line-at-a-time reader
+    # would see as other text, or not see at all; each is refused unread.
+
+    def unread(self, job: str, why: str) -> None:
+        tail = (
+            "    needs: changes\n"
+            "    if: needs.changes.outputs.src == 'true'\n"
+            "    runs-on: ubuntu-latest\n"
+        )
+        r = self.gate("CI passed", "always()", "  other:\n" + job + tail)
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(f"  other: {why}", r.stdout)
+
+    def test_refuses_a_folded_block_scalar(self) -> None:
+        self.unread("    name: >-\n      CI passed\n",
+                    "its name: continues on the next line")
+
+    def test_refuses_a_literal_block_scalar(self) -> None:
+        self.unread("    name: |-\n      CI passed\n",
+                    "its name: continues on the next line")
+
+    def test_refuses_an_empty_name_with_the_value_below(self) -> None:
+        # Not the job id: YAML reads the next, deeper line as the value.
+        self.unread("    name:\n      CI passed\n",
+                    "its name: continues on the next line")
+
+    def test_refuses_an_empty_name(self) -> None:
+        self.unread("    name:\n", "its name: is empty on its own line")
+
+    def test_refuses_a_multi_line_plain_scalar(self) -> None:
+        self.unread("    name: CI\n      passed\n",
+                    "its name: continues on the next line")
+
+    def test_refuses_a_multi_line_double_quoted_scalar(self) -> None:
+        self.unread('    name: "CI\n      passed"\n',
+                    "its name: continues on the next line")
+
+    def test_refuses_a_multi_line_single_quoted_scalar(self) -> None:
+        self.unread("    name: 'CI\n      passed'\n",
+                    "its name: continues on the next line")
+
+    def test_refuses_an_unclosed_quote(self) -> None:
+        # The script's own refusal, without the walk's: the next line is
+        # not deeper, so only the open quote says the scalar goes on.
+        self.unread('    name: "CI passed\n',
+                    "not one plain or quoted scalar on its line")
+
+    def test_refuses_a_block_scalar_indicator(self) -> None:
+        # The indicator alone, its content absent: the script's refusal.
+        self.unread("    name: >-\n",
+                    "not one plain or quoted scalar on its line: >-")
+
+    def test_refuses_a_tag(self) -> None:
+        self.unread("    name: !!str CI passed\n",
+                    "not one plain or quoted scalar on its line: !!str")
+
+    def test_refuses_an_anchor(self) -> None:
+        self.unread("    name: &n CI passed\n",
+                    "not one plain or quoted scalar on its line: &n")
+
+    def test_refuses_an_alias(self) -> None:
+        self.unread("    env:\n      X: &n CI passed\n    name: *n\n",
+                    "not one plain or quoted scalar on its line: *n")
+
+    def test_refuses_a_quoted_key(self) -> None:
+        job = second("x").replace("    name: x", '    "name": CI passed')
+        r = self.gate("CI passed", "always()", job)
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("  ci-passed other\n", r.stdout)
+
+    def test_refuses_a_flow_style_job(self) -> None:
+        r = self.gate(
+            "CI passed", "always()",
+            "  other: {name: CI passed, needs: changes,"
+            " if: \"needs.changes.outputs.src == 'true'\"}\n",
+        )
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("  other: its id line holds an inline value", r.stdout)
+
+    def test_refuses_a_flow_mapping_below_the_id(self) -> None:
+        self.unread("    {name: CI passed}\n",
+                    "it is written as a flow mapping")
+
+    def test_refuses_a_merge_key(self) -> None:
+        self.unread("    <<: *base\n", "it merges a YAML alias (<<:)")
+
     # -- cleared ----------------------------------------------------------
 
     def test_clears_doppler_sanitizer_names(self) -> None:

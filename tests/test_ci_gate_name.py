@@ -256,6 +256,10 @@ class GateName(Harness):
                      "no job named 'CI passed'")
 
 
+#: How the walk refuses a job line that is not a key it reads.
+_NK = "a line at its key depth is not a plain key"
+
+
 def second(name: str, matrix: str = "", job: str = "other") -> str:
     """A second job, gated on changes, with this name and strategy.matrix.
 
@@ -439,10 +443,29 @@ class SecondJob(Harness):
 
     def test_refuses_a_flow_mapping_below_the_id(self) -> None:
         self.unread("    {name: CI passed}\n",
-                    "it is written as a flow mapping")
+                    _NK + ": {name: CI passed}")
 
     def test_refuses_a_merge_key(self) -> None:
-        self.unread("    <<: *base\n", "it merges a YAML alias (<<:)")
+        self.unread("    <<: *base\n", _NK + ": <<: *base")
+
+    # Key spellings YAML decodes to `name` (each checked with PyYAML) that
+    # no line pattern for `name:` sees: only a plain id-shaped key, or
+    # `"name"`/`'name'`, is read at the job's key depth (an allow-list).
+
+    def test_refuses_an_explicit_key(self) -> None:
+        self.unread("    ? name\n    : CI passed\n", _NK + ": ? name")
+
+    def test_refuses_a_hex_escaped_key(self) -> None:
+        self.unread('    "na\\x6de": CI passed\n',
+                    _NK + ': "na\\x6de": CI passed')
+
+    def test_refuses_a_unicode_escaped_key(self) -> None:
+        self.unread('    "\\u006eame": CI passed\n',
+                    _NK + ': "\\u006eame": CI passed')
+
+    def test_refuses_a_tagged_key(self) -> None:
+        self.unread("    !!str name: CI passed\n",
+                    _NK + ": !!str name: CI passed")
 
     # -- cleared ----------------------------------------------------------
 
@@ -465,6 +488,17 @@ class SecondJob(Harness):
         # already rule the name out, so nothing is resolved.
         self.clears("test (${{ matrix.os }}, ${{ fromJSON(x) }})")
         self.clears("Build on ${{ github.ref }}")
+
+    def test_clears_a_sequence_flush_with_its_key(self) -> None:
+        # `steps:` then `- name: x` at the SAME indent is valid YAML (doppler
+        # writes it), and a sequence item there is no key of the job.
+        job = second("build").replace(
+            "    steps:\n      - name: CI passed\n        run: 'true'\n",
+            "    steps:\n    - name: CI passed\n      run: 'true'\n",
+        )
+        r = self.gate("CI passed", "always()", job)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("4 job(s)", r.stdout)
 
     def test_clears_a_longer_literal(self) -> None:
         self.clears("CI passed (push, minimal set)")

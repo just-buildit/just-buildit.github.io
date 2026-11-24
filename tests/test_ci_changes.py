@@ -17,6 +17,11 @@ contents, so a change contents cannot show -- a mode, a symlink's type, a
 submodule the default diff hides -- beside a bump read as a bump alone.
 Now each path is read from its ``git diff --raw`` record.
 
+just-buildit.github.io#239: a release also moves versions written in a
+derived form, such as a package name carrying the ABI major.minor. A repo
+names them in ``CI_DERIVED_VERSION_TOKENS``; only a token as written is
+accepted, never a bare ``0.85 -> 0.86``.
+
 These cases moved here from an inline step in ci.yml, so the target has one
 home for its behaviour; the unittest job runs them.
 
@@ -87,6 +92,11 @@ PINNED = textwrap.dedent(
     sdist = { url = "https://x/pinned-1.2.3.tar.gz", hash = "sha256:bbbb" }
     """
 )
+
+#: doppler's package file name, whose ABI major.minor moves with a release
+#: (#239): the probed version is 0.85.0, the token libdoppler-dsp0.85.
+DEB_085 = "libdoppler-dsp0.85_0.85.0_amd64.deb"
+DEB_086 = "libdoppler-dsp0.86_0.86.0_amd64.deb"
 
 
 class CiChanges(unittest.TestCase):
@@ -317,6 +327,56 @@ class CiChanges(unittest.TestCase):
         self.commit("a path with a space")
         self.bump()
         self.write("src.c CHANGELOG.md", "b\n")
+        self.assertSrc("true")
+
+    # -- a derived token, configured by the repo (#239) ------------------
+    #
+    # doppler's release doc names its package with the ABI major.minor,
+    # which moves with the version but is not the version the probe reads.
+
+    def derived(self, tokens: str) -> None:
+        """Release 0.85.0 with ``tokens`` configured, then bump to 0.86.0.
+
+        The Makefile line lands in BASE, so the only changed paths are the
+        manifest and what each test then edits.
+        """
+        mk = MAKEFILE.replace(
+            "include standard.mk",
+            f"CI_DERIVED_VERSION_TOKENS = {tokens}\ninclude standard.mk",
+        )
+        self.assertNotEqual(mk, MAKEFILE)
+        self.write("Makefile", mk)
+        self.edit("pyproject.toml", 'version = "1.2.3"', 'version = "0.85.0"')
+        self.write("install.md", f"apt install ./{DEB_085}\n")
+        self.write("perf.md", "The suite took 0.85 seconds.\n")
+        self.commit("release 0.85.0")
+        self.edit("pyproject.toml", 'version = "0.85.0"', 'version = "0.86.0"')
+
+    def test_a_derived_token_moved_with_the_version_skips(self) -> None:
+        self.derived("libdoppler-dsp{major}.{minor}")
+        self.edit("install.md", DEB_085, DEB_086)
+        self.assertSrc("false")
+
+    def test_a_bare_derived_value_elsewhere_runs(self) -> None:
+        # The control: `0.85` is the old major.minor, but not inside a
+        # configured token, so this is a change, not a bump.
+        self.derived("libdoppler-dsp{major}.{minor}")
+        self.edit("install.md", DEB_085, DEB_086)
+        self.edit("perf.md", "took 0.85 seconds", "took 0.86 seconds")
+        self.assertSrc("true")
+
+    def test_a_derived_token_left_behind_on_a_changed_line_runs(
+        self,
+    ) -> None:
+        # The full version moved and the token did not: half a bump.
+        self.derived("libdoppler-dsp{major}.{minor}")
+        self.edit("install.md", "0.85.0_amd64", "0.86.0_amd64")
+        self.assertSrc("true")
+
+    def test_a_derived_token_without_the_variable_runs(self) -> None:
+        # Unset, nothing changes: the package name is more than a bump.
+        self.derived("")
+        self.edit("install.md", DEB_085, DEB_086)
         self.assertSrc("true")
 
     # -- the output contract ---------------------------------------------

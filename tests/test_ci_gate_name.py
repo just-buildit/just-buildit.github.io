@@ -46,8 +46,11 @@ def load_tests(loader, tests, ignore):
     return tests
 
 
-def workflow(name: str, cond: str | None) -> str:
-    """A wired ci.yml whose aggregator has this name and if: (None: none)."""
+def workflow(name: str, cond: str | None, extra: str = "") -> str:
+    """A wired ci.yml whose aggregator has this name and if: (None: none).
+
+    ``extra`` is appended: more jobs, indented as under ``jobs:``.
+    """
     agg = f"    name: {name}\n    needs: [changes, test]\n"
     if cond is not None:
         agg += f"    if: {cond}\n"
@@ -67,10 +70,13 @@ def workflow(name: str, cond: str | None) -> str:
         )
         + agg
         + "    runs-on: ubuntu-latest\n"
+        + extra
     )
 
 
-class GateName(unittest.TestCase):
+class Harness(unittest.TestCase):
+    """A throwaway repo and the target run in it; no tests of its own."""
+
     def setUp(self) -> None:
         self.tmp = pathlib.Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp)
@@ -85,9 +91,9 @@ class GateName(unittest.TestCase):
         )
         (self.tmp / ".github" / "workflows").mkdir(parents=True)
 
-    def gate(self, name: str, cond: str | None):
+    def gate(self, name: str, cond: str | None, extra: str = ""):
         (self.tmp / ".github" / "workflows" / "ci.yml").write_text(
-            workflow(name, cond)
+            workflow(name, cond, extra)
         )
         env = {k: v for k, v in os.environ.items() if k != "MAKEFLAGS"}
         return subprocess.run(
@@ -105,6 +111,10 @@ class GateName(unittest.TestCase):
         r = self.gate(name, cond)
         self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn(why, r.stdout + r.stderr)
+
+
+class GateName(Harness):
+    """The aggregator's own name and if: (#241)."""
 
     # -- expressions ------------------------------------------------------
 
@@ -239,12 +249,137 @@ class GateName(unittest.TestCase):
             "always()",
         )
         self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn("holds a backslash escape", r.stdout)
-        self.assertIn("  again", r.stdout)
+        self.assertIn("  again: a backslash escape", r.stdout)
 
     def test_a_literal_longer_name_is_no_aggregator(self) -> None:
         self.refuses("CI passed (push, minimal set)", "always()",
                      "no job named 'CI passed'")
+
+
+def second(name: str, matrix: str = "", job: str = "other") -> str:
+    """A second job, gated on changes, with this name and strategy.matrix.
+
+    Its ``if:`` is conditional on purpose: were it named the required
+    check, a false ``if:`` would report it SKIPPED, which branch
+    protection counts as passing -- the hazard of #243. ``matrix`` is the
+    YAML under ``matrix:``, indented as written in the job.
+    """
+    out = (
+        f"  {job}:\n"
+        f"    name: {name}\n"
+        "    needs: changes\n"
+        "    if: needs.changes.outputs.src == 'true'\n"
+        "    runs-on: ubuntu-latest\n"
+    )
+    if matrix:
+        out += "    strategy:\n      matrix:" + matrix + "\n"
+    out += "    steps:\n      - name: CI passed\n        run: 'true'\n"
+    return out
+
+
+class SecondJob(Harness):
+    """A second job whose name can EVALUATE to the required one (#243).
+
+    The aggregator is a valid literal ``CI passed`` throughout, so each
+    verdict is about the second job alone. A step named ``CI passed`` is
+    in each: a step's name is no check, and must not count as one.
+    """
+
+    def with_second(self, name: str, matrix: str = ""):
+        return self.gate("CI passed", "always()", second(name, matrix))
+
+    def clears(self, name: str, matrix: str = "") -> None:
+        r = self.with_second(name, matrix)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("4 job(s)", r.stdout)
+
+    def unreadable(self, name: str, matrix: str, why: str) -> None:
+        r = self.with_second(name, matrix)
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("  other: its name might be 'CI passed' and cannot be"
+                      " read", r.stdout)
+        self.assertIn(why, r.stdout)
+
+    def duplicate(self, name: str, matrix: str = "") -> None:
+        r = self.with_second(name, matrix)
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("more than one job that can be named 'CI passed'",
+                      r.stdout)
+        self.assertIn("  ci-passed other\n", r.stdout)
+
+    # -- refused ----------------------------------------------------------
+
+    def test_refuses_a_format_call(self) -> None:
+        self.unreadable("${{ format('CI {0}', 'passed') }}", "",
+                        "${{ format('CI {0}', 'passed') }}")
+
+    def test_refuses_a_matrix_hole_that_yields_the_name(self) -> None:
+        self.duplicate("CI ${{ matrix.w }}", "\n        w: [passed]")
+
+    def test_refuses_a_matrix_hole_with_no_matrix(self) -> None:
+        self.unreadable("${{ matrix.label }}", "",
+                        "the job has no strategy.matrix")
+
+    def test_refuses_a_matrix_key_the_matrix_lacks(self) -> None:
+        self.unreadable("${{ matrix.label }}", "\n        os: [a]",
+                        "matrix.label: no such key in strategy.matrix")
+
+    def test_refuses_a_dynamic_matrix(self) -> None:
+        self.unreadable("${{ matrix.label }}",
+                        " ${{ fromJSON(needs.plan.outputs.matrix) }}",
+                        "strategy.matrix is not literal")
+
+    def test_refuses_another_context(self) -> None:
+        self.unreadable("${{ github.workflow }}", "", "github.workflow")
+
+    def test_refuses_a_padded_single_quoted_name(self) -> None:
+        self.duplicate("' CI passed '")
+
+    def test_refuses_a_padded_double_quoted_name(self) -> None:
+        self.duplicate('" CI passed "')
+
+    def test_refuses_a_padded_matrix_value(self) -> None:
+        self.duplicate("${{ matrix.w }}", "\n        w: [' ci PASSED ']")
+
+    def test_refuses_a_name_set_by_include(self) -> None:
+        self.duplicate(
+            "${{ matrix.label }}",
+            "\n        os: [a, b]"
+            "\n        include:"
+            "\n          - os: a"
+            "\n            label: CI passed",
+        )
+
+    def test_refuses_a_list_of_maps_value_that_yields_the_name(self) -> None:
+        self.duplicate(
+            "${{ matrix.san.label }}",
+            "\n        san:\n          - { target: a, label: \"CI passed\" }",
+        )
+
+    # -- cleared ----------------------------------------------------------
+
+    def test_clears_doppler_sanitizer_names(self) -> None:
+        # doppler's ci.yml, verbatim: the labels are not the name.
+        self.clears(
+            "${{ matrix.san.label }}",
+            "\n        san:"
+            "\n          - { target: test-asan,"
+            ' label: "ASan + LSan (C suite)" }'
+            '\n          - { target: test-ubsan, label: "UBSan (C suite)" }'
+            '\n          - { target: test-tsan, label: "TSan (C suite)" }',
+        )
+
+    def test_clears_a_matrix_value_that_is_not_the_name(self) -> None:
+        self.clears("CI ${{ matrix.w }}", "\n        w: [failed, skipped]")
+
+    def test_clears_a_pattern_that_cannot_match_unread(self) -> None:
+        # No matrix at all, and an unreadable hole: the literal parts
+        # already rule the name out, so nothing is resolved.
+        self.clears("test (${{ matrix.os }}, ${{ fromJSON(x) }})")
+        self.clears("Build on ${{ github.ref }}")
+
+    def test_clears_a_longer_literal(self) -> None:
+        self.clears("CI passed (push, minimal set)")
 
 
 if __name__ == "__main__":

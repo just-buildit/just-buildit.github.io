@@ -1339,13 +1339,18 @@ ci-check-name: ## Print CI_CHECK_NAME, the aggregate check's name
 #     passed' || ... || '<other>' }}`, just-buildit.github.io#241), so a
 #     run that is not the gate -- doppler's minimal and skip pushes --
 #     reports under another name. scripts/ci-gate-name.py inspects that
-#     shape and never evaluates it. A job is taken for the aggregator when
-#     its literal name is CI_CHECK_NAME, or its name holds `${{` and the
-#     quoted literal 'CI_CHECK_NAME' (case aside), and two such jobs are
-#     refused, as is any job whose double-quoted `name:` holds a backslash
-#     escape (YAML decodes it, so it could spell the name unseen). A name
-#     that reaches the required value another way -- format(), a context
-#     such as `CI ${{ matrix.w }}` -- is NOT detected;
+#     shape and never evaluates it. The same script decides WHICH job is
+#     the aggregator, from every job's name, if: and lines, which this
+#     walk hands it; names are compared trimmed and case aside, and a job
+#     with no name is named its id. A name whose `${{ ... }}` holes, each
+#     matching anything, cannot make CI_CHECK_NAME is cleared; one built
+#     from `matrix.<key>[.<field>]` is resolved from the job's literal
+#     strategy.matrix (lists, lists of maps, include:); one wholly an
+#     expression holding 'CI_CHECK_NAME' is an aggregator expression.
+#     Anything else that might be the name -- format(), a fromJSON
+#     matrix, another context, a backslash escape in a double-quoted
+#     name -- is refused, naming the job, and so are two jobs that can
+#     carry it (just-buildit.github.io#243);
 #   - after the aggregator: it `needs:` it (a mirror trigger, a deploy) AND
 #     its `if:` says always(). Without a status function GitHub ANDs in
 #     success(), which is false when anything upstream was SKIPPED -- so on
@@ -1379,7 +1384,7 @@ ci-changes-wiring-check: ## Verify GATES_CI_FILE gates every job on the vendored
 	     echo "ci-changes-wiring-check: no $$ci — nothing to check"; \
 	     exit 0; \
 	 fi; \
-	 out=$$(awk -v agg='$(CI_CHECK_NAME)' -v always='$(CI_ALWAYS_RUN_JOBS)' ' \
+	 out=$$(awk -v always='$(CI_ALWAYS_RUN_JOBS)' ' \
 	   function lead(s) { match(s, /^ */); return RLENGTH } \
 	   function val(s) { sub(/^[^:]*:[[:space:]]*/, "", s); sub(/[[:space:]]+#.*$$/, "", s); \
 	                     gsub(/^["\047]|["\047]$$/, "", s); return s } \
@@ -1404,12 +1409,12 @@ ci-changes-wiring-check: ## Verify GATES_CI_FILE gates every job on the vendored
 	       job = $$0; sub(/^ */, "", job); sub(/:.*/, "", job); \
 	       order[++total] = job; ai = -1; inneeds = 0; next \
 	     } \
-	     text[job] = text[job] " " $$0; \
+	     text[job] = text[job] " " $$0; print "L " job " " $$0; \
 	     if (ai < 0) ai = n; \
 	     if (n == ai) { \
 	       inneeds = 0; \
 	       if ($$0 ~ /^ *uses:/) uses[job] = val($$0); \
-	       else if ($$0 ~ /^ *name:/) { nm[job] = val($$0); rawnm[job] = rawval($$0) } \
+	       else if ($$0 ~ /^ *name:/) rawnm[job] = rawval($$0); \
 	       else if ($$0 ~ /^ *if:/) iff[job] = rawval($$0); \
 	       else if ($$0 ~ /^ *needs:/) { v = val($$0); if (v == "") inneeds = 1; else addneeds(job, v) } \
 	       next \
@@ -1423,21 +1428,14 @@ ci-changes-wiring-check: ## Verify GATES_CI_FILE gates every job on the vendored
 	     for (i = 1; i <= total; i++) seen[order[i]] = 1; \
 	     for (k in isalways) if (!(k in seen)) print "STALE " k; \
 	     for (i = 1; i <= total; i++) { j = order[i]; \
-	       if (substr(rawnm[j], 1, 1) == "\"" && index(rawnm[j], "\\")) print "ESCNAME " j } \
-	     for (i = 1; i <= total; i++) { j = order[i]; \
-	       if (uses[j] ~ /^\.\/\.github\/workflows\/changes\.ya?ml$$/) c = j; \
-	       if (tolower(nm[j]) == tolower(agg) || (index(rawnm[j], "$${{") && index(tolower(rawnm[j]), "\047" tolower(agg) "\047"))) { \
-	         if (a != "") print "DUPAGG " a " " j; a = j } } \
+	       if (uses[j] ~ /^\.\/\.github\/workflows\/changes\.ya?ml$$/) c = j } \
 	     if (c == "") { print "NOCALL"; exit } \
-	     if (a == "") { print "NOAGG"; exit } \
-	     print "AGG " a; print "AGGNAME " rawnm[a]; print "AGGIF " iff[a]; \
 	     for (i = 1; i <= total; i++) { j = order[i]; \
-	       if (j == c || j == a || (j in isalways)) continue; \
-	       if (index(needs[j], " " a " ")) { \
-	         if (index(text[j], "always()")) continue; \
-	         print "NOALWAYS " j; continue } \
-	       if (index(needs[j], " " c " ") && index(text[j], "needs." c ".outputs")) continue; \
-	       print "UNGATED " j } \
+	       print "NAME " j " " rawnm[j]; print "IF " j " " iff[j]; \
+	       if (j == c || (j in isalways)) continue; \
+	       print "CLS " j " " (index(text[j], "always()") > 0) " " \
+	         (index(needs[j], " " c " ") && index(text[j], "needs." c ".outputs")) \
+	         " " needs[j] } \
 	   } \
 	 ' ji=-1 "$$ci"); \
 	 total=$$(printf '%s\n' "$$out" | sed -n 's/^TOTAL //p'); \
@@ -1456,31 +1454,15 @@ ci-changes-wiring-check: ## Verify GATES_CI_FILE gates every job on the vendored
 	     echo "      permissions: { checks: read, contents: read }"; \
 	     exit 1; \
 	 fi; \
-	 if printf '%s\n' "$$out" | grep -q '^NOAGG'; then \
-	     echo "ERROR: $$ci has no job named '$(CI_CHECK_NAME)' (CI_CHECK_NAME)."; \
-	     echo "  The aggregator is what turns a skipped matrix into a pass."; \
-	     exit 1; \
-	 fi; \
-	 esc=$$(printf '%s\n' "$$out" | sed -n 's/^ESCNAME //p'); \
-	 if [ -n "$$esc" ]; then \
-	     echo "ERROR: $$ci jobs whose double-quoted name: holds a backslash escape:"; \
-	     printf '%s\n' "$$esc" | sed 's/^/  /'; \
-	     echo "  YAML decodes it (\"CI\\x20passed\" is 'CI passed'), so such a name"; \
-	     echo "  can carry '$(CI_CHECK_NAME)' unseen. Write the character itself."; \
-	     exit 1; \
-	 fi; \
-	 dup=$$(printf '%s\n' "$$out" | sed -n 's/^DUPAGG //p'); \
-	 if [ -n "$$dup" ]; then \
-	     echo "ERROR: $$ci has more than one job that can be named '$(CI_CHECK_NAME)':"; \
-	     printf '%s\n' "$$dup" | sed 's/^/  /'; \
-	     echo "  Each reports a check of the required name on the same commit,"; \
-	     echo "  and a ruleset may read whichever is newest. Keep one."; \
-	     exit 1; \
-	 fi; \
-	 python3 scripts/ci-gate-name.py --check-name '$(CI_CHECK_NAME)' \
-	     --job "$$(printf '%s\n' "$$out" | sed -n 's/^AGG //p')" \
-	     --name "$$(printf '%s\n' "$$out" | sed -n 's/^AGGNAME //p')" \
-	     --if "$$(printf '%s\n' "$$out" | sed -n 's/^AGGIF //p')" || exit 1; \
+	 agg=$$(printf '%s\n' "$$out" | python3 scripts/ci-gate-name.py \
+	     --check-name '$(CI_CHECK_NAME)' --file "$$ci") \
+	     || { printf '%s\n' "$$agg"; exit 1; }; \
+	 agg=$$(printf '%s\n' "$$agg" | sed -n 's/^AGG //p'); \
+	 cls=$$(printf '%s\n' "$$out" | awk -v a="$$agg" ' \
+	   $$1 == "CLS" && $$2 != a { na = 0; \
+	     for (i = 5; i <= NF; i++) if ($$i == a) na = 1; \
+	     if (na) { if (!$$3) print "NOALWAYS " $$2 } \
+	     else if (!$$4) print "UNGATED " $$2 }'); \
 	 stale=$$(printf '%s\n' "$$out" | sed -n 's/^STALE //p'); \
 	 if [ -n "$$stale" ]; then \
 	     echo "ERROR: CI_ALWAYS_RUN_JOBS names jobs $$ci does not have:"; \
@@ -1489,7 +1471,7 @@ ci-changes-wiring-check: ## Verify GATES_CI_FILE gates every job on the vendored
 	     echo "  takes the name. Drop it."; \
 	     exit 1; \
 	 fi; \
-	 noalways=$$(printf '%s\n' "$$out" | sed -n 's/^NOALWAYS //p'); \
+	 noalways=$$(printf '%s\n' "$$cls" | sed -n 's/^NOALWAYS //p'); \
 	 if [ -n "$$noalways" ]; then \
 	     echo "ERROR: $$ci jobs after '$(CI_CHECK_NAME)' that can never run on a skipped tree:"; \
 	     printf '%s\n' "$$noalways" | sed 's/^/  /'; \
@@ -1499,7 +1481,7 @@ ci-changes-wiring-check: ## Verify GATES_CI_FILE gates every job on the vendored
 	     echo "    if: always() && needs.<aggregator-job>.result == 'success' && ..."; \
 	     exit 1; \
 	 fi; \
-	 bad=$$(printf '%s\n' "$$out" | sed -n 's/^UNGATED //p'); \
+	 bad=$$(printf '%s\n' "$$cls" | sed -n 's/^UNGATED //p'); \
 	 if [ -n "$$bad" ]; then \
 	     echo "ERROR: $$ci jobs that ignore the changes job:"; \
 	     printf '%s\n' "$$bad" | sed 's/^/  /'; \

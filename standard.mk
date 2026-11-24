@@ -1159,6 +1159,9 @@ version-check: ## [VERSION=x.y.z] Verify version strings agree
 # so does a changed line where a configured token stayed. Empty by default;
 # a repo sets it in its own Makefile, and it reaches the recipe through the
 # environment, so braces and quotes arrive untouched.
+# Keep each template specific: a bare `{minor}` or `{major}.{minor}` is
+# accepted on ANY changed line, source code included, so it widens what a
+# bump may change to every such number in the tree.
 #
 # Each path is read from its `git diff --raw` record -- its old and new
 # mode, and the two blobs compared -- never from a list of names: a name

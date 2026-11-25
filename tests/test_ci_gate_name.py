@@ -463,6 +463,32 @@ class SecondJob(Harness):
         self.unread('    "\\u006eame": CI passed\n',
                     _NK + ': "\\u006eame": CI passed')
 
+    # A second `name:` at key depth is text a multi-line value swallowed:
+    # YAML reads the FIRST as the name below, and the walk, keeping the
+    # last, saw `build`. A mapping cannot repeat a key, so two are refused.
+
+    _MULTI = "it has more than one name: line at its key depth"
+
+    def swallowed(self, before: str, after: str) -> None:
+        job = (
+            "  other:\n    name: CI passed\n" + before
+            + "    needs: changes\n"
+            "    if: needs.changes.outputs.src == 'true'\n"
+            "    runs-on: ubuntu-latest\n" + after
+        )
+        r = self.gate("CI passed", "always()", job)
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(f"  other: {self._MULTI}", r.stdout)
+
+    def test_refuses_a_name_swallowed_by_a_quoted_step(self) -> None:
+        self.swallowed("", '    steps:\n    - "x\n    name: build"\n')
+
+    def test_refuses_a_name_swallowed_by_a_flow_step(self) -> None:
+        self.swallowed("", "    steps:\n    - {run: x,\n    name: build}\n")
+
+    def test_refuses_a_name_swallowed_by_a_flow_env(self) -> None:
+        self.swallowed("    env: {A: 'x\n    name: build'}\n", "")
+
     def test_refuses_a_tagged_key(self) -> None:
         self.unread("    !!str name: CI passed\n",
                     _NK + ": !!str name: CI passed")

@@ -1358,7 +1358,15 @@ ci-check-name: ## Print CI_CHECK_NAME, the aggregate check's name
 #     ways no pattern for it sees (`? name`, `"na\x6de"`, `!!str name`,
 #     a flow mapping, a `<<:` merge). The walk marks those UNREAD; the
 #     script refuses a block scalar, a tag, an anchor, an alias or an
-#     unclosed quote by its first character;
+#     unclosed quote by its first character. A job with MORE THAN ONE
+#     `name:` line at key depth is UNREAD too: a mapping cannot repeat a
+#     key, so all but one are text a multi-line quoted or flow value
+#     swallowed (`- "x` / `name: build"`), and the walk cannot tell
+#     which. That is enough because the walk is never blind to the real
+#     name: YAML's name is always one of the key-depth name lines the walk
+#     sees. With exactly one, it is the real name, or it was swallowed and
+#     YAML has none -- the job is then named its id, which cannot hold a
+#     space, so it cannot be a CI_CHECK_NAME such as 'CI passed';
 #   - after the aggregator: it `needs:` it (a mirror trigger, a deploy) AND
 #     its `if:` says always(). Without a status function GitHub ANDs in
 #     success(), which is false when anything upstream was SKIPPED -- so on
@@ -1434,6 +1442,7 @@ ci-changes-wiring-check: ## Verify GATES_CI_FILE gates every job on the vendored
 	           unread[job] = "a line at its key depth is not a plain key: " v } \
 	       if ($$0 ~ /^ *uses:/) uses[job] = val($$0); \
 	       else if ($$0 ~ /^ *(name|"name"|\047name\047)[[:space:]]*:([[:space:]]|$$)/) { \
+	         if (++nnm[job] > 1) unread[job] = "it has more than one name: line at its key depth"; \
 	         rawnm[job] = rawval($$0); nmline = 1; \
 	         if (rawnm[job] == "") unread[job] = "its name: is empty on its own line" } \
 	       else if ($$0 ~ /^ *if:/) iff[job] = rawval($$0); \

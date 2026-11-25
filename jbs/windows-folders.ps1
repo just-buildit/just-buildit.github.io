@@ -40,11 +40,14 @@
     a Known Folder Move policy (KFMSilentOptIn, KFMBlockOptOut under
     HKLM:\SOFTWARE\Policies\Microsoft\OneDrive) is set -- nothing is moved
     and OneDrive is not uninstalled; that is a separate choice. It is
-    reported, and PowerShell is fixed anyway: the jbx block goes in the
-    LOCAL Documents' profiles, and each redirected profile gets, in the
-    block's place, a stub that dot-sources its local twin. Lines of the
-    user's own outside the block are kept, and a profile that cannot be
-    read is never written (get-jb.ps1's Write-JbProfile decides that).
+    reported, and the jbx block still goes in the LOCAL Documents'
+    profiles, ready for when the folders move back. Nothing is ever written
+    under OneDrive: it is unreliable -- a profile there can be an
+    online-only placeholder nothing can read (#202) -- so until Documents
+    is local, PowerShell, which reads its profile from Documents as Windows
+    resolves it, does not load jbx, and the result line says so. A profile
+    that cannot be read is never written (get-jb.ps1's Write-JbProfile
+    decides that).
 
     The last line of output is `result: <summary>`, which setup-system puts
     in its summary; every line before it is progress.
@@ -228,21 +231,6 @@ function Get-JbJbxBlock {
     Get-JbProfileBlock -Bash $bash -Driver $driver
 }
 
-function Get-JbProfileStub {
-    <#
-    .SYNOPSIS
-        The block body for a profile Windows still reads from OneDrive: it
-        loads the local profile, where the jbx functions are.
-    #>
-    param([Parameter(Mandatory)][string]$Local)
-    $q = $Local -replace "'", "''"
-    @(
-        '# Documents is still redirected to OneDrive, so this profile only'
-        '# loads its local twin, where setup-system put jbx (#204). Written'
-        '# by setup-system''s folders step; it goes when the folders move back.'
-        "if (Test-Path -LiteralPath '$q') { . '$q' }"
-    )
-}
 
 function Invoke-JbKnownFolderRestore {
     <#
@@ -286,23 +274,22 @@ function Invoke-JbKnownFolderRestore {
         Write-Output ("not moved: $($why -join ', '), so OneDrive would redirect " +
             'them again. Quit OneDrive or stop its folder backup (and clear the ' +
             'policy), then re-run: setup-system -s folders')
-        $note = 'profile stub not needed'
+        $note = 'no profile needed'
         if ($docs -and $profiles) {
+            # Local only: nothing is written under OneDrive (#202). PowerShell
+            # reads the redirected profile until Documents moves back, so jbx
+            # is not loaded there until then -- the note says so.
             $block = Get-JbJbxBlock
             if (-not $block) {
                 $note = 'no jbx profile block to keep'
             } elseif ($DryRun) {
-                Write-Output "would put jbx in $(Join-Path $docs.Local '*\profile.ps1') and a stub loading it in $(Join-Path $docs.Path '*\profile.ps1')"
-                $note = 'profile stub (dry run)'
+                Write-Output "would put jbx in $(Join-Path $docs.Local '*\profile.ps1'); nothing under OneDrive"
+                $note = 'local profile (dry run)'
             } else {
                 $local = @(Get-JbProfilePath -Documents $docs.Local)
-                $remote = @(Get-JbProfilePath -Documents $docs.Path)
                 $skipped = @(Write-JbProfileAll -Path $local -Body $block)
-                for ($i = 0; $i -lt $remote.Count; $i++) {
-                    $skipped += @(Write-JbProfileAll -Path $remote[$i] -Body (Get-JbProfileStub -Local $local[$i]))
-                }
-                $note = 'profile stub written'
-                if ($skipped.Count -gt 0) { $note = "profile stub written; skipped $($skipped -join ', ')" }
+                $note = 'jbx in the local profile; PowerShell loads it once Documents is local'
+                if ($skipped.Count -gt 0) { $note += "; skipped $($skipped -join ', ')" }
             }
         }
         Write-Output "result: skipped ($names on OneDrive: $($why -join ', '); $note)"

@@ -39,10 +39,14 @@
     PowerShell 5.1 (Documents\WindowsPowerShell\profile.ps1) and PowerShell
     7 (Documents\PowerShell\profile.ps1), so the block is written to BOTH:
     a machine that only has 5.1 today gets pwsh 7 from setup-system, and
-    jbx should work there the moment it is installed. Documents is resolved
-    through Windows, so a OneDrive-redirected Documents folder is honoured.
-    JB_PS_PROFILE names the file to use instead (tests, or a custom
-    profile).
+    jbx should work there the moment it is installed. Documents is always
+    the LOCAL one, %USERPROFILE%\Documents, never a folder OneDrive
+    redirects it to: OneDrive is unreliable, and a profile there can be an
+    online-only placeholder nothing can read (#202). While Documents is
+    still redirected, PowerShell reads its profile from there instead, so
+    a warning names `jbx setup-system -s folders`, which moves it back
+    (#204). JB_PS_PROFILE names the file to use instead (tests, or a
+    custom profile).
 
     A profile that cannot be read is never written: its content may exist
     nowhere else. The usual case is a OneDrive online-only file under a
@@ -256,8 +260,10 @@ function Get-JbProfilePath {
         JB_PS_PROFILE, when set, names the only ones: one path, or several
         separated like PATH (`;` on Windows, `:` elsewhere). On Windows,
         otherwise, the CurrentUserAllHosts profile of both editions -- 5.1
-        and 7 read different files -- under Documents as Windows resolves
-        it. Elsewhere (pwsh on Linux or macOS), this host's own.
+        and 7 read different files -- under the LOCAL Documents,
+        %USERPROFILE%\Documents, whatever Windows resolves Documents to:
+        nothing is ever written under OneDrive (#202). Elsewhere (pwsh on
+        Linux or macOS), this host's own.
 
         -Documents names the Documents folder instead, and then only it
         decides: both editions' profiles under it, whatever JB_PS_PROFILE
@@ -275,7 +281,7 @@ function Get-JbProfilePath {
                 Where-Object { $_ })
         }
         if (-not (Test-JbWindows)) { return $PROFILE.CurrentUserAllHosts }
-        $Documents = [Environment]::GetFolderPath('MyDocuments')
+        $Documents = Join-Path $env:USERPROFILE 'Documents'
     }
     foreach ($edition in 'WindowsPowerShell', 'PowerShell') {
         Join-Path (Join-Path $Documents $edition) 'profile.ps1'
@@ -627,14 +633,19 @@ function Write-JbProfileAll {
     .DESCRIPTION
         One unreadable profile does not stop the others: each is reported
         as it is met, and the caller fails the run once the rest of the
-        install is done.
+        install is done. A profile that did not exist is created, and the
+        line says so: a fresh box has none, and the file it now has should
+        not come as a surprise.
     #>
     param([Parameter(Mandatory)][string[]]$Path, [Parameter(Mandatory)][string[]]$Body)
     foreach ($p in $Path) {
+        $created = -not (Test-Path -LiteralPath $p)
         $why = Write-JbProfile -Path $p -Body $Body
         if ($why) {
             Write-Warning $why
             $p
+        } elseif ($created) {
+            Write-Information "  ok  created local profile $p, with the jbx function"
         } else {
             Write-Information "  ok  jbx function in $p"
         }
@@ -753,6 +764,18 @@ function Install-JustBashit {
     $skipped = @(Write-JbProfileAll -Path @(Get-JbProfilePath) -Body $block)
     . ([scriptblock]::Create($block -join "`n"))
 
+    if ((Test-JbWindows) -and -not $env:JB_PS_PROFILE) {
+        # The profile went in the local Documents; PowerShell reads the one
+        # under Documents as Windows resolves it. Different means a
+        # redirect (OneDrive's Known Folder Move) is still in place.
+        $local = Join-Path $env:USERPROFILE 'Documents'
+        $resolved = [Environment]::GetFolderPath('MyDocuments')
+        if ($resolved -and ($resolved.TrimEnd('\') -ne $local.TrimEnd('\'))) {
+            Write-Warning ("Documents is redirected to $resolved, so new PowerShell " +
+                "sessions will not load jbx from $local. Move it back: " +
+                'jbx setup-system -s folders')
+        }
+    }
     if (Test-JbWindows) {
         $policy = Get-ExecutionPolicy
         if ($policy -eq 'Restricted' -or $policy -eq 'AllSigned' -or $policy -eq 'Undefined') {

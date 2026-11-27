@@ -99,9 +99,15 @@ A re-cut:
    refused too: a stale list is a mistake. A head with no record (a train
    cut before ``source`` existed) is read from GitHub, which holds a
    closed PR's head where the train left it.
-3. Composes from those heads exactly as above, every refusal intact
+3. Refuses when ``T``'s own branch carries a commit that is not one of
+   its recorded picks: one that carries no recorded ``source``'s diff and
+   message. A re-cut composes from the constituents alone, so a fix
+   pushed straight onto the train would be dropped without a word (#250).
+   Each such commit is named; move it onto the constituent that needs it
+   (then ``--moved``), or rebase the train in place instead.
+4. Composes from those heads exactly as above, every refusal intact
    except that a constituent may be closed, since the train closed it.
-4. With ``--push``, and only once the gate has passed on the combined
+5. With ``--push``, and only once the gate has passed on the combined
    tree: closes ``T``; reopens each closed constituent. If GitHub refuses
    to reopen an accepted moved PR, pushes its branch back to the closed
    head (``--force-with-lease`` pinned to the new head), reopens it, and
@@ -541,6 +547,25 @@ def constituents(body: str) -> dict[int, str | None]:
     [3]
     """
     heads: dict[int, str | None] = {}
+    for n, src in rows(body):
+        heads[n] = src
+    return heads
+
+
+def rows(body: str) -> list[tuple[int, str | None]]:
+    """Every row of a train body's table, in order: ``(from, source)``.
+
+    One row per commit the train picked, so this is also the list of its
+    recorded picks (``extra_commits``). ``source`` is None for a train cut
+    before that column existed.
+
+    >>> body = ("| commit | from | source |\\n|---|---|---|\\n"
+    ...         "| `a` | #3 | `" + "1" * 40 + "` |\\n"
+    ...         "| `c` | #5 |\\n")
+    >>> [(n, s and s[:4]) for n, s in rows(body)]
+    [(3, '1111'), (5, None)]
+    """
+    out: list[tuple[int, str | None]] = []
     inside = False
     for line in body.splitlines():
         if HEADER.match(line):
@@ -553,8 +578,55 @@ def constituents(body: str) -> dict[int, str | None]:
             continue
         m = ROW.search(line)
         if m:
-            heads[int(m.group(1))] = m.group(2)
-    return heads
+            out.append((int(m.group(1)), m.group(2)))
+    return out
+
+
+def extra_commits(
+    old: dict[str, Any], remote: str, base: str
+) -> list[str]:
+    """The commits on train ``old``'s head that are not its recorded picks.
+
+    A re-cut composes from the constituents alone, so a commit pushed
+    straight onto the train's branch -- a fix that belongs on a
+    constituent -- is in no constituent, and a re-cut drops it without a
+    word (#250). The train's commits over ``base`` are read from its head
+    (``refs/pull/<T>/head``, which GitHub keeps for a closed PR too), and
+    each must carry exactly the diff and message (``same_commit``) of a
+    ``source`` its table records. A source not in this clone is fetched by
+    sha. A row with no source to compare -- a train cut before that column
+    existed, or a source the remote no longer serves -- vouches for one
+    commit that matched nothing, oldest first; only the commits beyond
+    those are extra. Returned oldest first.
+    """
+    t = old["number"]
+    ref = f"refs/train/recut-{t}"
+    git("fetch", "--quiet", "--no-tags", remote, f"+refs/pull/{t}/head:{ref}")
+    if git("rev-parse", ref) != old["headRefOid"]:
+        raise RefusedError(
+            f"the train #{t} is not at {old['headRefOid'][:9]}, the head "
+            "GitHub reports; it moved, re-run"
+        )
+    commits = git(
+        "rev-list", "--reverse", f"{remote}/{base}..{ref}"
+    ).split()
+    picks = [src for _, src in rows(old["body"])]
+
+    def have(sha: str) -> bool:
+        return not run(
+            "git", "cat-file", "-e", f"{sha}^{{commit}}", check=False
+        ).returncode
+
+    known = []
+    for src in picks:
+        if src and not have(src):
+            git("fetch", "--quiet", "--no-tags", remote, src, check=False)
+        if src and have(src):
+            known.append(src)
+    unvouched = [
+        c for c in commits if all(same_commit(s, c) for s in known)
+    ]
+    return unvouched[len(picks) - len(known):]
 
 
 def subject(sha: str) -> str:
@@ -992,6 +1064,9 @@ def compose(args: argparse.Namespace) -> int:
             ):
                 ref = "refs/train/" + r.format(n)
                 git("update-ref", "-d", ref, check=False)
+        if args.recut:
+            git("update-ref", "-d", f"refs/train/recut-{args.recut}",
+                check=False)
 
 
 def compose_train(args: argparse.Namespace) -> int:
@@ -1092,6 +1167,20 @@ def compose_train(args: argparse.Namespace) -> int:
             "-- or pass TRAIN_BRANCH=<another name>"
         )
 
+    if old is not None:
+        extra = extra_commits(old, args.remote, args.base)
+        if extra:
+            raise RefusedError(
+                f"the train #{args.recut}'s branch {old['headRefName']} "
+                "carries commit(s) that are not its recorded picks, and a "
+                "re-cut composes from the constituents alone, so it would "
+                "drop them:\n"
+                + "".join(f"  {c[:9]} {subject(c)}\n" for c in extra)
+                + "Move each onto the constituent that needs it and name "
+                "that PR in MOVED= once the new head is reviewed, or "
+                "rebase the train in place (gh pr update-branch "
+                f"{args.recut} --rebase) instead of re-cutting it"
+            )
     start = git(
         "symbolic-ref", "--quiet", "--short", "HEAD", check=False
     ) or git("rev-parse", "HEAD")

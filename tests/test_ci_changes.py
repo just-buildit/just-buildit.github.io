@@ -388,7 +388,18 @@ class CiChanges(unittest.TestCase):
         missing = self.repo.parent / (self.repo.name + "-no-such-dir")
         got, why = self.classify(TMPDIR=str(missing))
         self.assertEqual(got, "true", why)
-        self.assertIn(f"cannot create a temp directory in {missing}", why)
+        # One line, and not a refusal: the job carried on, so nothing
+        # above src=true may read as an ERROR. GNU make 4.4 warns about the
+        # TMPDIR itself (`make: TMPDIR value ...`); that line is make's.
+        ours = [ln for ln in why.splitlines() if not ln.startswith("make:")]
+        self.assertEqual(
+            ours,
+            [
+                f"ci-changes: cannot create a temp directory in {missing}; "
+                "running everything"
+            ],
+        )
+        self.assertNotIn("ERROR", why)
 
     # -- the output contract ---------------------------------------------
 

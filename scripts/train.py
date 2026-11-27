@@ -104,7 +104,10 @@ A re-cut:
    message. A re-cut composes from the constituents alone, so a fix
    pushed straight onto the train would be dropped without a word (#250).
    Each such commit is named; move it onto the constituent that needs it
-   (then ``--moved``), or rebase the train in place instead.
+   (then ``--moved``), or rebase the train in place instead. A clean merge
+   (GitHub's "Update branch") is skipped; a merge whose own combined diff
+   is not empty -- a conflict resolution -- is refused with its own
+   message, since no constituent holds it.
 4. Composes from those heads exactly as above, every refusal intact
    except that a constituent may be closed, since the train closed it.
 5. With ``--push``, and only once the gate has passed on the combined
@@ -547,25 +550,27 @@ def constituents(body: str) -> dict[int, str | None]:
     [3]
     """
     heads: dict[int, str | None] = {}
-    for n, src in rows(body):
+    for n, src, _ in rows(body):
         heads[n] = src
     return heads
 
 
-def rows(body: str) -> list[tuple[int, str | None]]:
-    """Every row of a train body's table, in order: ``(from, source)``.
+def rows(body: str) -> list[tuple[int, str | None, str]]:
+    """Every row of a train body's table, in order: ``(from, source,
+    subject)``.
 
     One row per commit the train picked, so this is also the list of its
     recorded picks (``extra_commits``). ``source`` is None for a train cut
-    before that column existed.
+    before that column existed; ``subject`` is the pick's, as ``body_for``
+    wrote it in the ``commit`` column.
 
     >>> body = ("| commit | from | source |\\n|---|---|---|\\n"
     ...         "| `a` | #3 | `" + "1" * 40 + "` |\\n"
-    ...         "| `c` | #5 |\\n")
-    >>> [(n, s and s[:4]) for n, s in rows(body)]
-    [(3, '1111'), (5, None)]
+    ...         "| `c | d` | #5 |\\n")
+    >>> [(n, s and s[:4], t) for n, s, t in rows(body)]
+    [(3, '1111', 'a'), (5, None, 'c | d')]
     """
-    out: list[tuple[int, str | None]] = []
+    out: list[tuple[int, str | None, str]] = []
     inside = False
     for line in body.splitlines():
         if HEADER.match(line):
@@ -578,7 +583,9 @@ def rows(body: str) -> list[tuple[int, str | None]]:
             continue
         m = ROW.search(line)
         if m:
-            out.append((int(m.group(1)), m.group(2)))
+            subj = line[: m.start()].strip()
+            subj = subj.removeprefix("| `").removesuffix("`")
+            out.append((int(m.group(1)), m.group(2), subj))
     return out
 
 
@@ -591,13 +598,22 @@ def extra_commits(
     straight onto the train's branch -- a fix that belongs on a
     constituent -- is in no constituent, and a re-cut drops it without a
     word (#250). The train's commits over ``base`` are read from its head
-    (``refs/pull/<T>/head``, which GitHub keeps for a closed PR too), and
-    each must carry exactly the diff and message (``same_commit``) of a
-    ``source`` its table records. A source not in this clone is fetched by
-    sha. A row with no source to compare -- a train cut before that column
-    existed, or a source the remote no longer serves -- vouches for one
-    commit that matched nothing, oldest first; only the commits beyond
-    those are extra. Returned oldest first.
+    (``refs/pull/<T>/head``, which GitHub keeps for a closed PR too).
+
+    A merge commit -- GitHub's default "Update branch" makes one -- is
+    never a pick. A clean one (``git diff-tree --cc`` prints nothing: the
+    result is one parent's side in every hunk) carries nothing a re-cut
+    drops, and is skipped. One whose combined diff is not empty resolved a
+    conflict or changed code in the merge itself, and that is in no
+    constituent: it is refused here, with its own message.
+
+    Each other commit must carry exactly the diff and message
+    (``same_commit``) of a ``source`` the table records; a source not in
+    this clone is fetched by sha. A row with no source to compare -- a
+    train cut before that column existed, or a source the remote no longer
+    serves -- vouches for the oldest unmatched commit carrying the subject
+    it records, so an extra commit is never taken for a pick by position.
+    Returned oldest first.
     """
     t = old["number"]
     ref = f"refs/train/recut-{t}"
@@ -607,10 +623,26 @@ def extra_commits(
             f"the train #{t} is not at {old['headRefOid'][:9]}, the head "
             "GitHub reports; it moved, re-run"
         )
-    commits = git(
-        "rev-list", "--reverse", f"{remote}/{base}..{ref}"
-    ).split()
-    picks = [src for _, src in rows(old["body"])]
+    span = f"{remote}/{base}..{ref}"
+    evil = [
+        m
+        for m in git("rev-list", "--reverse", "--merges", span).split()
+        if git("diff-tree", "--cc", "--no-commit-id", m)
+    ]
+    if evil:
+        raise RefusedError(
+            f"the train #{t}'s branch {old['headRefName']} carries merge "
+            "commit(s) whose own diff is not empty (`git diff-tree --cc`): "
+            "a conflict resolution or a change made in the merge, which no "
+            "constituent holds and a re-cut would drop:\n"
+            + "".join(f"  {m[:9]} {subject(m)}\n" for m in evil)
+            + "Rebase the train in place (gh pr update-branch "
+            f"{t} --rebase) instead of re-cutting it, or rebase the "
+            "constituent that conflicted onto the base and re-cut once no "
+            "merge carries a resolution"
+        )
+    commits = git("rev-list", "--reverse", "--no-merges", span).split()
+    table = rows(old["body"])
 
     def have(sha: str) -> bool:
         return not run(
@@ -618,15 +650,22 @@ def extra_commits(
         ).returncode
 
     known = []
-    for src in picks:
+    unsourced = []
+    for _, src, subj in table:
         if src and not have(src):
             git("fetch", "--quiet", "--no-tags", remote, src, check=False)
         if src and have(src):
             known.append(src)
+        else:
+            unsourced.append(subj)
     unvouched = [
         c for c in commits if all(same_commit(s, c) for s in known)
     ]
-    return unvouched[len(picks) - len(known):]
+    for subj in unsourced:
+        match = next((c for c in unvouched if subject(c) == subj), None)
+        if match:
+            unvouched.remove(match)
+    return unvouched
 
 
 def subject(sha: str) -> str:

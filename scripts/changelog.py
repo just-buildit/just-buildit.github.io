@@ -323,9 +323,18 @@ def by_section(
     ls-tree`` prints them. Each list is sorted, so the assembled order is
     a property of the tree, not of the order a listing returned.
 
-    >>> by_section(["d/fixed/b.md", "d/added/a.md", "d/fixed/README.md",
-    ...             "d/x.md", "d/fixed/n/c.md", "d/fixed/a.md"],
-    ...            "d/", ["added", "fixed"])
+    >>> by_section(
+    ...     [
+    ...         "d/fixed/b.md",
+    ...         "d/added/a.md",
+    ...         "d/fixed/README.md",
+    ...         "d/x.md",
+    ...         "d/fixed/n/c.md",
+    ...         "d/fixed/a.md",
+    ...     ],
+    ...     "d/",
+    ...     ["added", "fixed"],
+    ... )
     {'added': ['d/added/a.md'], 'fixed': ['d/fixed/a.md', 'd/fixed/b.md']}
     """
     paths = list(paths)
@@ -567,7 +576,9 @@ def check(
         added = [
             p
             for s, p in changed
-            if s == "A" and p.startswith(frag) and p.endswith(".md")
+            if s == "A"
+            and p.startswith(frag)
+            and p.endswith(".md")
             and not p.endswith("README.md")
         ]
         consumed = any(
@@ -606,7 +617,9 @@ def check(
             why = (
                 "assembled"
                 if consumed
-                else f"{len(added)} fragment(s)" if added else "no code changes"
+                else f"{len(added)} fragment(s)"
+                if added
+                else "no code changes"
             )
             print(f"changelog-check: OK ({why})")
 
@@ -649,8 +662,9 @@ def released_edits(
     >>> old = "## [Unreleased]\\n\\n## [1.0]\\n\\n- one\\n"
     >>> released_edits(old, old + "- new\\n")
     [('1.0', 'changed')]
-    >>> released_edits(old, old.replace("## [Unreleased]\\n",
-    ...                                 "## [Unreleased]\\n\\n## [1.1]\\n"))
+    >>> released_edits(
+    ...     old, old.replace("## [Unreleased]\\n", "## [Unreleased]\\n\\n## [1.1]\\n")
+    ... )
     []
     >>> released_edits(old, old.replace("## [1.0]\\n", "## [1.0]\\n\\n## [1.0]\\n"))
     [('1.0', 'duplicated')]
@@ -772,8 +786,7 @@ def last_release(tags: Iterable[str]) -> Optional[str]:
     ``v0.1.9-100190b``), a pre-release, a tag without the ``v``
     (just-makeit's ``0.9.0``).
 
-    >>> last_release(["v0.9.0", "v0.10.0", "v0.1.9-100190b", "0.11.0",
-    ...               "v1.0.0rc1"])
+    >>> last_release(["v0.9.0", "v0.10.0", "v0.1.9-100190b", "0.11.0", "v1.0.0rc1"])
     'v0.10.0'
     >>> last_release(["0.9.0"]) is None
     True

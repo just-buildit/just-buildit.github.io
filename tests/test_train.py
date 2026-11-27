@@ -1208,12 +1208,34 @@ class Recuts(Fixture):
             sh(self.work, "git", "commit", "--quiet", "--amend", "--no-edit")
         else:
             sh(self.work, "git", "commit", "--quiet", "-m", msg)
+        return self.publish_train()
+
+    def publish_train(self) -> str:
+        """Pushes the local train/1-2 as the train's branch, and switches
+        back to main."""
         # GitHub follows the open train's branch with refs/pull/99/head.
         for ref in ("refs/heads/train/1-2", "refs/pull/99/head"):
             sh(self.work, "git", "push", "--quiet", "-f", "origin",
                f"train/1-2:{ref}")
         sh(self.work, "git", "switch", "--quiet", "main")
         return sh(self.work, "git", "rev-parse", "train/1-2")
+
+    def update_branch(self, edit: str = "") -> str:
+        """GitHub's default "Update branch": main moves on, and the train
+        merges it. ``edit`` rewrites a.txt inside the merge itself, as a
+        conflict resolution does."""
+        (self.work / "main.txt").write_text("main moved\n")
+        self.commit("main moves on")
+        sh(self.work, "git", "push", "--quiet", "origin", "HEAD:main")
+        sh(self.work, "git", "switch", "--quiet", "train/1-2")
+        sh(self.work, "git", "merge", "--quiet", "--no-ff", "--no-commit",
+           "origin/main")
+        if edit:
+            (self.work / "a.txt").write_text(edit)
+            sh(self.work, "git", "add", "-A")
+        sh(self.work, "git", "commit", "--quiet", "-m",
+           "Merge branch 'main' into train/1-2")
+        return self.publish_train()
 
     def assertDropRefused(self, p, extra: str, subj: str) -> None:
         self.assertRefused(p, "carries commit(s) that are not its recorded")
@@ -1244,16 +1266,57 @@ class Recuts(Fixture):
         p = self.train("--recut", "99")
         self.assertDropRefused(p, extra, "change 2")
 
-    def test_a_pre_source_train_still_names_the_extra(self) -> None:
-        # No source to compare: each row vouches for one commit, oldest
-        # first, so the one beyond the table's two rows is extra.
+    def pre_source(self) -> None:
+        """Strips the source column, as a train cut before it existed."""
         body = self.state["prs"]["99"]["body"]
         for h in self.heads.values():
             body = body.replace(f" `{h}` |", "")
+        self.assertEqual(train.constituents(body), {1: None, 2: None})
         self.state["prs"]["99"]["body"] = body
+
+    def test_a_pre_source_train_still_names_the_extra(self) -> None:
+        # No source to compare: each row vouches for the commit carrying
+        # the subject it records, so the one no row names is extra.
+        self.pre_source()
         extra = self.onto_train("fix pushed onto the train")
         p = self.train("--recut", "99")
         self.assertDropRefused(p, extra, "fix pushed onto the train")
+
+    def test_a_pre_source_train_names_an_extra_below_its_picks(self) -> None:
+        # The extra is the OLDEST commit: vouching by position would take
+        # it for the first pick and name the last pick instead.
+        self.pre_source()
+        sh(self.work, "git", "switch", "--quiet", "-C", "train/1-2",
+           "origin/main")
+        (self.work / "fix.txt").write_text("fix\n")
+        extra = self.commit("fix pushed onto the train")
+        sh(self.work, "git", "cherry-pick", "--quiet",
+           f"origin/main..{self.old}")
+        self.publish_train()
+        p = self.train("--recut", "99")
+        self.assertDropRefused(p, extra, "fix pushed onto the train")
+        self.assertNotRegex(p.stdout, r"(?m)^  [0-9a-f]{9} change [12]$")
+
+    def test_a_clean_update_branch_merge_is_not_extra(self) -> None:
+        # GitHub's default "Update branch" merges main into the train. The
+        # merge carries nothing a re-cut drops, so it re-cuts.
+        self.update_branch()
+        p = self.train("--recut", "99")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("dry run OK", p.stdout)
+
+    def test_a_merge_that_resolves_something_is_refused(self) -> None:
+        # A change made in the merge itself (a conflict resolution) is in
+        # no constituent; moving a commit cannot carry it, so the refusal
+        # says so in its own words.
+        merge = self.update_branch(edit="resolved\n")
+        p = self.train("--recut", "99")
+        self.assertRefused(p, "carries merge commit(s) whose own diff")
+        self.assertIn(
+            f"  {merge[:9]} Merge branch 'main' into train/1-2\n", p.stdout
+        )
+        self.assertIn("gh pr update-branch 99 --rebase", p.stdout)
+        self.assertNotIn("MOVED=", p.stdout)
 
     def test_a_merged_train(self) -> None:
         self.state["prs"]["99"]["state"] = "MERGED"

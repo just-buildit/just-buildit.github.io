@@ -96,35 +96,81 @@ class MissingTmpdir(unittest.TestCase):
 class EverySiteRefuses(unittest.TestCase):
     """The form every temp-file site in standard.mk must take."""
 
+    #: Any reference to either macro, in either make spelling. The
+    #: definitions' own ``$(_STD_TMP_REFUSE)`` is a different name.
+    USE = re.compile(r"\$[({]_STD_TMP(?:DIR)?[)}]")
+    #: What must follow it: the command substitution closing, then a
+    #: failure handler. ``say true`` is ci-changes' fail-safe answer.
+    HANDLED = re.compile(r"\s*\)\s*\|\|\s*(?:exit 1|say true)\b")
+
     def setUp(self) -> None:
-        # Comment lines describe the rule, and may quote it; only code counts.
-        self.code = [
-            (n, line)
-            for n, line in enumerate(STD.read_text().splitlines(), 1)
-            if not line.lstrip().startswith("#")
-        ]
+        # Comment lines describe the rule, and may quote it; only code
+        # counts. A recipe is one shell command across its backslash
+        # continuations, so each logical line is read whole (kept with the
+        # number of its first line): a handler on the next line counts.
+        self.code: list[tuple[int, str]] = []
+        held, first = "", 0
+        for n, line in enumerate(STD.read_text().splitlines(), 1):
+            if not held and line.lstrip().startswith("#"):
+                continue
+            if not held:
+                first = n
+            if line.endswith("\\"):
+                held += line[:-1] + " "
+                continue
+            self.code.append((first, held + line))
+            held = ""
 
     def test_mktemp_only_in_the_two_definitions(self) -> None:
         stray = [
-            f"standard.mk:{n}: {line.strip()}"
+            f"standard.mk:{n}: {line.strip()[:120]}"
             for n, line in self.code
             if "mktemp" in line
             and not re.match(r"_STD_TMP(DIR)? = mktemp ", line)
         ]
         self.assertEqual(stray, [], "use $(_STD_TMP) / $(_STD_TMPDIR)")
 
-    def test_every_use_exits_when_mktemp_fails(self) -> None:
+    def unhandled(self, line: str) -> list[str]:
+        """Each use of the macros in ``line`` with no failure handler."""
+        bad = []
+        for m in self.USE.finditer(line):
+            h = self.HANDLED.match(line[m.end():])
+            # `say` exists only in the recipe that defines it.
+            if not h or ("say true" in h.group(0) and "say() {" not in line):
+                bad.append(line[m.start():][:80])
+        return bad
+
+    def test_every_use_handles_a_failed_mktemp(self) -> None:
         uses = 0
         bad = []
         for n, line in self.code:
-            for m in re.finditer(r"\$\$\(\$\(_STD_TMP(DIR)?\)\)", line):
-                uses += 1
-                rest = line[m.end():]
-                if not re.match(r"\s*\|\|\s*exit 1\s*;", rest):
-                    bad.append(f"standard.mk:{n}: {line.strip()}")
+            if re.match(r"_STD_TMP(DIR)? = ", line):
+                continue
+            uses += len(self.USE.findall(line))
+            bad += [f"standard.mk:{n}: {b}" for b in self.unhandled(line)]
         # A walk that found nothing has checked nothing.
-        self.assertGreater(uses, 0, "found no $$($(_STD_TMP)) use at all")
+        self.assertGreater(uses, 0, "found no $(_STD_TMP) use at all")
         self.assertEqual(bad, [], "write x=$$($(_STD_TMP)) || exit 1;")
+
+    def test_the_scan_reads_every_spelling(self) -> None:
+        # The scan itself, on the shapes a hand edit could produce.
+        ok = [
+            "x=$$($(_STD_TMP)) || exit 1;",
+            "x=$$($(_STD_TMPDIR) ) || exit 1;",
+            "x=$$(${_STD_TMP})||exit 1",
+            "say() { exit 0; }; x=$$($(_STD_TMPDIR)) || say true why",
+        ]
+        red = [
+            "x=$$($(_STD_TMP));",
+            "x=$$($(_STD_TMPDIR) );",
+            "x=$$(${_STD_TMP}) || true;",
+            "x=$$($(_STD_TMP) 2>/dev/null) || exit 1;",
+            "x=$$($(_STD_TMPDIR)) || say true why",
+        ]
+        self.assertTrue(all(self.USE.search(t) for t in ok + red))
+        for text in ok + red:
+            with self.subTest(text=text):
+                self.assertEqual(self.unhandled(text) == [], text in ok)
 
 
 if __name__ == "__main__":

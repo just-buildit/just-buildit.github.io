@@ -379,6 +379,17 @@ class CiChanges(unittest.TestCase):
         self.edit("install.md", DEB_085, DEB_086)
         self.assertSrc("true")
 
+    def test_a_temp_dir_that_cannot_be_made_runs(self) -> None:
+        # #251: a gate refuses when mktemp fails, but this target is
+        # fail-safe, and a refusal would turn every adopter's changes job,
+        # and so CI passed, red. A real bump, so only the temp dir can
+        # answer src=true; classify requires rc 0 and one src line.
+        self.bump()
+        missing = self.repo.parent / (self.repo.name + "-no-such-dir")
+        got, why = self.classify(TMPDIR=str(missing))
+        self.assertEqual(got, "true", why)
+        self.assertIn(f"cannot create a temp directory in {missing}", why)
+
     # -- the output contract ---------------------------------------------
 
     def test_the_answer_reaches_github_output(self) -> None:

@@ -1175,7 +1175,8 @@ version-check: ## [VERSION=x.y.z] Verify version strings agree
 # .gitmodules otherwise hides a moved pointer from the diff entirely.
 #
 # Fail-safe in every direction: an unreadable BASE, a probe that prints
-# nothing, no version change, an empty diff -- each answers src=true. The
+# nothing, no version change, an empty diff, a temp directory that cannot
+# be made (a gate would refuse there, #251) -- each answers src=true. The
 # worst this can do wrong is run a matrix that was not needed.
 #
 # Prints `src=true|false` and appends it to $GITHUB_OUTPUT when set; the
@@ -1196,7 +1197,9 @@ ci-changes: ## [BASE=<rev>] src=false when HEAD is only a version bump over BASE
 	          | head -n1 | cut -d'|' -f2-); \
 	 [ -n "$$probe" ] || say true "no VERSION_PROBES to read a version with"; \
 	 new=$$(eval "$$probe" 2>/dev/null); \
-	 tmp=$$($(_STD_TMPDIR)) || exit 1; trap 'rm -rf "$$tmp"' EXIT; \
+	 d=$${TMPDIR:-/tmp}; \
+	 tmp=$$($(_STD_TMPDIR)) || say true "cannot create a temp directory in $$d"; \
+	 trap 'rm -rf "$$tmp"' EXIT; \
 	 mkdir "$$tmp/base"; \
 	 git archive "$$base" | tar -x -C "$$tmp/base"; \
 	 old=$$(cd "$$tmp/base" && eval "$$probe" 2>/dev/null); \
@@ -2030,8 +2033,9 @@ STD_TARGETS += hook-stage-check tracked-paths-check workflow-timeout-check \
 # so, before it fetches or compares anything. An empty `$$tmp` used to reach
 # `curl -o ""`, and standard-check blamed the network for every vendored file
 # ("cannot fetch <url>"), with mktemp's own error buried between the fetch
-# errors (just-buildit.github.io#251). tests/test_std_tmp.py holds every site
-# to this form.
+# errors (just-buildit.github.io#251). The one exception is ci-changes, whose
+# contract is fail-safe: it answers `|| say true` (run everything), never a
+# red changes job. tests/test_std_tmp.py holds every site to this form.
 _STD_TMP_REFUSE = { \
     echo "ERROR: cannot create a temp file in $${TMPDIR:-/tmp} (TMPDIR)." >&2; \
     echo "  This is the local temp directory, not what the gate checks:" >&2; \

@@ -73,8 +73,15 @@ _jb_install() {
 
 	# -- version-aware download -----------------------------------------------
 
-	local tmp_runit
-	tmp_runit=$(mktemp /tmp/just-runit.XXXXXX)
+	# In TMPDIR, as every other temp file is. A mktemp that fails refuses
+	# here, naming the directory: an empty path used to reach curl -o, and
+	# the install reported "failed to download jb" for a fetch never made.
+	local tmp_runit tmp_dir="${TMPDIR:-/tmp}"
+	if ! tmp_runit=$(mktemp "${tmp_dir}/just-runit.XXXXXX"); then
+		printf "\033[1;31m  !!  \033[0mcannot create a temp file in %s (TMPDIR); nothing was downloaded\n" \
+			"${tmp_dir}" >&2
+		return 1
+	fi
 	# shellcheck disable=SC2064
 	trap "rm -f '${tmp_runit}'" RETURN
 

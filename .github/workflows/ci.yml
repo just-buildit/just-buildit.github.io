@@ -38,7 +38,7 @@ jobs:
           printf 'HAS_DOXYGEN = 1\ninclude standard.mk\n' > "$tmp/Makefile"
           out="$(make -C "$tmp" help 2>&1 || true)"
           echo "$out"
-          echo "$out" | grep -q "TEST_CMD is empty" \
+          echo "$out" | grep "TEST_CMD is empty" >/dev/null \
             || { echo "::error::expected a parse-time error naming TEST_CMD"; exit 1; }
 
       - name: Every feature group defines its targets, and passes the gates
@@ -281,12 +281,12 @@ jobs:
 
           # `lint` runs it -- the one target every adopter's CI runs -- and
           # every repo vendors the script it runs, flag or no flag.
-          make -s -C "$tmp" -pn lint 2>/dev/null | grep -qE '^lint:.* close-keywords-check( |$)' \
+          make -s -C "$tmp" -pn lint 2>/dev/null | grep -E '^lint:.* close-keywords-check( |$)' >/dev/null \
             || { echo "::error::lint does not run close-keywords-check"; exit 1; }
-          make -s -C "$tmp" standard-files | grep -qx scripts/close-keywords.py \
+          make -s -C "$tmp" standard-files | grep -x scripts/close-keywords.py >/dev/null \
             || { echo "::error::scripts/close-keywords.py is not vendored"; exit 1; }
           # Any other event is inert: on a push the issue is already closed.
-          GITHUB_EVENT_NAME=push make -s -C "$tmp" close-keywords-check | grep -q "inert" \
+          GITHUB_EVENT_NAME=push make -s -C "$tmp" close-keywords-check | grep "inert" >/dev/null \
             || { echo "::error::a push run was not inert"; exit 1; }
 
           # And this repo's own pull requests are held to it, from the
@@ -673,7 +673,7 @@ jobs:
           out="$(make -C "$tmp" standard-check)" || { echo "$out"; \
             echo "::error::clean tree should pass"; exit 1; }
           echo "$out"
-          echo "$out" | grep -q "2 vendored file(s) match" \
+          echo "$out" | grep "2 vendored file(s) match" >/dev/null \
             || { echo "::error::expected a count of 2, got: $out"; exit 1; }
 
           # (1) listed but absent
@@ -731,7 +731,7 @@ jobs:
           EOF
           make -C "$tmp/a" standard-update
           cmp "$canon/github/dependabot.yml" "$tmp/a/.github/dependabot.yml"
-          make -C "$tmp/a" standard-check | grep -q "2 vendored file(s) match" \
+          make -C "$tmp/a" standard-check | grep "2 vendored file(s) match" >/dev/null \
             || { echo "::error::a clean .github/ vendored file did not pass"; exit 1; }
           echo "# drift" >> "$tmp/a/.github/dependabot.yml"
           if make -C "$tmp/a" standard-check > "$tmp/log" 2>&1; then
@@ -1224,7 +1224,7 @@ jobs:
           echo "$sha  $RUNNER_TEMP/sc.tar.xz" | sha256sum -c -
           tar -xJf "$RUNNER_TEMP/sc.tar.xz" -C "$RUNNER_TEMP"
           export PATH="$RUNNER_TEMP/shellcheck-v$v:$PATH"
-          shellcheck --version | grep -qx "version: $v" \
+          shellcheck --version | grep -x "version: $v" >/dev/null \
             || { echo "::error::shellcheck is not $v"; exit 1; }
           # Default severity, not --severity=warning: these files are
           # vendored byte-identical, and a consumer that shellchecks its
@@ -1270,7 +1270,7 @@ jobs:
           set -euo pipefail
           printed="$(grep -n '^[^#]*echo' scripts/release-watch.sh || true)"
           [ -n "$printed" ] || { echo "::error::no echo lines — not armed"; exit 1; }
-          if echo "$printed" | grep -q 'likely a flake'; then
+          if echo "$printed" | grep 'likely a flake' >/dev/null; then
             echo "::error::release-watch prints a guess for a failure it can name:"
             echo "$printed" | grep 'likely a flake'
             exit 1
@@ -1278,7 +1278,7 @@ jobs:
           # Replacing the guess with silence would be no better — the reader
           # needs to know WHICH job failed to judge whether a rerun is worth
           # anything.
-          echo "$printed" | grep -q 'failed: \${FAILED_JOBS' \
+          echo "$printed" | grep 'failed: \${FAILED_JOBS' >/dev/null \
             || { echo "::error::the failing job names are never printed"; exit 1; }
           echo "  ok  names the failure instead of guessing at it"
 

@@ -15,6 +15,12 @@ check was skipped.
 ``grep ... >/dev/null`` and ``sed -n 1p`` read all of their input, so the
 producer always finishes and the exit status is the reader's verdict alone.
 
+The rule has no exceptions. A pipeline whose status is thrown away -- one
+ending in ``|| true`` or ``|| :``, or one nothing tests -- is flagged all
+the same: making it safe costs one ``sed -n 1p``, a rule without exceptions
+needs no judgement to apply, and a status discarded today is tested the
+day someone edits the line.
+
 What it reads: PIPELINES, not lines. A command continued with a trailing
 ``\\`` or ``|`` is joined first; the words are split as the shell splits
 them, so ``grep -E -q``, ``egrep -q`` and a pipe split across lines are all
@@ -71,9 +77,9 @@ _ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 def pipelines(text: str, yaml: bool = False) -> list[tuple[int, str]]:
     """Each logical command line of *text*, with its first line's number.
 
-    >>> pipelines('a |\\n  grep -q x\\nb \\\\\\n c\\n')
+    >>> pipelines("a |\\n  grep -q x\\nb \\\\\\n c\\n")
     [(1, 'a | grep -q x'), (3, 'b  c')]
-    >>> pipelines('run: |\\n  a || b\\n', yaml=True)
+    >>> pipelines("run: |\\n  a || b\\n", yaml=True)
     [(2, 'a || b')]
     """
     out: list[tuple[int, str]] = []
@@ -334,22 +340,28 @@ def _pipes_into_reader(line: str) -> bool:
 def offenders(text: str, yaml: bool = False) -> list[tuple[int, str]]:
     """Each (line number, pipeline) of *text* piping into an early reader.
 
-    >>> offenders('a | grep -q x\\nb | grep x >/dev/null\\n')
+    >>> offenders("a | grep -q x\\nb | grep x >/dev/null\\n")
     [(1, 'a | grep -q x')]
-    >>> offenders('! make c | grep -qx packager=1')
+    >>> offenders("! make c | grep -qx packager=1")
     [(1, '! make c | grep -qx packager=1')]
-    >>> [n for n, _ in offenders('x |\\n  egrep -q y\\nz | grep -E -q w\\n')]
+    >>> [n for n, _ in offenders("x |\\n  egrep -q y\\nz | grep -E -q w\\n")]
     [1, 3]
     >>> offenders('v="$(gh --version | head -n 1)"')
     [(1, 'v="$(gh --version | head -n 1)"')]
-    >>> [n for n, _ in offenders('a | LC_ALL=C grep -q x\\nb | sed 1q\\n')]
+    >>> [n for n, _ in offenders("a | LC_ALL=C grep -q x\\nb | sed 1q\\n")]
     [1, 2]
-    >>> offenders('grep -q x file\\na || grep -q y f\\n# a | grep -q c\\n')
+    >>> offenders("grep -q x file\\na || grep -q y f\\n# a | grep -q c\\n")
     []
     >>> offenders("echo '$(a | head)'\\n")
     []
-    >>> offenders('run: |\\n  grep -q x f\\n', yaml=True)
+    >>> offenders("run: |\\n  grep -q x f\\n", yaml=True)
     []
+
+    No exceptions: a status thrown away is flagged all the same.
+
+    >>> discarded = "v=$(x | head -1 || true)\\ny | grep -q z || :\\n"
+    >>> [n for n, _ in offenders(discarded)]
+    [1, 2]
     """
     return [
         (n, line)

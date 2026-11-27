@@ -1197,6 +1197,64 @@ class Recuts(Fixture):
             sh(self.work, "git", "branch", "--list", "dry-run/*"), ""
         )
 
+    def onto_train(self, msg: str, amend: bool = False) -> str:
+        """Pushes a commit straight onto the train's branch, as a fix that
+        belongs on a constituent (#250); ``amend`` rewrites the train's top
+        pick instead, keeping its message."""
+        sh(self.work, "git", "switch", "--quiet", "train/1-2")
+        (self.work / "fix.txt").write_text(f"{msg}\n")
+        sh(self.work, "git", "add", "-A")
+        if amend:
+            sh(self.work, "git", "commit", "--quiet", "--amend", "--no-edit")
+        else:
+            sh(self.work, "git", "commit", "--quiet", "-m", msg)
+        # GitHub follows the open train's branch with refs/pull/99/head.
+        for ref in ("refs/heads/train/1-2", "refs/pull/99/head"):
+            sh(self.work, "git", "push", "--quiet", "-f", "origin",
+               f"train/1-2:{ref}")
+        sh(self.work, "git", "switch", "--quiet", "main")
+        return sh(self.work, "git", "rev-parse", "train/1-2")
+
+    def assertDropRefused(self, p, extra: str, subj: str) -> None:
+        self.assertRefused(p, "carries commit(s) that are not its recorded")
+        self.assertIn(f"  {extra[:9]} {subj}\n", p.stdout)
+        self.assertIn("name that PR in MOVED=", p.stdout)
+        self.assertIn("gh pr update-branch 99 --rebase", p.stdout)
+        self.assertEqual(self.verbs("reopen"), [])
+
+    def test_a_commit_pushed_onto_the_train_is_refused(self) -> None:
+        # jm#2814: a fix pushed onto the train's branch is in no
+        # constituent, and the dry run said OK while composing without it.
+        extra = self.onto_train("fix pushed onto the train")
+        before = self.refs()
+        for push in ((), ("--push",)):
+            p = self.train("--recut", "99", *push)
+            self.assertDropRefused(p, extra, "fix pushed onto the train")
+            # Only the extra commit is named, not the picks under it.
+            self.assertNotIn(self.old[:9], p.stdout)
+            self.assertEqual(self.refs(), before)
+        self.assertEqual(
+            sh(self.work, "git", "for-each-ref", "refs/train/"), ""
+        )
+
+    def test_an_amended_pick_is_refused(self) -> None:
+        # Same subject, so a subject match would pass it; its diff is not
+        # the source's.
+        extra = self.onto_train("amended", amend=True)
+        p = self.train("--recut", "99")
+        self.assertDropRefused(p, extra, "change 2")
+
+    def test_a_pre_source_train_still_names_the_extra(self) -> None:
+        # No source to compare: each row vouches for one commit, oldest
+        # first, so the one beyond the table's two rows is extra.
+        body = self.state["prs"]["99"]["body"]
+        for h in self.heads.values():
+            body = body.replace(f" `{h}` |", "")
+        self.state["prs"]["99"]["body"] = body
+        extra = self.onto_train("fix pushed onto the train")
+        p = self.train("--recut", "99")
+        self.assertDropRefused(p, extra, "fix pushed onto the train")
+
     def test_a_merged_train(self) -> None:
         self.state["prs"]["99"]["state"] = "MERGED"
         self.assertRefused(self.train("--recut", "99"), "is merged")

@@ -96,9 +96,11 @@ class MissingTmpdir(unittest.TestCase):
 class EverySiteRefuses(unittest.TestCase):
     """The form every temp-file site in standard.mk must take."""
 
-    #: Any reference to either macro, in either make spelling. The
+    #: Any reference to a temp macro, in either make spelling. The
     #: definitions' own ``$(_STD_TMP_REFUSE)`` is a different name.
-    USE = re.compile(r"\$[({]_STD_TMP(?:DIR)?[)}]")
+    USE = re.compile(r"\$[({]_STD_TMP(?:DIR(?:_QUIET)?)?[)}]")
+    #: The definitions themselves, the one place mktemp is spelled.
+    DEFINED = re.compile(r"_STD_TMP(?:DIR(?:_QUIET)?)? = ")
     #: What must follow it: the command substitution closing, then a
     #: failure handler. ``say true`` is ci-changes' fail-safe answer.
     HANDLED = re.compile(r"\s*\)\s*\|\|\s*(?:exit 1|say true)\b")
@@ -126,7 +128,7 @@ class EverySiteRefuses(unittest.TestCase):
             f"standard.mk:{n}: {line.strip()[:120]}"
             for n, line in self.code
             if "mktemp" in line
-            and not re.match(r"_STD_TMP(DIR)? = mktemp ", line)
+            and not self.DEFINED.match(line)
         ]
         self.assertEqual(stray, [], "use $(_STD_TMP) / $(_STD_TMPDIR)")
 
@@ -135,8 +137,15 @@ class EverySiteRefuses(unittest.TestCase):
         bad = []
         for m in self.USE.finditer(line):
             h = self.HANDLED.match(line[m.end():])
-            # `say` exists only in the recipe that defines it.
-            if not h or ("say true" in h.group(0) and "say() {" not in line):
+            say = h is not None and "say true" in h.group(0)
+            # `say` exists only in the recipe that defines it; and the QUIET
+            # macro prints nothing, so only `say` (which prints why) may
+            # follow it: a bare `|| exit 1` would fail with no word of why.
+            if (
+                not h
+                or (say and "say() {" not in line)
+                or ("_QUIET" in m.group(0) and not say)
+            ):
                 bad.append(line[m.start():][:80])
         return bad
 
@@ -144,7 +153,7 @@ class EverySiteRefuses(unittest.TestCase):
         uses = 0
         bad = []
         for n, line in self.code:
-            if re.match(r"_STD_TMP(DIR)? = ", line):
+            if self.DEFINED.match(line):
                 continue
             uses += len(self.USE.findall(line))
             bad += [f"standard.mk:{n}: {b}" for b in self.unhandled(line)]
@@ -159,8 +168,10 @@ class EverySiteRefuses(unittest.TestCase):
             "x=$$($(_STD_TMPDIR) ) || exit 1;",
             "x=$$(${_STD_TMP})||exit 1",
             "say() { exit 0; }; x=$$($(_STD_TMPDIR)) || say true why",
+            "say() { exit 0; }; x=$$($(_STD_TMPDIR_QUIET)) || say true y",
         ]
         red = [
+            "x=$$($(_STD_TMPDIR_QUIET)) || exit 1;",
             "x=$$($(_STD_TMP));",
             "x=$$($(_STD_TMPDIR) );",
             "x=$$(${_STD_TMP}) || true;",

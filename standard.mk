@@ -1198,7 +1198,8 @@ ci-changes: ## [BASE=<rev>] src=false when HEAD is only a version bump over BASE
 	 [ -n "$$probe" ] || say true "no VERSION_PROBES to read a version with"; \
 	 new=$$(eval "$$probe" 2>/dev/null); \
 	 d=$${TMPDIR:-/tmp}; \
-	 tmp=$$($(_STD_TMPDIR)) || say true "cannot create a temp directory in $$d"; \
+	 tmp=$$($(_STD_TMPDIR_QUIET)) \
+	     || say true "cannot create a temp directory in $$d; running everything"; \
 	 trap 'rm -rf "$$tmp"' EXIT; \
 	 mkdir "$$tmp/base"; \
 	 git archive "$$base" | tar -x -C "$$tmp/base"; \
@@ -2034,8 +2035,10 @@ STD_TARGETS += hook-stage-check tracked-paths-check workflow-timeout-check \
 # `curl -o ""`, and standard-check blamed the network for every vendored file
 # ("cannot fetch <url>"), with mktemp's own error buried between the fetch
 # errors (just-buildit.github.io#251). The one exception is ci-changes, whose
-# contract is fail-safe: it answers `|| say true` (run everything), never a
-# red changes job. tests/test_std_tmp.py holds every site to this form.
+# contract is fail-safe: it uses _STD_TMPDIR_QUIET, which prints nothing,
+# and answers `|| say true` with one line (run everything) -- never a red
+# changes job, and no ERROR above a job that carried on.
+# tests/test_std_tmp.py holds every site to this form.
 _STD_TMP_REFUSE = { \
     echo "ERROR: cannot create a temp file in $${TMPDIR:-/tmp} (TMPDIR)." >&2; \
     echo "  This is the local temp directory, not what the gate checks:" >&2; \
@@ -2044,6 +2047,7 @@ _STD_TMP_REFUSE = { \
     exit 1; }
 _STD_TMP = mktemp "$${TMPDIR:-/tmp}/std.XXXXXX" || $(_STD_TMP_REFUSE)
 _STD_TMPDIR = mktemp -d "$${TMPDIR:-/tmp}/std.XXXXXX" || $(_STD_TMP_REFUSE)
+_STD_TMPDIR_QUIET = mktemp -d "$${TMPDIR:-/tmp}/std.XXXXXX" 2>/dev/null
 
 # The rule for the target named in the calling recipe's `t`, read from the
 # files named after the macro, with the name matched as a LITERAL string:

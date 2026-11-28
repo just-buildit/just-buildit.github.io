@@ -564,9 +564,11 @@ def rows(body: str) -> list[tuple[int, str | None, str]]:
     before that column existed; ``subject`` is the pick's, as ``body_for``
     wrote it in the ``commit`` column.
 
-    >>> body = ("| commit | from | source |\\n|---|---|---|\\n"
-    ...         "| `a` | #3 | `" + "1" * 40 + "` |\\n"
-    ...         "| `c | d` | #5 |\\n")
+    >>> body = (
+    ...     "| commit | from | source |\\n|---|---|---|\\n"
+    ...     "| `a` | #3 | `" + "1" * 40 + "` |\\n"
+    ...     "| `c | d` | #5 |\\n"
+    ... )
     >>> [(n, s and s[:4], t) for n, s, t in rows(body)]
     [(3, '1111', 'a'), (5, None, 'c | d')]
     """
@@ -589,9 +591,7 @@ def rows(body: str) -> list[tuple[int, str | None, str]]:
     return out
 
 
-def extra_commits(
-    old: dict[str, Any], remote: str, base: str
-) -> list[str]:
+def extra_commits(old: dict[str, Any], remote: str, base: str) -> list[str]:
     """The commits on train ``old``'s head that are not its recorded picks.
 
     A re-cut composes from the constituents alone, so a commit pushed
@@ -658,9 +658,7 @@ def extra_commits(
             known.append(src)
         else:
             unsourced.append(subj)
-    unvouched = [
-        c for c in commits if all(same_commit(s, c) for s in known)
-    ]
+    unvouched = [c for c in commits if all(same_commit(s, c) for s in known)]
     for subj in unsourced:
         match = next((c for c in unvouched if subject(c) == subj), None)
         if match:
@@ -1104,8 +1102,12 @@ def compose(args: argparse.Namespace) -> int:
                 ref = "refs/train/" + r.format(n)
                 git("update-ref", "-d", ref, check=False)
         if args.recut:
-            git("update-ref", "-d", f"refs/train/recut-{args.recut}",
-                check=False)
+            git(
+                "update-ref",
+                "-d",
+                f"refs/train/recut-{args.recut}",
+                check=False,
+            )
 
 
 def compose_train(args: argparse.Namespace) -> int:

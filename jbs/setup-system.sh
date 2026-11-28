@@ -1637,7 +1637,7 @@ _ssh_github_check() {
 		_result "github:  ok (${key##*/} authenticates as ${user})"
 	elif [[ ${out} == *"Permission denied"* ]]; then
 		if _have ssh-keygen && ! ssh-keygen -y -P '' -f "${key}" >/dev/null 2>&1 &&
-			! { ssh-add -L 2>/dev/null | grep -qF -- "$(cut -d' ' -f2 "${key}.pub")"; }; then
+			! { ssh-add -L 2>/dev/null | grep -F -- "$(cut -d' ' -f2 "${key}.pub")" >/dev/null; }; then
 			_info "${key} has a passphrase and is not in ssh-agent, so it cannot be tested unattended"
 			_info "test it by hand: ssh -T -i ${key} git@github.com"
 			_result "github:  not tested (passphrase: ssh-add ${key}, then ssh -T git@github.com)"
@@ -2054,7 +2054,7 @@ _macos_remote_login_on() {
 	# "enabled" on current macOS; "false" (not disabled) on Monterey and
 	# earlier.
 	launchctl print-disabled system 2>/dev/null |
-		grep -qE '"com\.openssh\.sshd" => (enabled|false)'
+		grep -E '"com\.openssh\.sshd" => (enabled|false)' >/dev/null
 }
 
 # _ak_has_key FILE -- true when FILE holds at least one line ssh-keygen

@@ -283,7 +283,8 @@ _secret_need() {
 
 _secret_gpg_has_key() {
 	command -v gpg >/dev/null 2>&1 &&
-		gpg --batch --list-secret-keys --with-colons 2>/dev/null | grep -q '^sec'
+		gpg --batch --list-secret-keys --with-colons 2>/dev/null |
+		grep '^sec' >/dev/null
 }
 
 # ---- the backends: the only code that differs between gpg and age ----------
@@ -1793,7 +1794,7 @@ _acquire_jbs() {
 			_fetch_to "${_JBS_BASE}/${l}.sh" "${jbs_dir}/${l}.sh"
 		done
 		# fetch the target itself when it is not one of the core libs
-		if ! printf '%s\n' "${_JBS_LIBS[@]}" | grep -qx "${lib}"; then
+		if ! printf '%s\n' "${_JBS_LIBS[@]}" | grep -x -- "${lib}" >/dev/null; then
 			_fetch_to "${_JBS_BASE}/${lib}.sh" "${dest}"
 		fi
 	else

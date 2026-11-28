@@ -112,7 +112,7 @@ _tool_version() {
 	local cmd="$1"
 	shift
 	command -v "${cmd}" >/dev/null 2>&1 || return 0
-	"${cmd}" "$@" 2>/dev/null | head -1 || true
+	"${cmd}" "$@" 2>/dev/null | sed -n 1p || true
 }
 
 # ---------------------------------------------------------------------------
@@ -137,7 +137,7 @@ _do_inspect() {
 	printf 'kernel = "%s"\n' "$(uname -r)"
 	printf 'arch = "%s"\n' "$(uname -m)"
 	_glibc=$(getconf GNU_LIBC_VERSION 2>/dev/null ||
-		ldd --version 2>/dev/null | head -1 || true)
+		ldd --version 2>/dev/null | sed -n 1p || true)
 	[ -n "${_glibc}" ] && printf 'glibc = "%s"\n' "${_glibc}"
 	printf '\n'
 
